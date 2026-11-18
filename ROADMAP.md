@@ -11,6 +11,10 @@ never depends on a chat.
 - E-AC-3 JOC (Atmos) passthrough: `dec3` built through the mp4 muxer, JOC flag
   read out of it, packets handed to the renderer compressed.
 - 5-band EQ + preamp + peak limiter on the libavcodec path.
+- ReplayGain: `MediaProbe` reads `replaygain_track_gain` from the container and
+  the libavcodec path applies it through the limiter. `LoudnessAnalyzer` computes
+  BS.1770 / EBU R128 integrated loudness (K-weighting, 400 ms blocks, gating) for
+  offline per-track gain.
 - Now Playing + remote commands, `AVAudioSession` with
   `setSupportsMultichannelContent(true)`.
 
@@ -46,12 +50,13 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 
 ## Next
 
-1. ReplayGain / EBU R128 normalisation (per-track gain + the existing limiter).
-2. EQ on the AVPlayer route via `MTAudioProcessingTap` (today it only applies on
+1. EQ on the AVPlayer route via `MTAudioProcessingTap` (today it only applies on
    the libavcodec route).
-3. Gapless playback.
-4. APAC encode for AirPlay / HomePod Atmos.
-5. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+2. Gapless playback.
+3. APAC encode for AirPlay / HomePod Atmos.
+4. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+5. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
+   result into `trackGainDB` when there is no ReplayGain tag.
 
 ## Known constraints
 
