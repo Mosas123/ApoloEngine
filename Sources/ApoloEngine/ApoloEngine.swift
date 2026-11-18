@@ -39,10 +39,12 @@ public final class ApoloEngine {
     private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
 
+    private var queue = PlayQueue()
+
     /// Sources queued after the current one. The hosts advance into them on
     /// their own; the engine only keeps the Now Playing card in sync.
-    public private(set) var nextTracks: [ApoloTrack] = []
-    public private(set) var currentTrack: ApoloTrack?
+    public var nextTracks: [ApoloTrack] { queue.upcoming }
+    public var currentTrack: ApoloTrack? { queue.current }
 
     public init() {
         host.onState = { [weak self] state in
@@ -111,20 +113,25 @@ public final class ApoloEngine {
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil
     ) async throws {
-        state = .loading
-        self.metadata = metadata
-        currentTrack = ApoloTrack(
+        let track = ApoloTrack(
             url: url,
             httpHeaders: httpHeaders,
             metadata: metadata
         )
+        queue.start(track)
+        try await startPlayback(track)
+    }
+
+    private func startPlayback(_ track: ApoloTrack) async throws {
+        state = .loading
+        metadata = track.metadata
 
         let info = try await Task.detached(priority: .userInitiated) {
-            try MediaProbe.probe(url: url, httpHeaders: httpHeaders)
+            try MediaProbe.probe(url: track.url, httpHeaders: track.httpHeaders)
         }.value
         media = info
 
-        guard let track = info.audioTracks.first else {
+        guard let audioTrack = info.audioTracks.first else {
             state = .failed("No audio track")
             throw ApoloError.noAudioTrack
         }
@@ -134,15 +141,18 @@ public final class ApoloEngine {
         metadataGainDB = info.trackGainDB
         applyProcessing()
 
-        switch CodecSupport.route(forCodec: track.codec) {
+        switch CodecSupport.route(forCodec: audioTrack.codec) {
         case .avPlayer:
             route = .avPlayer
             libavHost?.stop()
-            await host.load(url: url, httpHeaders: httpHeaders)
+            await host.load(track: track)
         case .libavcodec:
             route = .libavcodec
             host.stop()
-            libavHost?.load(url: url, httpHeaders: httpHeaders)
+            libavHost?.load(
+                url: track.url,
+                httpHeaders: track.httpHeaders
+            )
         }
 
         refreshNowPlaying()
@@ -182,7 +192,7 @@ public final class ApoloEngine {
     /// Queues a source to start when the current one ends, with no gap on the
     /// libavcodec route and no audible one on AVQueuePlayer.
     public func enqueueNext(_ track: ApoloTrack) async {
-        nextTracks.append(track)
+        queue.enqueue(track)
         switch route {
         case .avPlayer:
             await host.enqueueNext(track)
@@ -192,7 +202,19 @@ public final class ApoloEngine {
     }
 
     public func clearQueue() {
-        nextTracks.removeAll()
+        queue.clearUpcoming()
+    }
+
+    /// Manual skip. Reloads the source through the normal route decision, so a
+    /// codec change between tracks is handled.
+    public func skipToNext() async throws {
+        guard let next = queue.advance() else { return }
+        try await startPlayback(next)
+    }
+
+    public func skipToPrevious() async throws {
+        guard let previous = queue.previous() else { return }
+        try await startPlayback(previous)
     }
 
     public func stop() {
@@ -204,21 +226,23 @@ public final class ApoloEngine {
         media = nil
         elapsed = 0
         state = .idle
-        nextTracks.removeAll()
-        currentTrack = nil
+        queue.clear()
         metadata = nil
     }
 
     private func advanceFromQueue() {
-        guard !nextTracks.isEmpty else { return }
-        advance(to: nextTracks.removeFirst())
+        guard let next = queue.advance() else { return }
+        applyAdvanced(next)
     }
 
     private func advance(to track: ApoloTrack) {
-        if let index = nextTracks.firstIndex(of: track) {
-            nextTracks.remove(at: index)
+        if !queue.consume(track) {
+            queue.start(track)
         }
-        currentTrack = track
+        applyAdvanced(track)
+    }
+
+    private func applyAdvanced(_ track: ApoloTrack) {
         metadata = track.metadata
         metadataGainDB = nil
         elapsed = 0
