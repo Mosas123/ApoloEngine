@@ -35,7 +35,7 @@ public enum MediaProbe {
         }
 
         var tracks: [AudioTrackInfo] = []
-        var audioMetadata: UnsafeMutablePointer<AVDictionary>?
+        var audioMetadata: OpaquePointer?
         for index in 0..<Int(context.pointee.nb_streams) {
             guard let stream = context.pointee.streams[index],
                   let codecpar = stream.pointee.codecpar,
@@ -85,9 +85,7 @@ public enum MediaProbe {
     }
 
     /// Reads `replaygain_track_gain` ("-7.23 dB") and returns the number.
-    private static func replayGain(
-        from metadata: UnsafeMutablePointer<AVDictionary>?
-    ) -> Double? {
+    private static func replayGain(from metadata: OpaquePointer?) -> Double? {
         guard let metadata,
               let entry = av_dict_get(metadata, "replaygain_track_gain", nil, 0),
               let value = entry.pointee.value
