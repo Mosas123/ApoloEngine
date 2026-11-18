@@ -17,7 +17,7 @@ public enum MediaProbe {
             let joined = httpHeaders
                 .map { "\($0.key): \($0.value)" }
                 .joined(separator: "\r\n")
-            joined.withCString { av_dict_set(&options, "headers", $0, 0) }
+            joined.withCString { _ = av_dict_set(&options, "headers", $0, 0) }
         }
         defer { av_dict_free(&options) }
 
@@ -60,8 +60,9 @@ public enum MediaProbe {
         let container = context.pointee.iformat
             .map { String(cString: $0.pointee.name) } ?? "unknown"
 
+        // AV_NOPTS_VALUE is a C macro (INT64_MIN) and does not bridge to Swift.
         let duration: TimeInterval
-        if context.pointee.duration != AV_NOPTS_VALUE {
+        if context.pointee.duration != Int64.min {
             duration = TimeInterval(context.pointee.duration) / TimeInterval(AV_TIME_BASE)
         } else {
             duration = 0
