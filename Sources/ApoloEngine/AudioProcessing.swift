@@ -34,13 +34,14 @@ final class AudioProcessingChain {
         sampleRate: Double,
         channels: Int,
         settings: EqualizerSettings,
-        limiterEnabled: Bool
+        limiterEnabled: Bool,
+        trackGainDB: Double
     ) {
         self.sampleRate = sampleRate
         self.channels = max(1, channels)
         self.limiterEnabled = limiterEnabled
         self.limiter = Limiter(ceilingDB: -1, sampleRate: sampleRate)
-        self.preamp = Float(pow(10, settings.preampDB / 20))
+        self.preamp = Float(pow(10, (settings.preampDB + trackGainDB) / 20))
 
         let bands = settings.bandsDB
         self.filters = (0..<self.channels).map { _ in
@@ -98,6 +99,50 @@ struct Biquad {
         z1 = b1 * input - a1 * output + z2
         z2 = b2 * input - a2 * output
         return output
+    }
+
+    /// RBJ cookbook high shelf, normalised by a0. Used by the K-weighting
+    /// pre-filter of the loudness analyser.
+    static func highShelf(
+        frequency: Double,
+        q: Double,
+        gainDB: Double,
+        sampleRate: Double
+    ) -> Biquad {
+        let amplitude = pow(10, gainDB / 40)
+        let omega = 2 * Double.pi * frequency / sampleRate
+        let alpha = sin(omega) / (2 * q)
+        let cosine = cos(omega)
+        let root = 2 * sqrt(amplitude) * alpha
+
+        let a0 = (amplitude + 1) - (amplitude - 1) * cosine + root
+        return Biquad(
+            b0: Float(amplitude * ((amplitude + 1) + (amplitude - 1) * cosine + root) / a0),
+            b1: Float(-2 * amplitude * ((amplitude - 1) + (amplitude + 1) * cosine) / a0),
+            b2: Float(amplitude * ((amplitude + 1) + (amplitude - 1) * cosine - root) / a0),
+            a1: Float(2 * ((amplitude - 1) - (amplitude + 1) * cosine) / a0),
+            a2: Float(((amplitude + 1) - (amplitude - 1) * cosine - root) / a0)
+        )
+    }
+
+    /// RBJ cookbook high pass, normalised by a0. The second K-weighting stage.
+    static func highPass(
+        frequency: Double,
+        q: Double,
+        sampleRate: Double
+    ) -> Biquad {
+        let omega = 2 * Double.pi * frequency / sampleRate
+        let alpha = sin(omega) / (2 * q)
+        let cosine = cos(omega)
+
+        let a0 = 1 + alpha
+        return Biquad(
+            b0: Float(((1 + cosine) / 2) / a0),
+            b1: Float(-(1 + cosine) / a0),
+            b2: Float(((1 + cosine) / 2) / a0),
+            a1: Float((-2 * cosine) / a0),
+            a2: Float((1 - alpha) / a0)
+        )
     }
 
     /// RBJ cookbook peaking EQ, normalised by a0.

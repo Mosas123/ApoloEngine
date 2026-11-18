@@ -18,22 +18,19 @@ public final class ApoloEngine {
     /// Five-band EQ. Applied on the libavcodec route; the AVPlayer route
     /// ignores it until the tap lands.
     public var equalizer: EqualizerSettings = .flat {
-        didSet {
-            libavHost?.configure(
-                equalizer: equalizer,
-                limiterEnabled: limiterEnabled
-            )
-        }
+        didSet { applyProcessing() }
     }
 
     public var limiterEnabled: Bool = true {
-        didSet {
-            libavHost?.configure(
-                equalizer: equalizer,
-                limiterEnabled: limiterEnabled
-            )
-        }
+        didSet { applyProcessing() }
     }
+
+    /// Extra gain in dB, applied on top of any ReplayGain tag in the container.
+    public var trackGainDB: Double = 0 {
+        didSet { applyProcessing() }
+    }
+
+    private var metadataGainDB: Double?
 
     private let host = AVPlayerHost()
     private let session = AudioSessionController()
@@ -126,6 +123,8 @@ public final class ApoloEngine {
         case .libavcodec:
             route = .libavcodec
             host.stop()
+            metadataGainDB = info.trackGainDB
+            applyProcessing()
             libavHost?.load(url: url, httpHeaders: httpHeaders)
         }
 
@@ -172,6 +171,14 @@ public final class ApoloEngine {
         media = nil
         elapsed = 0
         state = .idle
+    }
+
+    private func applyProcessing() {
+        libavHost?.configure(
+            equalizer: equalizer,
+            limiterEnabled: limiterEnabled,
+            trackGainDB: (metadataGainDB ?? 0) + trackGainDB
+        )
     }
 
     private func apply(_ newState: PlaybackState) {

@@ -9,7 +9,8 @@ final class AudioProcessingTests: XCTestCase {
             sampleRate: sampleRate,
             channels: 1,
             settings: .flat,
-            limiterEnabled: false
+            limiterEnabled: false,
+            trackGainDB: 0
         )
         let original = tone(frequency: 1_000, count: 256, amplitude: 0.25)
         var output = original
@@ -28,7 +29,8 @@ final class AudioProcessingTests: XCTestCase {
             sampleRate: sampleRate,
             channels: 1,
             settings: EqualizerSettings(bandsDB: [6, 0, 0, 0, 0]),
-            limiterEnabled: false
+            limiterEnabled: false,
+            trackGainDB: 0
         )
         let input = tone(frequency: 60, count: 4_800, amplitude: 0.1)
         var output = input
@@ -47,7 +49,8 @@ final class AudioProcessingTests: XCTestCase {
             sampleRate: sampleRate,
             channels: 1,
             settings: .flat,
-            limiterEnabled: true
+            limiterEnabled: true,
+            trackGainDB: 0
         )
         var samples = [Float](repeating: 0.99, count: 64)
 
@@ -58,6 +61,28 @@ final class AudioProcessingTests: XCTestCase {
         let ceiling = Float(pow(10, -1.0 / 20.0))
         let peak = samples.map { abs($0) }.max() ?? 0
         XCTAssertLessThanOrEqual(peak, ceiling + 0.001)
+    }
+
+    func testTrackGainScalesOutput() {
+        let chain = AudioProcessingChain(
+            sampleRate: sampleRate,
+            channels: 1,
+            settings: .flat,
+            limiterEnabled: false,
+            trackGainDB: 6
+        )
+        let input = tone(frequency: 1_000, count: 480, amplitude: 0.1)
+        var output = input
+
+        output.withUnsafeMutableBufferPointer { buffer in
+            chain.process(interleaved: buffer.baseAddress!, frames: buffer.count)
+        }
+
+        XCTAssertEqual(
+            Double(rms(output) / rms(input)),
+            2.0,
+            accuracy: 0.02
+        )
     }
 
     private func tone(frequency: Double, count: Int, amplitude: Float) -> [Float] {

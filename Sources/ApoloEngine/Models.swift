@@ -28,15 +28,19 @@ public struct MediaInfo: Sendable, Equatable {
     public let container: String
     public let duration: TimeInterval
     public let audioTracks: [AudioTrackInfo]
+    /// ReplayGain track gain from the container metadata, in dB, when present.
+    public let trackGainDB: Double?
 
     public init(
         container: String,
         duration: TimeInterval,
-        audioTracks: [AudioTrackInfo]
+        audioTracks: [AudioTrackInfo],
+        trackGainDB: Double? = nil
     ) {
         self.container = container
         self.duration = duration
         self.audioTracks = audioTracks
+        self.trackGainDB = trackGainDB
     }
 }
 

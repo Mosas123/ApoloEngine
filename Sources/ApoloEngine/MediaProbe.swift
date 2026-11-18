@@ -35,6 +35,7 @@ public enum MediaProbe {
         }
 
         var tracks: [AudioTrackInfo] = []
+        var audioMetadata: UnsafeMutablePointer<AVDictionary>?
         for index in 0..<Int(context.pointee.nb_streams) {
             guard let stream = context.pointee.streams[index],
                   let codecpar = stream.pointee.codecpar,
@@ -43,6 +44,10 @@ public enum MediaProbe {
 
             let codec = avcodec_get_name(codecpar.pointee.codec_id)
                 .map { String(cString: $0) } ?? "unknown"
+
+            if audioMetadata == nil {
+                audioMetadata = stream.pointee.metadata
+            }
 
             tracks.append(
                 AudioTrackInfo(
@@ -68,11 +73,34 @@ public enum MediaProbe {
             duration = 0
         }
 
+        let trackGain = replayGain(from: context.pointee.metadata)
+            ?? replayGain(from: audioMetadata)
+
         return MediaInfo(
             container: container,
             duration: duration,
-            audioTracks: tracks
+            audioTracks: tracks,
+            trackGainDB: trackGain
         )
+    }
+
+    /// Reads `replaygain_track_gain` ("-7.23 dB") and returns the number.
+    private static func replayGain(
+        from metadata: UnsafeMutablePointer<AVDictionary>?
+    ) -> Double? {
+        guard let metadata,
+              let entry = av_dict_get(metadata, "replaygain_track_gain", nil, 0),
+              let value = entry.pointee.value
+        else { return nil }
+
+        var text = String(cString: value).trimmingCharacters(in: .whitespaces)
+        text = text.replacingOccurrences(
+            of: "dB",
+            with: "",
+            options: .caseInsensitive
+        )
+        text = text.trimmingCharacters(in: .whitespaces)
+        return Double(text)
     }
 
     /// E-AC-3 profile 30 is Dolby Digital Plus JOC (Atmos). FFmpeg's

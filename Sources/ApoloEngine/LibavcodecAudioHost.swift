@@ -25,6 +25,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var wantsToPlay = false
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
+    private var trackGainDB: Double = 0
 
     init(
         onState: @escaping @Sendable (PlaybackState) -> Void,
@@ -60,6 +61,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 let decoder = AudioDecoder()
                 decoder.processingSettings = self.equalizer
                 decoder.limiterEnabled = self.limiterEnabled
+                decoder.trackGainDB = self.trackGainDB
                 try decoder.open(url: url, httpHeaders: httpHeaders)
                 self.decoder = decoder
                 self.wantsToPlay = true
@@ -122,14 +124,20 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         }
     }
 
-    func configure(equalizer: EqualizerSettings, limiterEnabled: Bool) {
+    func configure(
+        equalizer: EqualizerSettings,
+        limiterEnabled: Bool,
+        trackGainDB: Double
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             self.equalizer = equalizer
             self.limiterEnabled = limiterEnabled
+            self.trackGainDB = trackGainDB
             self.decoder?.updateProcessing(
                 settings: equalizer,
-                limiterEnabled: limiterEnabled
+                limiterEnabled: limiterEnabled,
+                trackGainDB: trackGainDB
             )
         }
     }

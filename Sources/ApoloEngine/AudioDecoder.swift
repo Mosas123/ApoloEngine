@@ -34,6 +34,7 @@ final class AudioDecoder {
 
     var processingSettings: EqualizerSettings = .flat
     var limiterEnabled = true
+    var trackGainDB: Double = 0
 
     private var pendingBytes: [UInt8] = []
     private var pendingSamples = 0
@@ -231,15 +232,21 @@ final class AudioDecoder {
         return Double(ticks) * Double(timeBase.num) / Double(timeBase.den)
     }
 
-    func updateProcessing(settings: EqualizerSettings, limiterEnabled: Bool) {
+    func updateProcessing(
+        settings: EqualizerSettings,
+        limiterEnabled: Bool,
+        trackGainDB: Double
+    ) {
         processingSettings = settings
         self.limiterEnabled = limiterEnabled
+        self.trackGainDB = trackGainDB
         guard resampler != nil else { return }
         processingChain = AudioProcessingChain(
             sampleRate: Double(sampleRate),
             channels: Int(channels),
             settings: settings,
-            limiterEnabled: limiterEnabled
+            limiterEnabled: limiterEnabled,
+            trackGainDB: trackGainDB
         )
     }
 
@@ -348,7 +355,8 @@ final class AudioDecoder {
             sampleRate: Double(sampleRate),
             channels: Int(channels),
             settings: processingSettings,
-            limiterEnabled: limiterEnabled
+            limiterEnabled: limiterEnabled,
+            trackGainDB: trackGainDB
         )
         return true
     }
