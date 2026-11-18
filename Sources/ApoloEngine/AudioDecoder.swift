@@ -436,6 +436,8 @@ final class AudioDecoder {
         }
         guard converted > 0 else { return }
 
+        processIfNeeded(&scratch, frames: Int(converted))
+
         let ticks = frame.pointee.pts == Int64.min
             ? runningSamples
             : av_rescale_q(
@@ -476,6 +478,7 @@ final class AudioDecoder {
         }
         guard converted > 0 else { return nil }
 
+        processIfNeeded(&scratch, frames: Int(converted))
         commit(
             scratch: scratch,
             converted: Int(converted),
@@ -484,17 +487,21 @@ final class AudioDecoder {
         return makeSampleBuffer()
     }
 
-    private func commit(scratch: [UInt8], converted: Int, startTicks: Int64) {
-        if let chain = processingChain {
-            scratch.withUnsafeMutableBytes { raw in
-                guard let base = raw.baseAddress else { return }
-                chain.process(
-                    interleaved: base.assumingMemoryBound(to: Float.self),
-                    frames: converted
-                )
-            }
+    private func processIfNeeded(
+        _ scratch: inout [UInt8],
+        frames: Int
+    ) {
+        guard let chain = processingChain else { return }
+        scratch.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            chain.process(
+                interleaved: base.assumingMemoryBound(to: Float.self),
+                frames: frames
+            )
         }
+    }
 
+    private func commit(scratch: [UInt8], converted: Int, startTicks: Int64) {
         if pendingSamples == 0 {
             pendingStartPTS = CMTime(value: startTicks, timescale: sampleRate)
                 + CMTime(seconds: startOffsetSeconds, preferredTimescale: 600)
