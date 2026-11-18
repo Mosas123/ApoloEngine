@@ -18,6 +18,9 @@ never depends on a chat.
 - EQ, ReplayGain gain and limiter on the **AVPlayer route** too, through
   `MTAudioProcessingTap` (`AudioTapProcessor`): planar/interleaved float, chain
   swapped under a lock.
+- Gapless: `AVQueuePlayer` with one tap per item on the AVPlayer route; the
+  libavcodec route opens the next source on the running synchronizer and offsets
+  its PTS by the previous track's end. `ApoloEngine.enqueueNext(_:)` feeds it.
 - Now Playing + remote commands, `AVAudioSession` with
   `setSupportsMultichannelContent(true)`.
 
@@ -38,7 +41,9 @@ lacks, while keeping the Apple output path.
 - Workflow `.github/workflows/build.yml` runs `./build.sh` on `macos-26` and
   commits the rebuilt `Sources/*.xcframework` back to `apolo-union`
   (commit message `build: xcframeworks ...` is skipped by the job guard).
-- First run: https://github.com/Mosas123/FFmpegBuild/actions/runs/44393146128
+- First run failed with `autoreconf: command not found` (exit 127). The workflow
+  now installs `autoconf automake libtool pkg-config meson ninja nasm` first.
+- Runs: https://github.com/Mosas123/FFmpegBuild/actions/workflows/build.yml
 
 **When the build lands**, do exactly this in ApoloEngine:
 
@@ -53,9 +58,9 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 
 ## Next
 
-1. Gapless playback.
-2. APAC encode for AirPlay / HomePod Atmos.
-3. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+1. APAC encode for AirPlay / HomePod Atmos.
+2. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+3. Manual skip / previous.
 4. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
