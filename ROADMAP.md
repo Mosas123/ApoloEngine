@@ -97,6 +97,9 @@ Fixed in phase 1 (CI green, 16 tests):
 - Remote HTTP(S) routed to AVPlayer; probe duration falls back to the audio
   stream when the container has none; `failedToPlayToEndTime` surfaces AVPlayer
   failures.
+- Probe results cached (LRU 32, keyed by path + size + mtime, or URL + headers).
+- Seek pre-roll: frames before the requested position are dropped instead of
+  playing the previous keyframe's tail.
 
 Open:
 
@@ -106,8 +109,9 @@ Open:
    remote music already plays through AVPlayer.
 2. Separate the control queue from the render queue so pause/seek stay snappy
    during a refill burst.
-3. Probe tuning (`probesize`/`analyzeduration`) and one open instead of
-   probe + decode.
+3. Probe tuning (`probesize`/`analyzeduration`) and a **single open** (share
+   the AVFormatContext between probe and decoder; today the probe cache only
+   removes repeat probes).
 4. Channel-layout mapping for 5.1/7.1 (FFmpeg order vs Apple tags).
 5. Lookahead limiter and click-free EQ changes.
 6. AVPlayer: probe queued tracks for ReplayGain; Now Playing artwork and
