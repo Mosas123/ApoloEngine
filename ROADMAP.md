@@ -26,6 +26,12 @@ never depends on a chat.
   between tracks is handled; a skip may re-introduce a small gap.
 - Now Playing + remote commands, `AVAudioSession` with
   `setSupportsMultichannelContent(true)`.
+- Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
+  protocol dependency). Local files keep the full FFmpeg probe and route.
+- The libavcodec tail is no longer cut: at EOF the clock keeps running until
+  the enqueued audio has played, then the finish is published.
+- libavcodec positions are track-relative across gapless switches, so UI seek
+  and Now Playing stay correct after the first automatic advance.
 
 ## In flight
 
@@ -85,12 +91,19 @@ Fixed in phase 1 (CI green, 16 tests):
 - Seek uses `AVSEEK_FLAG_BACKWARD` + `avformat_flush`.
 - Non-audio streams set to `AVDISCARD_ALL`.
 - Flat EQ skips zero-gain bands; non-finite gains are ignored.
+- Track tail kept at EOF (delayed finish instead of stopping the clock early).
+- Track-relative time across gapless (`trackStart` + lock), seek adds the
+  offset, `timelineEnd` tracks absolute positions.
+- Remote HTTP(S) routed to AVPlayer; probe duration falls back to the audio
+  stream when the container has none; `failedToPlayToEndTime` surfaces AVPlayer
+  failures.
 
 Open:
 
-1. **HTTP**: custom `AVIOContext` over `URLSession` (works with any FFmpeg
-   build), or enable `network`/`http`/`https` + `securetransport` in the fork
-   build (another multi-hour run).
+1. **FFmpeg over HTTP** for exotic remote formats (APE/TTA/WavPack over HTTP):
+   custom `AVIOContext` over `URLSession`, or enable `network`/`http`/`https` +
+   `securetransport` in the fork build (another multi-hour run). Standard
+   remote music already plays through AVPlayer.
 2. Separate the control queue from the render queue so pause/seek stay snappy
    during a refill burst.
 3. Probe tuning (`probesize`/`analyzeduration`) and one open instead of
