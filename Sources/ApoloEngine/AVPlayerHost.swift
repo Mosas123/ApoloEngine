@@ -7,6 +7,10 @@ final class AVPlayerHost {
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var lastState: PlaybackState = .idle
+    private var tapProcessor: AudioTapProcessor?
+    private var equalizer = EqualizerSettings.flat
+    private var limiterEnabled = true
+    private var trackGainDB: Double = 0
 
     var onState: (@MainActor (PlaybackState) -> Void)?
     var onTime: (@MainActor (TimeInterval) -> Void)?
@@ -40,7 +44,22 @@ final class AVPlayerHost {
         set { player.volume = newValue }
     }
 
-    func load(url: URL, httpHeaders: [String: String]) {
+    func configure(
+        equalizer: EqualizerSettings,
+        limiterEnabled: Bool,
+        trackGainDB: Double
+    ) {
+        self.equalizer = equalizer
+        self.limiterEnabled = limiterEnabled
+        self.trackGainDB = trackGainDB
+        tapProcessor?.update(
+            equalizer: equalizer,
+            limiterEnabled: limiterEnabled,
+            trackGainDB: trackGainDB
+        )
+    }
+
+    func load(url: URL, httpHeaders: [String: String]) async {
         let asset: AVURLAsset
         if httpHeaders.isEmpty {
             asset = AVURLAsset(url: url)
@@ -50,10 +69,31 @@ final class AVPlayerHost {
                 options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
             )
         }
+
+        let item = AVPlayerItem(asset: asset)
         wantsToPlay = true
-        player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
-        player.play()
+        player.replaceCurrentItem(with: item)
         publish(.loading)
+
+        // The audio mix needs the track, and the track load is async. The tap
+        // is attached before playback starts so the first buffer is covered.
+        if let track = try? await asset.loadTracks(withMediaType: .audio).first {
+            let processor = AudioTapProcessor(
+                equalizer: equalizer,
+                limiterEnabled: limiterEnabled,
+                trackGainDB: trackGainDB
+            )
+            if let tap = processor.makeTap() {
+                tapProcessor = processor
+                let parameters = AVMutableAudioMixInputParameters(track: track)
+                parameters.audioTapProcessor = tap
+                let mix = AVMutableAudioMix()
+                mix.inputParameters = [parameters]
+                item.audioMix = mix
+            }
+        }
+
+        player.play()
     }
 
     func play() {

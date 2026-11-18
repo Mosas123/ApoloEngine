@@ -85,6 +85,39 @@ final class AudioProcessingTests: XCTestCase {
         )
     }
 
+    func testPlanarTrackGainScalesOutput() {
+        let chain = AudioProcessingChain(
+            sampleRate: sampleRate,
+            channels: 2,
+            settings: .flat,
+            limiterEnabled: false,
+            trackGainDB: 6
+        )
+        let original = tone(frequency: 1_000, count: 480, amplitude: 0.1)
+        var left = original
+        var right = original
+
+        left.withUnsafeMutableBufferPointer { leftBuffer in
+            right.withUnsafeMutableBufferPointer { rightBuffer in
+                guard let l = leftBuffer.baseAddress,
+                      let r = rightBuffer.baseAddress
+                else { return }
+                chain.process(planar: [l, r], frames: leftBuffer.count)
+            }
+        }
+
+        XCTAssertEqual(
+            Double(rms(left) / rms(original)),
+            2.0,
+            accuracy: 0.02
+        )
+        XCTAssertEqual(
+            Double(rms(right) / rms(original)),
+            2.0,
+            accuracy: 0.02
+        )
+    }
+
     private func tone(frequency: Double, count: Int, amplitude: Float) -> [Float] {
         (0..<count).map { index in
             amplitude * Float(sin(2 * Double.pi * frequency * Double(index) / sampleRate))

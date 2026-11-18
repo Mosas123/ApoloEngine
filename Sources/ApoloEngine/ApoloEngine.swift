@@ -119,7 +119,7 @@ public final class ApoloEngine {
         case .avPlayer:
             route = .avPlayer
             libavHost?.stop()
-            host.load(url: url, httpHeaders: httpHeaders)
+            await host.load(url: url, httpHeaders: httpHeaders)
         case .libavcodec:
             route = .libavcodec
             host.stop()
@@ -174,10 +174,16 @@ public final class ApoloEngine {
     }
 
     private func applyProcessing() {
+        let gain = (metadataGainDB ?? 0) + trackGainDB
+        host.configure(
+            equalizer: equalizer,
+            limiterEnabled: limiterEnabled,
+            trackGainDB: gain
+        )
         libavHost?.configure(
             equalizer: equalizer,
             limiterEnabled: limiterEnabled,
-            trackGainDB: (metadataGainDB ?? 0) + trackGainDB
+            trackGainDB: gain
         )
     }
 

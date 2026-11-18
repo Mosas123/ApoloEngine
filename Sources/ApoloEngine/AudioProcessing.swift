@@ -56,6 +56,34 @@ final class AudioProcessingChain {
         }
     }
 
+    func process(planar: [UnsafeMutablePointer<Float>], frames: Int) {
+        guard frames > 0 else { return }
+        let count = min(planar.count, filters.count)
+        guard count > 0 else { return }
+
+        for frame in 0..<frames {
+            var peak: Float = 0
+
+            for channel in 0..<count {
+                var sample = planar[channel][frame] * preamp
+                for index in filters[channel].indices {
+                    sample = filters[channel][index].process(sample)
+                }
+                planar[channel][frame] = sample
+                peak = max(peak, abs(sample))
+            }
+
+            if limiterEnabled {
+                let gain = limiter.gain(forPeak: peak)
+                if gain < 1 {
+                    for channel in 0..<count {
+                        planar[channel][frame] *= gain
+                    }
+                }
+            }
+        }
+    }
+
     func process(interleaved: UnsafeMutablePointer<Float>, frames: Int) {
         guard frames > 0 else { return }
         let channelCount = channels
