@@ -1,3 +1,4 @@
+import AudioToolbox
 import AVFoundation
 import CoreMedia
 import Foundation
@@ -17,6 +18,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     private let onState: @Sendable (PlaybackState) -> Void
     private let onTime: @Sendable (TimeInterval) -> Void
+    private let onTrackChange: @Sendable (ApoloTrack) -> Void
 
     private var decoder: AudioDecoder?
     private var timeObserver: Any?
@@ -26,13 +28,17 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
     private var trackGainDB: Double = 0
+    private var nextTrack: ApoloTrack?
+    private var timelineEnd: TimeInterval = 0
 
     init(
         onState: @escaping @Sendable (PlaybackState) -> Void,
-        onTime: @escaping @Sendable (TimeInterval) -> Void
+        onTime: @escaping @Sendable (TimeInterval) -> Void,
+        onTrackChange: @escaping @Sendable (ApoloTrack) -> Void
     ) {
         self.onState = onState
         self.onTime = onTime
+        self.onTrackChange = onTrackChange
         synchronizer.addRenderer(renderer)
         timeObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
@@ -158,6 +164,10 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             }
 
             guard let buffer = decoder.readNextBuffer() else {
+                if let next = nextTrack, start(next: next) {
+                    nextTrack = nil
+                    continue
+                }
                 requesting = false
                 renderer.stopRequestingMediaData()
                 synchronizer.setRate(0, time: synchronizer.currentTime())
@@ -171,7 +181,37 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
             }
 
+            timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
             renderer.enqueue(buffer)
+        }
+    }
+
+    func enqueueNext(_ track: ApoloTrack) {
+        queue.async { [weak self] in
+            self?.nextTrack = track
+        }
+    }
+
+    /// Opens the next source on the running synchronizer and hands it the
+    /// timeline position the previous track ended at. Returns false when the
+    /// source cannot be opened.
+    private func start(next track: ApoloTrack) -> Bool {
+        do {
+            let decoder = AudioDecoder()
+            decoder.processingSettings = equalizer
+            decoder.limiterEnabled = limiterEnabled
+            decoder.trackGainDB = trackGainDB
+            decoder.startOffsetSeconds = max(
+                timelineEnd,
+                synchronizer.currentTime().seconds
+            )
+            try decoder.open(url: track.url, httpHeaders: track.httpHeaders)
+            self.decoder?.close()
+            self.decoder = decoder
+            onTrackChange(track)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -184,6 +224,28 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         decoder = nil
         started = false
         wantsToPlay = false
+        nextTrack = nil
+        timelineEnd = 0
+    }
+
+    private static func endSeconds(of buffer: CMSampleBuffer) -> TimeInterval {
+        let start = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+        let duration = CMSampleBufferGetDuration(buffer)
+        if duration.isNumeric, duration.seconds > 0 {
+            return start + duration.seconds
+        }
+
+        var rate = 48_000.0
+        var frames = Double(CMSampleBufferGetNumSamples(buffer))
+        if let format = CMSampleBufferGetFormatDescription(buffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format) {
+            rate = asbd.pointee.mSampleRate
+            if asbd.pointee.mFormatID != kAudioFormatLinearPCM {
+                frames = Double(asbd.pointee.mFramesPerPacket)
+            }
+        }
+        guard rate > 0 else { return start }
+        return start + frames / rate
     }
 
     private func publish(_ state: PlaybackState) {

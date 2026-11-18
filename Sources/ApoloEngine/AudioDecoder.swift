@@ -35,6 +35,9 @@ final class AudioDecoder {
     var processingSettings: EqualizerSettings = .flat
     var limiterEnabled = true
     var trackGainDB: Double = 0
+    /// Added to every buffer PTS so a gapless switch keeps the render timeline
+    /// monotonic across tracks.
+    var startOffsetSeconds: Double = 0
 
     private var pendingBytes: [UInt8] = []
     private var pendingSamples = 0
@@ -185,7 +188,7 @@ final class AudioDecoder {
                 continue
             }
 
-            let seconds = startSeconds(for: packet)
+            let seconds = startSeconds(for: packet) + startOffsetSeconds
 
             if passthroughMode == .undecided {
                 let stream = formatContext.pointee.streams[Int(streamIndex)]
@@ -409,6 +412,7 @@ final class AudioDecoder {
                     AVRational(num: 1, den: sampleRate)
                 )
             pendingStartPTS = CMTime(value: ticks, timescale: sampleRate)
+                + CMTime(seconds: startOffsetSeconds, preferredTimescale: 600)
         }
 
         pendingBytes.append(contentsOf: scratch.prefix(Int(converted) * bytesPerFrame))

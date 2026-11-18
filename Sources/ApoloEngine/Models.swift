@@ -52,6 +52,24 @@ public enum AudioRoute: Sendable, Equatable {
     case libavcodec
 }
 
+/// One queued source. The engine uses it to keep gapless playback going and to
+/// update the Now Playing card across track boundaries.
+public struct ApoloTrack: Sendable, Equatable {
+    public let url: URL
+    public let httpHeaders: [String: String]
+    public let metadata: NowPlayingMetadata?
+
+    public init(
+        url: URL,
+        httpHeaders: [String: String] = [:],
+        metadata: NowPlayingMetadata? = nil
+    ) {
+        self.url = url
+        self.httpHeaders = httpHeaders
+        self.metadata = metadata
+    }
+}
+
 /// Playback lifecycle.
 public enum PlaybackState: Sendable, Equatable {
     case idle

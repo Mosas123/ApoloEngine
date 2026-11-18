@@ -39,12 +39,20 @@ public final class ApoloEngine {
     private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
 
+    /// Sources queued after the current one. The hosts advance into them on
+    /// their own; the engine only keeps the Now Playing card in sync.
+    public private(set) var nextTracks: [ApoloTrack] = []
+    public private(set) var currentTrack: ApoloTrack?
+
     public init() {
         host.onState = { [weak self] state in
             self?.apply(state)
         }
         host.onTime = { [weak self] time in
             self?.elapsed = time
+        }
+        host.onTrackChange = { [weak self] in
+            self?.advanceFromQueue()
         }
         nowPlaying.onPlay = { [weak self] in self?.play() }
         nowPlaying.onPause = { [weak self] in self?.pause() }
@@ -60,6 +68,9 @@ public final class ApoloEngine {
             },
             onTime: { [weak self] time in
                 Task { @MainActor in self?.elapsed = time }
+            },
+            onTrackChange: { [weak self] track in
+                Task { @MainActor in self?.advance(to: track) }
             }
         )
     }
@@ -102,6 +113,11 @@ public final class ApoloEngine {
     ) async throws {
         state = .loading
         self.metadata = metadata
+        currentTrack = ApoloTrack(
+            url: url,
+            httpHeaders: httpHeaders,
+            metadata: metadata
+        )
 
         let info = try await Task.detached(priority: .userInitiated) {
             try MediaProbe.probe(url: url, httpHeaders: httpHeaders)
@@ -115,6 +131,9 @@ public final class ApoloEngine {
 
         try session.activateMultichannel()
 
+        metadataGainDB = info.trackGainDB
+        applyProcessing()
+
         switch CodecSupport.route(forCodec: track.codec) {
         case .avPlayer:
             route = .avPlayer
@@ -123,8 +142,6 @@ public final class ApoloEngine {
         case .libavcodec:
             route = .libavcodec
             host.stop()
-            metadataGainDB = info.trackGainDB
-            applyProcessing()
             libavHost?.load(url: url, httpHeaders: httpHeaders)
         }
 
@@ -162,6 +179,22 @@ public final class ApoloEngine {
         }
     }
 
+    /// Queues a source to start when the current one ends, with no gap on the
+    /// libavcodec route and no audible one on AVQueuePlayer.
+    public func enqueueNext(_ track: ApoloTrack) async {
+        nextTracks.append(track)
+        switch route {
+        case .avPlayer:
+            await host.enqueueNext(track)
+        case .libavcodec:
+            libavHost?.enqueueNext(track)
+        }
+    }
+
+    public func clearQueue() {
+        nextTracks.removeAll()
+    }
+
     public func stop() {
         host.stop()
         libavHost?.stop()
@@ -171,6 +204,26 @@ public final class ApoloEngine {
         media = nil
         elapsed = 0
         state = .idle
+        nextTracks.removeAll()
+        currentTrack = nil
+        metadata = nil
+    }
+
+    private func advanceFromQueue() {
+        guard !nextTracks.isEmpty else { return }
+        advance(to: nextTracks.removeFirst())
+    }
+
+    private func advance(to track: ApoloTrack) {
+        if let index = nextTracks.firstIndex(of: track) {
+            nextTracks.remove(at: index)
+        }
+        currentTrack = track
+        metadata = track.metadata
+        metadataGainDB = nil
+        elapsed = 0
+        applyProcessing()
+        refreshNowPlaying()
     }
 
     private func applyProcessing() {

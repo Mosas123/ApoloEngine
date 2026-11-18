@@ -25,6 +25,22 @@ final class AudioDecoderTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    func testStartOffsetShiftsTheTimeline() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("apolo-offset-\(UUID().uuidString).wav")
+        try makeToneWAV().write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let decoder = AudioDecoder()
+        decoder.startOffsetSeconds = 10
+        try decoder.open(url: url, httpHeaders: [:])
+        defer { decoder.close() }
+
+        let first = try XCTUnwrap(decoder.readNextBuffer())
+        let pts = CMSampleBufferGetPresentationTimeStamp(first).seconds
+        XCTAssertEqual(pts, 10, accuracy: 0.01)
+    }
+
     func testMP4MuxerIsAvailable() {
         XCTAssertTrue(EAC3Passthrough.isMP4MuxerAvailable())
     }
