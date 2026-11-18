@@ -55,7 +55,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             guard let self else { return }
             self.reset()
             do {
-                let decoder = try AudioDecoder()
+                let decoder = AudioDecoder()
                 try decoder.open(url: url, httpHeaders: httpHeaders)
                 self.decoder = decoder
                 self.wantsToPlay = true
@@ -96,8 +96,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             do {
                 try decoder.seek(to: seconds)
                 self.renderer.flush()
-                self.synchronizer.setCurrentTime(
-                    CMTime(seconds: seconds, preferredTimescale: 600)
+                self.synchronizer.currentTime = CMTime(
+                    seconds: seconds,
+                    preferredTimescale: 600
                 )
                 self.started = false
                 if self.wantsToPlay {
@@ -155,7 +156,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         renderer.stopRequestingMediaData()
         renderer.flush()
         synchronizer.setRate(0, time: .zero)
-        synchronizer.setCurrentTime(.zero)
+        synchronizer.currentTime = .zero
         decoder?.close()
         decoder = nil
         started = false
