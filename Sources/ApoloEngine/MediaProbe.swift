@@ -36,6 +36,7 @@ public enum MediaProbe {
 
         var tracks: [AudioTrackInfo] = []
         var audioMetadata: OpaquePointer?
+        var streamDuration: TimeInterval = 0
         for index in 0..<Int(context.pointee.nb_streams) {
             guard let stream = context.pointee.streams[index],
                   let codecpar = stream.pointee.codecpar,
@@ -47,6 +48,13 @@ public enum MediaProbe {
 
             if audioMetadata == nil {
                 audioMetadata = stream.pointee.metadata
+            }
+            if streamDuration == 0, stream.pointee.duration != Int64.min {
+                let base = stream.pointee.time_base
+                if base.num > 0, base.den > 0 {
+                    streamDuration = Double(stream.pointee.duration)
+                        * Double(base.num) / Double(base.den)
+                }
             }
 
             tracks.append(
@@ -67,10 +75,10 @@ public enum MediaProbe {
 
         // AV_NOPTS_VALUE is a C macro (INT64_MIN) and does not bridge to Swift.
         let duration: TimeInterval
-        if context.pointee.duration != Int64.min {
+        if context.pointee.duration != Int64.min, context.pointee.duration > 0 {
             duration = TimeInterval(context.pointee.duration) / TimeInterval(AV_TIME_BASE)
         } else {
-            duration = 0
+            duration = streamDuration
         }
 
         let trackGain = replayGain(from: context.pointee.metadata)

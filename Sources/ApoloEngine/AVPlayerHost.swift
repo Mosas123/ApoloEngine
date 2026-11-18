@@ -82,6 +82,7 @@ final class AVPlayerHost {
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
         observeEnd(of: item)
+        observeFailure(of: item)
         // Start first; the tap is attached as soon as the track loads so a
         // remote asset does not delay time-to-first-audio.
         player.insert(item, after: nil)
@@ -101,6 +102,7 @@ final class AVPlayerHost {
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
         observeEnd(of: item)
+        observeFailure(of: item)
         player.insert(item, after: player.items().last)
         if finished {
             finished = false
@@ -180,6 +182,19 @@ final class AVPlayerHost {
             // safe without crossing an isolation boundary.
             MainActor.assumeIsolated {
                 self?.handleEnd(of: ended)
+            }
+        }
+        endObservers.append(token)
+    }
+
+    private func observeFailure(of item: AVPlayerItem) {
+        let token = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.failedToPlayToEndTimeNotification,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.publish(.failed("Playback failed"))
             }
         }
         endObservers.append(token)

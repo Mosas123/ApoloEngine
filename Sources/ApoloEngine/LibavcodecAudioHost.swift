@@ -30,6 +30,11 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var trackGainDB: Double = 0
     private var nextTrack: ApoloTrack?
     private var timelineEnd: TimeInterval = 0
+    /// Absolute synchronizer position where the current track starts. The
+    /// public time is always relative to it, even after gapless switches.
+    private var trackStart: TimeInterval = 0
+    private let timelineLock = NSLock()
+    private var finishToken: UInt64 = 0
 
     init(
         onState: @escaping @Sendable (PlaybackState) -> Void,
@@ -45,13 +50,26 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             queue: .main
         ) { [weak self] time in
             guard let self, time.isNumeric else { return }
-            self.onTime(time.seconds)
+            self.onTime(max(0, time.seconds - self.currentTrackStart))
         }
     }
 
     var currentTime: TimeInterval {
         let seconds = synchronizer.currentTime().seconds
-        return seconds.isFinite ? seconds : 0
+        guard seconds.isFinite else { return 0 }
+        return max(0, seconds - currentTrackStart)
+    }
+
+    private var currentTrackStart: TimeInterval {
+        timelineLock.lock()
+        defer { timelineLock.unlock() }
+        return trackStart
+    }
+
+    private func setTrackStart(_ value: TimeInterval) {
+        timelineLock.lock()
+        trackStart = value
+        timelineLock.unlock()
     }
 
     var volume: Float {
@@ -106,14 +124,16 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, let decoder = self.decoder else { return }
             do {
-                try decoder.seek(to: seconds)
+                let target = self.currentTrackStart + max(0, seconds)
+                try decoder.seek(to: max(0, seconds))
                 self.renderer.flush()
                 self.synchronizer.setRate(
                     self.wantsToPlay ? 1 : 0,
-                    time: CMTime(seconds: seconds, preferredTimescale: 600)
+                    time: CMTime(seconds: target, preferredTimescale: 600)
                 )
                 self.started = false
-                self.timelineEnd = seconds
+                self.timelineEnd = target
+                self.finishToken &+= 1
                 if self.wantsToPlay {
                     self.startRequesting()
                 }
@@ -171,8 +191,24 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 }
                 requesting = false
                 renderer.stopRequestingMediaData()
-                synchronizer.setRate(0, time: synchronizer.currentTime())
-                publish(.finished)
+                // The renderer still holds enqueued audio. Do not stop the
+                // clock now or the tail of every track is cut. Finish once the
+                // last queued buffer should have played.
+                let remaining = max(
+                    0,
+                    timelineEnd - synchronizer.currentTime().seconds
+                )
+                finishToken &+= 1
+                let token = finishToken
+                queue.asyncAfter(deadline: .now() + remaining + 0.3) {
+                    [weak self] in
+                    guard let self, self.finishToken == token else { return }
+                    self.synchronizer.setRate(
+                        0,
+                        time: self.synchronizer.currentTime()
+                    )
+                    self.publish(.finished)
+                }
                 return
             }
 
@@ -191,9 +227,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.nextTrack = track
+            self.finishToken &+= 1
             // The host may have already reached `.finished`; restart the
-            // renderer so the queued track actually plays.
+            // renderer so the queued track actually plays. Clearing `started`
+            // makes the first new buffer re-arm the synchronizer rate.
             if !self.requesting {
+                self.started = false
                 self.startRequesting()
             }
         }
@@ -221,6 +260,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             try decoder.open(url: track.url, httpHeaders: track.httpHeaders)
             self.decoder?.close()
             self.decoder = decoder
+            self.setTrackStart(decoder.startOffsetSeconds)
+            self.finishToken &+= 1
             onTrackChange(track)
             return true
         } catch {
@@ -239,6 +280,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         wantsToPlay = false
         nextTrack = nil
         timelineEnd = 0
+        setTrackStart(0)
+        finishToken &+= 1
     }
 
     private static func endSeconds(of buffer: CMSampleBuffer) -> TimeInterval {

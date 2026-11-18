@@ -132,6 +132,23 @@ public final class ApoloEngine {
         media = nil
         metadata = track.metadata
 
+        // The FFmpeg build has no network protocols, and AVFoundation is the
+        // native path for remote music (including Spatial/Atmos). Remote
+        // sources skip the probe entirely; the local FFmpeg route keeps the
+        // full codec/container probe.
+        let scheme = track.url.scheme?.lowercased()
+        if scheme == "http" || scheme == "https" {
+            guard epoch == loadEpoch else { return }
+            try? session.activateMultichannel()
+            metadataGainDB = nil
+            applyProcessing()
+            route = .avPlayer
+            libavHost?.stop()
+            await host.load(track: track)
+            refreshNowPlaying()
+            return
+        }
+
         let info: MediaInfo
         do {
             info = try await Task.detached(priority: .userInitiated) {
