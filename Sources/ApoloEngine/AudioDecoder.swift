@@ -43,6 +43,8 @@ final class AudioDecoder {
     private var pendingSamples = 0
     private var pendingStartPTS: CMTime = .invalid
     private var runningSamples: Int64 = 0
+    private var decoderDrained = false
+    private var resamplerFlushed = false
 
     deinit {
         close()
@@ -82,6 +84,13 @@ final class AudioDecoder {
         }
         streamIndex = found
         timeBase = stream.pointee.time_base
+
+        // Skip video/subtitle/cover packets instead of demuxing and throwing
+        // them away (album rips often carry cover art and chapters).
+        for index in 0..<Int(formatContext.pointee.nb_streams)
+        where Int32(index) != streamIndex {
+            formatContext.pointee.streams[index]?.pointee.discard = AVDISCARD_ALL
+        }
 
         guard let codecpar = stream.pointee.codecpar,
               let codec = avcodec_find_decoder(codecpar.pointee.codec_id)
@@ -138,14 +147,21 @@ final class AudioDecoder {
 
         while true {
             if reachedEnd {
+                if !decoderDrained {
+                    decoderDrained = true
+                    _ = avcodec_send_packet(codecContext, nil)
+                    if let buffer = drain(codecContext) { return buffer }
+                }
+                if !resamplerFlushed {
+                    return flushResampler()
+                }
                 return nil
             }
 
             let read = av_read_frame(formatContext, packet)
             if read < 0 {
                 reachedEnd = true
-                avcodec_send_packet(codecContext, nil)
-                return drain(codecContext)
+                continue
             }
 
             if packet.pointee.stream_index != streamIndex {
@@ -153,16 +169,34 @@ final class AudioDecoder {
                 continue
             }
 
-            let sent = avcodec_send_packet(codecContext, packet)
+            let result = send(packet, to: codecContext)
             av_packet_unref(packet)
-            if sent < 0 {
+            if !result.accepted {
                 continue
             }
-
-            if let buffer = drain(codecContext) {
+            if let buffer = result.buffer {
                 return buffer
             }
         }
+    }
+
+    /// Sends one packet, tolerating a full decoder: drain what it already has,
+    /// then retry the same packet once instead of dropping it.
+    private func send(
+        _ packet: UnsafePointer<AVPacket>,
+        to context: UnsafeMutablePointer<AVCodecContext>
+    ) -> (buffer: CMSampleBuffer?, accepted: Bool) {
+        let first = avcodec_send_packet(context, packet)
+        if first >= 0 {
+            return (drain(context), true)
+        }
+
+        let drained = drain(context)
+        let second = avcodec_send_packet(context, packet)
+        if second < 0 {
+            return (drained, false)
+        }
+        return (drained ?? drain(context), true)
     }
 
     private func readCompressedBuffer() -> CMSampleBuffer? {
@@ -202,12 +236,12 @@ final class AudioDecoder {
                     passthroughMode = .passthrough
                 } else {
                     passthroughMode = .decode
-                    let sent = avcodec_send_packet(codecContext, packet)
+                    let result = send(packet, to: codecContext)
                     av_packet_unref(packet)
-                    if sent < 0 {
-                        continue
+                    if result.accepted, let buffer = result.buffer {
+                        return buffer
                     }
-                    return drain(codecContext)
+                    return readDecodedBuffer()
                 }
             }
 
@@ -255,6 +289,9 @@ final class AudioDecoder {
 
     func seek(to seconds: TimeInterval) throws {
         guard let formatContext, let codecContext else { return }
+        guard timeBase.num > 0, timeBase.den > 0 else {
+            throw ApoloError.unsupportedFormat
+        }
 
         let rate = Double(timeBase.num) / Double(timeBase.den)
         let target = Int64(seconds / rate)
@@ -264,12 +301,16 @@ final class AudioDecoder {
             Int64.min,
             target,
             Int64.max,
-            0
+            AVSEEK_FLAG_BACKWARD
         )
         guard result >= 0 else { throw ApoloError.unsupportedFormat }
 
+        // Drop packets the demuxer queued before the seek point.
+        avformat_flush(formatContext)
         avcodec_flush_buffers(codecContext)
         reachedEnd = false
+        decoderDrained = false
+        resamplerFlushed = false
         runningSamples = 0
         resetPending()
     }
@@ -288,6 +329,8 @@ final class AudioDecoder {
         passthroughFormat = nil
         processingChain = nil
         passthroughMode = .decode
+        decoderDrained = false
+        resamplerFlushed = false
         resetPending()
     }
 
@@ -393,30 +436,73 @@ final class AudioDecoder {
         }
         guard converted > 0 else { return }
 
+        let ticks = frame.pointee.pts == Int64.min
+            ? runningSamples
+            : av_rescale_q(
+                frame.pointee.pts,
+                timeBase,
+                AVRational(num: 1, den: sampleRate)
+            )
+        commit(
+            scratch: scratch,
+            converted: Int(converted),
+            startTicks: ticks
+        )
+    }
+
+    /// Pushes whatever resampler tail is still buffered when the decoder hits
+    /// EOF. Without this the last few milliseconds of every track are lost.
+    private func flushResampler() -> CMSampleBuffer? {
+        guard let resampler, !resamplerFlushed else { return nil }
+        resamplerFlushed = true
+
+        let outputSamples = Int(swr_get_out_samples(resampler, 0))
+        guard outputSamples > 0 else { return nil }
+
+        let bytesPerFrame = Int(channels) * 4
+        var scratch = [UInt8](repeating: 0, count: outputSamples * bytesPerFrame)
+        let converted: Int32 = scratch.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return 0 }
+            var output: UnsafeMutablePointer<UInt8>? = base.assumingMemoryBound(to: UInt8.self)
+            return withUnsafeMutablePointer(to: &output) { outputPointer in
+                swr_convert(
+                    resampler,
+                    outputPointer,
+                    Int32(outputSamples),
+                    nil,
+                    0
+                )
+            }
+        }
+        guard converted > 0 else { return nil }
+
+        commit(
+            scratch: scratch,
+            converted: Int(converted),
+            startTicks: runningSamples
+        )
+        return makeSampleBuffer()
+    }
+
+    private func commit(scratch: [UInt8], converted: Int, startTicks: Int64) {
         if let chain = processingChain {
             scratch.withUnsafeMutableBytes { raw in
                 guard let base = raw.baseAddress else { return }
                 chain.process(
                     interleaved: base.assumingMemoryBound(to: Float.self),
-                    frames: Int(converted)
+                    frames: converted
                 )
             }
         }
 
         if pendingSamples == 0 {
-            let ticks = frame.pointee.pts == Int64.min
-                ? runningSamples
-                : av_rescale_q(
-                    frame.pointee.pts,
-                    timeBase,
-                    AVRational(num: 1, den: sampleRate)
-                )
-            pendingStartPTS = CMTime(value: ticks, timescale: sampleRate)
+            pendingStartPTS = CMTime(value: startTicks, timescale: sampleRate)
                 + CMTime(seconds: startOffsetSeconds, preferredTimescale: 600)
         }
 
-        pendingBytes.append(contentsOf: scratch.prefix(Int(converted) * bytesPerFrame))
-        pendingSamples += Int(converted)
+        let bytesPerFrame = Int(channels) * 4
+        pendingBytes.append(contentsOf: scratch.prefix(converted * bytesPerFrame))
+        pendingSamples += converted
         runningSamples += Int64(converted)
     }
 

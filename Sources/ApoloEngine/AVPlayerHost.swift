@@ -82,17 +82,32 @@ final class AVPlayerHost {
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
         observeEnd(of: item)
-        await attachTap(to: item, asset: asset)
+        // Start first; the tap is attached as soon as the track loads so a
+        // remote asset does not delay time-to-first-audio.
         player.insert(item, after: nil)
         player.play()
+        await attachTap(to: item, asset: asset)
+    }
+
+    func clearUpcoming() {
+        let items = player.items()
+        guard items.count > 1 else { return }
+        for item in items.dropFirst() {
+            player.remove(item)
+        }
     }
 
     func enqueueNext(_ track: ApoloTrack) async {
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
         observeEnd(of: item)
-        await attachTap(to: item, asset: asset)
         player.insert(item, after: player.items().last)
+        if finished {
+            finished = false
+            wantsToPlay = true
+            player.play()
+        }
+        await attachTap(to: item, asset: asset)
     }
 
     func play() {
@@ -159,21 +174,26 @@ final class AVPlayerHost {
             forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item,
             queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.handleEnd() }
+        ) { [weak self] notification in
+            guard let ended = notification.object as? AVPlayerItem else { return }
+            // The block runs on the main queue, so reading the player here is
+            // safe without crossing an isolation boundary.
+            MainActor.assumeIsolated {
+                self?.handleEnd(of: ended)
+            }
         }
         endObservers.append(token)
     }
 
-    private func handleEnd() {
-        guard let current = player.currentItem,
-              let last = player.items().last
-        else {
+    private func handleEnd(of ended: AVPlayerItem) {
+        guard let last = player.items().last else {
             finished = true
             publish(.finished)
             return
         }
-        if current === last {
+        // Compare the item that actually ended, not `currentItem`: by the time
+        // the notification runs AVQueuePlayer may already have advanced.
+        if ended === last {
             finished = true
             publish(.finished)
         } else {

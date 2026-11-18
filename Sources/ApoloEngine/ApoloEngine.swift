@@ -31,6 +31,9 @@ public final class ApoloEngine {
     }
 
     private var metadataGainDB: Double?
+    /// Incremented on every load/skip so a slow, superseded probe cannot
+    /// overwrite the engine after the user moved on.
+    private var loadEpoch: UInt64 = 0
 
     private let host = AVPlayerHost()
     private let session = AudioSessionController()
@@ -119,16 +122,32 @@ public final class ApoloEngine {
             metadata: metadata
         )
         queue.start(track)
-        try await startPlayback(track)
+        loadEpoch &+= 1
+        try await startPlayback(track, epoch: loadEpoch)
     }
 
-    private func startPlayback(_ track: ApoloTrack) async throws {
+    private func startPlayback(_ track: ApoloTrack, epoch: UInt64) async throws {
         state = .loading
+        elapsed = 0
+        media = nil
         metadata = track.metadata
 
-        let info = try await Task.detached(priority: .userInitiated) {
-            try MediaProbe.probe(url: track.url, httpHeaders: track.httpHeaders)
-        }.value
+        let info: MediaInfo
+        do {
+            info = try await Task.detached(priority: .userInitiated) {
+                try MediaProbe.probe(
+                    url: track.url,
+                    httpHeaders: track.httpHeaders
+                )
+            }.value
+        } catch {
+            if epoch == loadEpoch {
+                state = .failed("Could not open the source")
+            }
+            throw error
+        }
+
+        guard epoch == loadEpoch else { return }
         media = info
 
         guard let audioTrack = info.audioTracks.first else {
@@ -136,7 +155,9 @@ public final class ApoloEngine {
             throw ApoloError.noAudioTrack
         }
 
-        try session.activateMultichannel()
+        // A session failure degrades Spatial Audio, it must not strand the
+        // engine in `.loading`.
+        try? session.activateMultichannel()
 
         metadataGainDB = info.trackGainDB
         applyProcessing()
@@ -187,6 +208,8 @@ public final class ApoloEngine {
         case .libavcodec:
             libavHost?.seek(to: seconds)
         }
+        elapsed = seconds
+        refreshNowPlaying()
     }
 
     /// Queues a source to start when the current one ends, with no gap on the
@@ -203,18 +226,22 @@ public final class ApoloEngine {
 
     public func clearQueue() {
         queue.clearUpcoming()
+        host.clearUpcoming()
+        libavHost?.clearNext()
     }
 
     /// Manual skip. Reloads the source through the normal route decision, so a
     /// codec change between tracks is handled.
     public func skipToNext() async throws {
         guard let next = queue.advance() else { return }
-        try await startPlayback(next)
+        loadEpoch &+= 1
+        try await startPlayback(next, epoch: loadEpoch)
     }
 
     public func skipToPrevious() async throws {
         guard let previous = queue.previous() else { return }
-        try await startPlayback(previous)
+        loadEpoch &+= 1
+        try await startPlayback(previous, epoch: loadEpoch)
     }
 
     public func stop() {
@@ -245,6 +272,8 @@ public final class ApoloEngine {
     private func applyAdvanced(_ track: ApoloTrack) {
         metadata = track.metadata
         metadataGainDB = nil
+        // The previous track's probed duration no longer applies.
+        media = nil
         elapsed = 0
         applyProcessing()
         refreshNowPlaying()

@@ -41,12 +41,17 @@ final class AudioProcessingChain {
         self.channels = max(1, channels)
         self.limiterEnabled = limiterEnabled
         self.limiter = Limiter(ceilingDB: -1, sampleRate: sampleRate)
-        self.preamp = Float(pow(10, (settings.preampDB + trackGainDB) / 20))
+
+        let totalGainDB = settings.preampDB + trackGainDB
+        self.preamp = totalGainDB.isFinite
+            ? Float(pow(10, totalGainDB / 20))
+            : 1
 
         let bands = settings.bandsDB
         self.filters = (0..<self.channels).map { _ in
-            zip(EqualizerSettings.bandFrequencies, bands).map { frequency, gain in
-                Biquad.peaking(
+            zip(EqualizerSettings.bandFrequencies, bands).compactMap { frequency, gain in
+                guard gain != 0, gain.isFinite else { return nil }
+                return Biquad.peaking(
                     frequency: frequency,
                     q: 1,
                     gainDB: gain,
@@ -60,6 +65,7 @@ final class AudioProcessingChain {
         guard frames > 0 else { return }
         let count = min(planar.count, filters.count)
         guard count > 0 else { return }
+        guard !filters[0].isEmpty || limiterEnabled || preamp != 1 else { return }
 
         for frame in 0..<frames {
             var peak: Float = 0
@@ -87,6 +93,7 @@ final class AudioProcessingChain {
     func process(interleaved: UnsafeMutablePointer<Float>, frames: Int) {
         guard frames > 0 else { return }
         let channelCount = channels
+        guard !filters[0].isEmpty || limiterEnabled || preamp != 1 else { return }
 
         for frame in 0..<frames {
             let base = frame * channelCount

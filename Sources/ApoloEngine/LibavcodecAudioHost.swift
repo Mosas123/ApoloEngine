@@ -113,6 +113,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                     time: CMTime(seconds: seconds, preferredTimescale: 600)
                 )
                 self.started = false
+                self.timelineEnd = seconds
                 if self.wantsToPlay {
                     self.startRequesting()
                 }
@@ -188,7 +189,19 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     func enqueueNext(_ track: ApoloTrack) {
         queue.async { [weak self] in
-            self?.nextTrack = track
+            guard let self else { return }
+            self.nextTrack = track
+            // The host may have already reached `.finished`; restart the
+            // renderer so the queued track actually plays.
+            if !self.requesting {
+                self.startRequesting()
+            }
+        }
+    }
+
+    func clearNext() {
+        queue.async { [weak self] in
+            self?.nextTrack = nil
         }
     }
 
