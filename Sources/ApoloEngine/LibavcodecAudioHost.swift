@@ -199,49 +199,55 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     private func provideMoreMedia() {
-        while renderer.isReadyForMoreMediaData {
-            guard let decoder else {
-                requesting = false
-                return
-            }
-
-            guard let buffer = decoder.readNextBuffer() else {
-                if let next = nextTrack, start(next: next) {
-                    nextTrack = nil
-                    continue
-                }
-                requesting = false
-                renderer.stopRequestingMediaData()
-                // The renderer still holds enqueued audio. Do not stop the
-                // clock now or the tail of every track is cut. Finish once the
-                // last queued buffer should have played.
-                let remaining = max(
-                    0,
-                    timelineEnd - synchronizer.currentTime().seconds
-                )
-                finishToken &+= 1
-                let token = finishToken
-                queue.asyncAfter(deadline: .now() + remaining + 0.3) {
-                    [weak self] in
-                    guard let self, self.finishToken == token else { return }
-                    self.synchronizer.setRate(
-                        0,
-                        time: self.synchronizer.currentTime()
-                    )
-                    self.publish(.finished)
-                }
-                return
-            }
-
-            if !started {
-                started = true
-                let start = CMSampleBufferGetPresentationTimeStamp(buffer)
-                synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
-            }
-
-            timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
-            renderer.enqueue(buffer)
+        // One buffer per callback. The renderer calls this again as soon as
+        // it wants more, so control commands queued on this serial queue
+        // (pause, seek, load) run between refill steps instead of waiting for
+        // a long burst to finish.
+        guard renderer.isReadyForMoreMediaData else { return }
+        guard let decoder else {
+            requesting = false
+            return
         }
+
+        if let buffer = decoder.readNextBuffer() {
+            enqueueDecoded(buffer)
+            return
+        }
+
+        if let next = nextTrack, start(next: next) {
+            nextTrack = nil
+            if let buffer = self.decoder?.readNextBuffer() {
+                enqueueDecoded(buffer)
+            }
+            return
+        }
+
+        requesting = false
+        renderer.stopRequestingMediaData()
+        // The renderer still holds enqueued audio. Do not stop the clock now
+        // or the tail of every track is cut. Finish once the last queued
+        // buffer should have played.
+        let remaining = max(
+            0,
+            timelineEnd - synchronizer.currentTime().seconds
+        )
+        finishToken &+= 1
+        let token = finishToken
+        queue.asyncAfter(deadline: .now() + remaining + 0.3) { [weak self] in
+            guard let self, self.finishToken == token else { return }
+            self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
+            self.publish(.finished)
+        }
+    }
+
+    private func enqueueDecoded(_ buffer: CMSampleBuffer) {
+        if !started {
+            started = true
+            let start = CMSampleBufferGetPresentationTimeStamp(buffer)
+            synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
+        }
+        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
+        renderer.enqueue(buffer)
     }
 
     func enqueueNext(_ track: ApoloTrack) {

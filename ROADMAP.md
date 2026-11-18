@@ -101,6 +101,8 @@ Fixed in phase 1 (CI green, 16 tests):
 - Single open for local files: `OpenedSource` runs `avformat_find_stream_info`
   once and hands the `AVFormatContext` to `AudioDecoder` on the libavcodec
   route; the AVPlayer route closes it after reading the info.
+- Refill is one buffer per callback, so control commands interleave with
+  decoding instead of waiting for a long burst.
 - Seek pre-roll: frames before the requested position are dropped instead of
   playing the previous keyframe's tail.
 
@@ -110,8 +112,9 @@ Open:
    custom `AVIOContext` over `URLSession`, or enable `network`/`http`/`https` +
    `securetransport` in the fork build (another multi-hour run). Standard
    remote music already plays through AVPlayer.
-2. Separate the control queue from the render queue so pause/seek stay snappy
-   during a refill burst.
+2. ~~Separate the control queue from the render queue.~~ The refill now
+   enqueues one buffer per `requestMediaDataWhenReady` callback, so pause/seek
+   queued on the same serial queue run between steps. No second queue needed.
 3. Probe tuning (`probesize`/`analyzeduration`).
 4. Channel-layout mapping for 5.1/7.1 (FFmpeg order vs Apple tags).
 5. Lookahead limiter and click-free EQ changes.
