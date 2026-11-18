@@ -318,10 +318,7 @@ final class AudioDecoder {
         processingSettings = settings
         self.limiterEnabled = limiterEnabled
         self.trackGainDB = trackGainDB
-        guard resampler != nil else { return }
-        processingChain = AudioProcessingChain(
-            sampleRate: Double(sampleRate),
-            channels: Int(channels),
+        processingChain?.update(
             settings: settings,
             limiterEnabled: limiterEnabled,
             trackGainDB: trackGainDB

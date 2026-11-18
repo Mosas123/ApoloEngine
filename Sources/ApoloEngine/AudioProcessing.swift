@@ -26,9 +26,10 @@ final class AudioProcessingChain {
     private let sampleRate: Double
     private let channels: Int
     private var filters: [[Biquad]]
+    private var activeBands: [[Int]] = []
     private var limiter: Limiter
     private var preamp: Float
-    private let limiterEnabled: Bool
+    private var limiterEnabled: Bool
 
     init(
         sampleRate: Double,
@@ -48,17 +49,72 @@ final class AudioProcessingChain {
             : 1
 
         let bands = settings.bandsDB
-        self.filters = (0..<self.channels).map { _ in
-            zip(EqualizerSettings.bandFrequencies, bands).compactMap { frequency, gain in
-                guard gain != 0, gain.isFinite else { return nil }
-                return Biquad.peaking(
+        var built: [[Biquad]] = []
+        var indices: [[Int]] = []
+        for _ in 0..<self.channels {
+            var channelFilters: [Biquad] = []
+            var channelBands: [Int] = []
+            for (index, frequency) in EqualizerSettings.bandFrequencies.enumerated() {
+                let gain = bands[index]
+                guard gain != 0, gain.isFinite else { continue }
+                channelFilters.append(
+                    Biquad.peaking(
+                        frequency: frequency,
+                        q: 1,
+                        gainDB: gain,
+                        sampleRate: sampleRate
+                    )
+                )
+                channelBands.append(index)
+            }
+            built.append(channelFilters)
+            indices.append(channelBands)
+        }
+        self.filters = built
+        self.activeBands = indices
+    }
+
+    /// Recomputes coefficients in place, carrying each biquad's memory and the
+    /// limiter envelope so an EQ change does not click.
+    func update(
+        settings: EqualizerSettings,
+        limiterEnabled: Bool,
+        trackGainDB: Double
+    ) {
+        let totalGainDB = settings.preampDB + trackGainDB
+        preamp = totalGainDB.isFinite
+            ? Float(pow(10, totalGainDB / 20))
+            : 1
+        self.limiterEnabled = limiterEnabled
+
+        let bands = settings.bandsDB
+        var built: [[Biquad]] = []
+        var indices: [[Int]] = []
+        for channel in 0..<channels {
+            var channelFilters: [Biquad] = []
+            var channelBands: [Int] = []
+            for (index, frequency) in EqualizerSettings.bandFrequencies.enumerated() {
+                let gain = bands[index]
+                guard gain != 0, gain.isFinite else { continue }
+                var filter = Biquad.peaking(
                     frequency: frequency,
                     q: 1,
                     gainDB: gain,
                     sampleRate: sampleRate
                 )
+                if let position = activeBands[channel].firstIndex(of: index) {
+                    let previous = filters[channel][position]
+                    filter.z1 = previous.z1
+                    filter.z2 = previous.z2
+                }
+                channelFilters.append(filter)
+                channelBands.append(index)
             }
+            built.append(channelFilters)
+            indices.append(channelBands)
         }
+        filters = built
+        activeBands = indices
     }
 
     func process(planar: [UnsafeMutablePointer<Float>], frames: Int) {
