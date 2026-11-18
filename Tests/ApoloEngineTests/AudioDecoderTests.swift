@@ -9,7 +9,7 @@ final class AudioDecoderTests: XCTestCase {
         try makeToneWAV().write(to: url)
         defer { try? FileManager.default.removeItem(at: url) }
 
-        let decoder = try AudioDecoder()
+        let decoder = AudioDecoder()
         try decoder.open(url: url, httpHeaders: [:])
         defer { decoder.close() }
 
