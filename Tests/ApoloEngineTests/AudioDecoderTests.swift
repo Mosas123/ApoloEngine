@@ -25,6 +25,10 @@ final class AudioDecoderTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    func testMP4MuxerIsAvailable() {
+        XCTAssertTrue(EAC3Passthrough.isMP4MuxerAvailable())
+    }
+
     private func makeToneWAV(
         sampleRate: Int = 44_100,
         seconds: Double = 0.25,

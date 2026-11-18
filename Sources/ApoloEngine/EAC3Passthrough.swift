@@ -139,6 +139,23 @@ enum EAC3Passthrough {
         return flag == 1
     }
 
+    /// Whether this FFmpeg build carries the mp4 muxer the dec3 extraction
+    /// depends on. Cheap enough to assert once in tests.
+    static func isMP4MuxerAvailable() -> Bool {
+        var context: UnsafeMutablePointer<AVFormatContext>?
+        let status = avformat_alloc_output_context2(
+            &context,
+            nil,
+            "mp4",
+            "probe.mp4"
+        )
+        let available = status == 0 && context != nil
+        if let context {
+            avformat_free_context(context)
+        }
+        return available
+    }
+
     static func dec3Box(
         codecpar: UnsafePointer<AVCodecParameters>,
         packet: UnsafePointer<AVPacket>
