@@ -41,6 +41,24 @@ final class AudioDecoderTests: XCTestCase {
         XCTAssertEqual(pts, 10, accuracy: 0.01)
     }
 
+    func testAdoptsAnAlreadyOpenedSource() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("apolo-adopt-\(UUID().uuidString).wav")
+        try makeToneWAV().write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let source = try OpenedSource.open(url: url)
+        let decoder = AudioDecoder()
+        try decoder.adopt(source)
+        defer { decoder.close() }
+
+        var samples = 0
+        while let buffer = decoder.readNextBuffer() {
+            samples += CMSampleBufferGetNumSamples(buffer)
+        }
+        XCTAssertGreaterThan(samples, 0)
+    }
+
     func testMP4MuxerIsAvailable() {
         XCTAssertTrue(EAC3Passthrough.isMP4MuxerAvailable())
     }
