@@ -76,7 +76,7 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 
 ## Audit backlog
 
-Fixed in phase 1 (CI green, 16 tests):
+Fixed in phase 1 (CI green, 19 tests):
 
 - Tap lifetime: `passRetained` + `release` in `finalize` (no use-after-free).
 - Tap state under one lock; planar pointer array reused on the audio thread.
@@ -105,6 +105,9 @@ Fixed in phase 1 (CI green, 16 tests):
   decoding instead of waiting for a long burst.
 - Seek pre-roll: frames before the requested position are dropped instead of
   playing the previous keyframe's tail.
+- 7-channel PCM: the resampler is forced to `6.1(back)` so `MPEG_6_1_A`
+  describes the actual order. 1/2/4/5/6/8 already match the default order
+  (cross-checked against AetherEngine); there is a layout test.
 
 Open:
 
@@ -116,7 +119,6 @@ Open:
    enqueues one buffer per `requestMediaDataWhenReady` callback, so pause/seek
    queued on the same serial queue run between steps. No second queue needed.
 3. Probe tuning (`probesize`/`analyzeduration`).
-4. Channel-layout mapping for 5.1/7.1 (FFmpeg order vs Apple tags).
 5. Lookahead limiter and click-free EQ changes.
 6. AVPlayer: probe queued tracks for ReplayGain; Now Playing artwork and
    `MPNowPlayingInfoPropertyMediaType`.
