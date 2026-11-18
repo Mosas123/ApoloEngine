@@ -15,6 +15,9 @@ never depends on a chat.
   the libavcodec path applies it through the limiter. `LoudnessAnalyzer` computes
   BS.1770 / EBU R128 integrated loudness (K-weighting, 400 ms blocks, gating) for
   offline per-track gain.
+- EQ, ReplayGain gain and limiter on the **AVPlayer route** too, through
+  `MTAudioProcessingTap` (`AudioTapProcessor`): planar/interleaved float, chain
+  swapped under a lock.
 - Now Playing + remote commands, `AVAudioSession` with
   `setSupportsMultichannelContent(true)`.
 
@@ -50,16 +53,15 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 
 ## Next
 
-1. EQ on the AVPlayer route via `MTAudioProcessingTap` (today it only applies on
-   the libavcodec route).
-2. Gapless playback.
-3. APAC encode for AirPlay / HomePod Atmos.
-4. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
-5. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
+1. Gapless playback.
+2. APAC encode for AirPlay / HomePod Atmos.
+3. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+4. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
 ## Known constraints
 
 - iOS 18+; Spatial Audio / object audio effectively wants iOS 26.
-- The EQ is applied only where ApoloEngine owns the PCM (libavcodec route).
+- Taps only process Float32 buffers; other AVPlayer processing formats play
+  without processing instead of failing.
 - JOC passthrough relies on the system Atmos decoder; no bundled primer yet.
