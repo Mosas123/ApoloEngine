@@ -22,6 +22,15 @@ final class AudioDecoder {
     private var formatDescription: CMAudioFormatDescription?
     private var reachedEnd = false
 
+    private enum PassthroughMode {
+        case decode
+        case undecided
+        case passthrough
+    }
+
+    private var passthroughMode: PassthroughMode = .decode
+    private var passthroughFormat: CMAudioFormatDescription?
+
     private var pendingBytes: [UInt8] = []
     private var pendingSamples = 0
     private var pendingStartPTS: CMTime = .invalid
@@ -92,10 +101,27 @@ final class AudioDecoder {
         if channels > 8 {
             channels = 2
         }
+
+        // Only a 5.1 48 kHz E-AC-3 stream can carry JOC. Whether it does is
+        // decidable from the dec3 box, which needs a real packet.
+        if codecpar.pointee.codec_id == AV_CODEC_ID_EAC3,
+           channels == 6,
+           sampleRate == 48_000 {
+            passthroughMode = .undecided
+        }
     }
 
-    /// Returns the next decoded buffer, or nil at end of stream.
+    /// Returns the next buffer, decoded or compressed, or nil at end of stream.
     func readNextBuffer() -> CMSampleBuffer? {
+        switch passthroughMode {
+        case .decode:
+            return readDecodedBuffer()
+        case .undecided, .passthrough:
+            return readCompressedBuffer()
+        }
+    }
+
+    private func readDecodedBuffer() -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
 
         var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
@@ -131,6 +157,76 @@ final class AudioDecoder {
         }
     }
 
+    private func readCompressedBuffer() -> CMSampleBuffer? {
+        guard let formatContext, let codecContext else { return nil }
+
+        var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        defer { av_packet_free(&packet) }
+        guard let packet else { return nil }
+
+        while true {
+            if reachedEnd {
+                return nil
+            }
+
+            let read = av_read_frame(formatContext, packet)
+            if read < 0 {
+                reachedEnd = true
+                return nil
+            }
+
+            if packet.pointee.stream_index != streamIndex {
+                av_packet_unref(packet)
+                continue
+            }
+
+            let seconds = startSeconds(for: packet)
+
+            if passthroughMode == .undecided {
+                let stream = formatContext.pointee.streams[Int(streamIndex)]
+                if let codecpar = stream?.pointee.codecpar,
+                   let entry = EAC3Passthrough.formatDescription(
+                       codecpar: codecpar,
+                       packet: packet
+                   ),
+                   entry.carriesJOC {
+                    passthroughFormat = entry.description
+                    passthroughMode = .passthrough
+                } else {
+                    passthroughMode = .decode
+                    let sent = avcodec_send_packet(codecContext, packet)
+                    av_packet_unref(packet)
+                    if sent < 0 {
+                        continue
+                    }
+                    return drain(codecContext)
+                }
+            }
+
+            guard let format = passthroughFormat else {
+                av_packet_unref(packet)
+                return nil
+            }
+            let buffer = EAC3Passthrough.sampleBuffer(
+                packet: packet,
+                seconds: seconds,
+                formatDescription: format
+            )
+            av_packet_unref(packet)
+            if let buffer {
+                return buffer
+            }
+        }
+    }
+
+    private func startSeconds(for packet: UnsafePointer<AVPacket>) -> Double {
+        let ticks = packet.pointee.pts != Int64.min
+            ? packet.pointee.pts
+            : packet.pointee.dts
+        guard ticks != Int64.min, timeBase.den > 0 else { return 0 }
+        return Double(ticks) * Double(timeBase.num) / Double(timeBase.den)
+    }
+
     func seek(to seconds: TimeInterval) throws {
         guard let formatContext, let codecContext else { return }
 
@@ -163,6 +259,8 @@ final class AudioDecoder {
             avformat_close_input(&formatContext)
         }
         formatDescription = nil
+        passthroughFormat = nil
+        passthroughMode = .decode
         resetPending()
     }
 
