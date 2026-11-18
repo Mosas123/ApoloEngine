@@ -50,6 +50,8 @@ jobs:
             -scheme ApoloEngine \
             -destination 'generic/platform=iOS Simulator' \
             -derivedDataPath .build/DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO
 
       - name: Pick a simulator
@@ -70,4 +72,6 @@ jobs:
             -scheme ApoloEngine \
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
             -derivedDataPath .build/DerivedData \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO

@@ -65,6 +65,12 @@ lacks, while keeping the Apple output path.
 Caveats: the macOS build takes hours, can fail on SDK/disk, and each successful
 build adds roughly 380 MB to the FFmpegBuild git history.
 
+Known issue in the first successful build: the **x86_64 simulator** slices keep
+absolute `/Users/runner/...` install names (the `install_name_tool` pass missed
+them); the **arm64** slices are correct. CI forces `ARCHS=arm64`, which is what
+devices and Apple Silicon simulators use. Follow-up: rebuild fixing the
+per-slice install names (or drop the x86_64 simulator slice).
+
 ## Next
 
 1. APAC (AirPlay / HomePod Atmos): iOS 26+, `AVAudioConverter` with the APAC
