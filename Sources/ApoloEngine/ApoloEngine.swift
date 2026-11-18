@@ -15,6 +15,26 @@ public final class ApoloEngine {
     public private(set) var media: MediaInfo?
     public private(set) var elapsed: TimeInterval = 0
 
+    /// Five-band EQ. Applied on the libavcodec route; the AVPlayer route
+    /// ignores it until the tap lands.
+    public var equalizer: EqualizerSettings = .flat {
+        didSet {
+            libavHost?.configure(
+                equalizer: equalizer,
+                limiterEnabled: limiterEnabled
+            )
+        }
+    }
+
+    public var limiterEnabled: Bool = true {
+        didSet {
+            libavHost?.configure(
+                equalizer: equalizer,
+                limiterEnabled: limiterEnabled
+            )
+        }
+    }
+
     private let host = AVPlayerHost()
     private let session = AudioSessionController()
     private let nowPlaying = NowPlayingController()

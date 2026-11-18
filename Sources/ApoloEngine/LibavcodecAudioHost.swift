@@ -23,6 +23,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var requesting = false
     private var started = false
     private var wantsToPlay = false
+    private var equalizer = EqualizerSettings.flat
+    private var limiterEnabled = true
 
     init(
         onState: @escaping @Sendable (PlaybackState) -> Void,
@@ -56,6 +58,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             self.reset()
             do {
                 let decoder = AudioDecoder()
+                decoder.processingSettings = self.equalizer
+                decoder.limiterEnabled = self.limiterEnabled
                 try decoder.open(url: url, httpHeaders: httpHeaders)
                 self.decoder = decoder
                 self.wantsToPlay = true
@@ -115,6 +119,18 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             guard let self else { return }
             self.reset()
             self.publish(.idle)
+        }
+    }
+
+    func configure(equalizer: EqualizerSettings, limiterEnabled: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.equalizer = equalizer
+            self.limiterEnabled = limiterEnabled
+            self.decoder?.updateProcessing(
+                settings: equalizer,
+                limiterEnabled: limiterEnabled
+            )
         }
     }
 

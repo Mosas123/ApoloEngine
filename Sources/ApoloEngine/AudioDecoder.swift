@@ -30,6 +30,10 @@ final class AudioDecoder {
 
     private var passthroughMode: PassthroughMode = .decode
     private var passthroughFormat: CMAudioFormatDescription?
+    private var processingChain: AudioProcessingChain?
+
+    var processingSettings: EqualizerSettings = .flat
+    var limiterEnabled = true
 
     private var pendingBytes: [UInt8] = []
     private var pendingSamples = 0
@@ -227,6 +231,18 @@ final class AudioDecoder {
         return Double(ticks) * Double(timeBase.num) / Double(timeBase.den)
     }
 
+    func updateProcessing(settings: EqualizerSettings, limiterEnabled: Bool) {
+        processingSettings = settings
+        self.limiterEnabled = limiterEnabled
+        guard resampler != nil else { return }
+        processingChain = AudioProcessingChain(
+            sampleRate: Double(sampleRate),
+            channels: Int(channels),
+            settings: settings,
+            limiterEnabled: limiterEnabled
+        )
+    }
+
     func seek(to seconds: TimeInterval) throws {
         guard let formatContext, let codecContext else { return }
 
@@ -260,6 +276,7 @@ final class AudioDecoder {
         }
         formatDescription = nil
         passthroughFormat = nil
+        processingChain = nil
         passthroughMode = .decode
         resetPending()
     }
@@ -326,6 +343,13 @@ final class AudioDecoder {
             swr_free(&self.resampler)
             return false
         }
+
+        processingChain = AudioProcessingChain(
+            sampleRate: Double(sampleRate),
+            channels: Int(channels),
+            settings: processingSettings,
+            limiterEnabled: limiterEnabled
+        )
         return true
     }
 
@@ -357,6 +381,16 @@ final class AudioDecoder {
             }
         }
         guard converted > 0 else { return }
+
+        if let chain = processingChain {
+            scratch.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                chain.process(
+                    interleaved: base.assumingMemoryBound(to: Float.self),
+                    frames: Int(converted)
+                )
+            }
+        }
 
         if pendingSamples == 0 {
             let ticks = frame.pointee.pts == Int64.min

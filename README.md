@@ -55,9 +55,10 @@ engine.play()
 | AVPlayer audio path | working |
 | Now Playing + remote commands | working |
 | Spatial Audio session (`setSupportsMultichannelContent`) | working |
-| libavcodec → `AVSampleBufferAudioRenderer` | roadmap |
-| E-AC-3 JOC (Atmos) passthrough | roadmap |
-| Loudness normalisation + limiter | roadmap |
+| libavcodec → `AVSampleBufferAudioRenderer` | working |
+| E-AC-3 JOC (Atmos) passthrough | working |
+| 5-band EQ + peak limiter (libavcodec route) | working |
+| Loudness normalisation (ReplayGain/EBU R128) | roadmap |
 | APAC (AirPlay / HomePod Atmos) | roadmap |
 | Gapless | roadmap |
 
