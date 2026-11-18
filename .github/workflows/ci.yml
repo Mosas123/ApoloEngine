@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: apolo-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Build + test (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+
+      - name: Cache SwiftPM clones
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/org.swift.swiftpm/repositories
+          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          restore-keys: swiftpm-repos-
+
+      - name: Resolve dependencies
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -scheme ApoloEngine \
+            -destination 'generic/platform=iOS Simulator'
+
+      - name: Build
+        run: |
+          set -o pipefail
+          xcodebuild build \
+            -scheme ApoloEngine \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 \
+            | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Testing on: $NAME"
+
+      - name: Test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -scheme ApoloEngine \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
+            -derivedDataPath .build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO
