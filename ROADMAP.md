@@ -105,6 +105,8 @@ Fixed in phase 1 (CI green, 19 tests):
   decoding instead of waiting for a long burst.
 - Seek pre-roll: frames before the requested position are dropped instead of
   playing the previous keyframe's tail.
+- EQ changes are click-free: coefficients are rewritten in place and each
+  biquad keeps its `z1`/`z2`, so moving a slider does not reset the filter.
 - 7-channel PCM: the resampler is forced to `6.1(back)` so `MPEG_6_1_A`
   describes the actual order. 1/2/4/5/6/8 already match the default order
   (cross-checked against AetherEngine); there is a layout test.
@@ -119,7 +121,11 @@ Open:
    enqueues one buffer per `requestMediaDataWhenReady` callback, so pause/seek
    queued on the same serial queue run between steps. No second queue needed.
 3. Probe tuning (`probesize`/`analyzeduration`).
-5. Lookahead limiter and click-free EQ changes.
+5. ~~Lookahead limiter and click-free EQ changes.~~ EQ changes are now
+   click-free (coefficients rewritten in place, biquad memory and limiter
+   envelope kept). A lookahead limiter is deliberately **not** used: it adds
+   5 ms of latency and a 5 ms silence at every gapless boundary, because the
+   processing chain is per track.
 6. AVPlayer: probe queued tracks for ReplayGain; Now Playing artwork and
    `MPNowPlayingInfoPropertyMediaType`.
 7. Tests: JOC/`dec3`, ReplayGain parsing, tap lifetime, gapless integration.
