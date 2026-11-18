@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/org.swift.swiftpm/repositories
-          key: swiftpm-repos-${{ hashFiles('Package.resolved') }}
+          key: swiftpm-repos-${{ hashFiles('Package.swift') }}
           restore-keys: swiftpm-repos-
 
       - name: Resolve dependencies
