@@ -26,6 +26,7 @@ let package = Package(
                 .product(name: "AetherLibavcodec", package: "FFmpegBuild"),
                 .product(name: "AetherLibavformat", package: "FFmpegBuild"),
                 .product(name: "AetherLibavutil", package: "FFmpegBuild"),
+                .product(name: "AetherLibswresample", package: "FFmpegBuild"),
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),

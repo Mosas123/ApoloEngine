@@ -54,6 +54,7 @@ public enum PlaybackState: Sendable, Equatable {
     case loading
     case playing
     case paused
+    case finished
     case failed(String)
 }
 

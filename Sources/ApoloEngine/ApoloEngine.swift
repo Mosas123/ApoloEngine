@@ -3,9 +3,9 @@ import Observation
 
 /// Music and streaming engine.
 ///
-/// AVFoundation is the playback engine. FFmpeg probes every source first and
-/// is the route for codecs AVFoundation cannot play. This first version
-/// implements the AVPlayer path; the libavcodec route is the next milestone.
+/// AVFoundation is the playback engine for the codecs it handles. Everything
+/// else goes through FFmpeg into an `AVSampleBufferAudioRenderer`, which keeps
+/// Spatial Audio and Atmos available on the same session.
 ///
 /// Create one instance and keep it for the app's lifetime.
 @MainActor
@@ -18,12 +18,13 @@ public final class ApoloEngine {
     private let host = AVPlayerHost()
     private let session = AudioSessionController()
     private let nowPlaying = NowPlayingController()
+    private var libavHost: LibavcodecAudioHost?
+    private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
 
     public init() {
         host.onState = { [weak self] state in
-            self?.state = state
-            self?.refreshNowPlaying()
+            self?.apply(state)
         }
         host.onTime = { [weak self] time in
             self?.elapsed = time
@@ -35,25 +36,48 @@ public final class ApoloEngine {
             Task { await self?.seek(to: time) }
         }
         nowPlaying.activate()
+
+        libavHost = LibavcodecAudioHost(
+            onState: { [weak self] state in
+                Task { @MainActor in self?.apply(state) }
+            },
+            onTime: { [weak self] time in
+                Task { @MainActor in self?.elapsed = time }
+            }
+        )
     }
 
     public var currentTime: TimeInterval {
-        host.currentTime
+        switch route {
+        case .avPlayer:
+            return host.currentTime
+        case .libavcodec:
+            return libavHost?.currentTime ?? 0
+        }
     }
 
     public var duration: TimeInterval {
-        host.duration
+        let hostDuration = host.duration
+        return hostDuration > 0 ? hostDuration : (media?.duration ?? 0)
     }
 
     public var volume: Float {
-        get { host.volume }
-        set { host.volume = newValue }
+        get {
+            switch route {
+            case .avPlayer: return host.volume
+            case .libavcodec: return libavHost?.volume ?? 1
+            }
+        }
+        set {
+            host.volume = newValue
+            libavHost?.volume = newValue
+        }
     }
 
-    /// Probes the source, then hands it to AVFoundation.
+    /// Probes the source, then picks the playback route.
     ///
     /// The probe runs off the main actor because `avformat_open_input` and
-    /// `avformat_find_stream_info` can block for seconds on a slow CDN.
+    /// `avformat_find_stream_info` can block on a slow source.
     public func load(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -72,23 +96,34 @@ public final class ApoloEngine {
             throw ApoloError.noAudioTrack
         }
 
+        try session.activateMultichannel()
+
         switch CodecSupport.route(forCodec: track.codec) {
         case .avPlayer:
-            try session.activateMultichannel()
+            route = .avPlayer
+            libavHost?.stop()
             host.load(url: url, httpHeaders: httpHeaders)
-            refreshNowPlaying()
         case .libavcodec:
-            state = .failed("libavcodec route not implemented yet")
-            throw ApoloError.unsupportedFormat
+            route = .libavcodec
+            host.stop()
+            libavHost?.load(url: url, httpHeaders: httpHeaders)
         }
+
+        refreshNowPlaying()
     }
 
     public func play() {
-        host.play()
+        switch route {
+        case .avPlayer: host.play()
+        case .libavcodec: libavHost?.play()
+        }
     }
 
     public func pause() {
-        host.pause()
+        switch route {
+        case .avPlayer: host.pause()
+        case .libavcodec: libavHost?.pause()
+        }
     }
 
     public func togglePlayPause() {
@@ -100,15 +135,28 @@ public final class ApoloEngine {
     }
 
     public func seek(to seconds: TimeInterval) async {
-        await host.seek(to: seconds)
+        switch route {
+        case .avPlayer:
+            await host.seek(to: seconds)
+        case .libavcodec:
+            libavHost?.seek(to: seconds)
+        }
     }
 
     public func stop() {
         host.stop()
+        libavHost?.stop()
+        route = .avPlayer
         session.deactivate()
         nowPlaying.clear()
         media = nil
         elapsed = 0
+        state = .idle
+    }
+
+    private func apply(_ newState: PlaybackState) {
+        state = newState
+        refreshNowPlaying()
     }
 
     private func refreshNowPlaying() {
