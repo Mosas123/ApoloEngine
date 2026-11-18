@@ -21,6 +21,9 @@ final class AudioDecoder {
     private var channels: Int32 = 2
     private var formatDescription: CMAudioFormatDescription?
     private var reachedEnd = false
+    /// Stream-time position requested by the last seek. Frames that arrive
+    /// before it (demuxers seek to the previous keyframe) are dropped.
+    private var seekTargetTicks: Int64?
 
     private enum PassthroughMode {
         case decode
@@ -222,6 +225,14 @@ final class AudioDecoder {
                 continue
             }
 
+            if let target = seekTargetTicks, packet.pointee.pts != Int64.min {
+                if packet.pointee.pts < target {
+                    av_packet_unref(packet)
+                    continue
+                }
+                seekTargetTicks = nil
+            }
+
             let seconds = startSeconds(for: packet) + startOffsetSeconds
 
             if passthroughMode == .undecided {
@@ -312,10 +323,12 @@ final class AudioDecoder {
         decoderDrained = false
         resamplerFlushed = false
         runningSamples = 0
+        seekTargetTicks = target
         resetPending()
     }
 
     func close() {
+        seekTargetTicks = nil
         if resampler != nil {
             swr_free(&resampler)
         }
@@ -408,6 +421,10 @@ final class AudioDecoder {
     }
 
     private func append(_ frame: UnsafeMutablePointer<AVFrame>) {
+        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {
+            if frame.pointee.pts < target { return }
+            seekTargetTicks = nil
+        }
         guard let resampler else { return }
 
         let samples = frame.pointee.nb_samples
