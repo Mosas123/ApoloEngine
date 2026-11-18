@@ -68,6 +68,15 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 3. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
+## Decisions
+
+- **No embedded libmpv.** We take mpv's codec/filter ideas into our own FFmpeg
+  build and keep the Apple output path; shipping libmpv would mean two FFmpegs
+  and lose the native renderer.
+- **KSPlayer rejected.** It only adds app UI and video conveniences; its audio
+  stack is behind what we have, and its licence (GPL by default, LGPL paid) is
+  worse for a closed-source App Store app. UI belongs to the app, not the engine.
+
 ## Known constraints
 
 - iOS 18+; Spatial Audio / object audio effectively wants iOS 26.
