@@ -68,6 +68,43 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 3. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
+## Audit backlog
+
+Fixed in phase 1 (CI green, 16 tests):
+
+- Tap lifetime: `passRetained` + `release` in `finalize` (no use-after-free).
+- Tap state under one lock; planar pointer array reused on the audio thread.
+- `loadEpoch`: a superseded probe can no longer overwrite the engine.
+- Audio-session failure degrades instead of stranding `.loading`; probe errors
+  set `.failed`.
+- Stale `media`/`duration`/`elapsed` cleared on track advance and seek.
+- `AVQueuePlayer` end detection uses the item that actually ended.
+- `timelineEnd` reset on seek; `enqueueNext` restarts a finished host.
+- swresample flushed at EOF (no lost tail).
+- `avcodec_send_packet` EAGAIN drains and retries instead of dropping packets.
+- Seek uses `AVSEEK_FLAG_BACKWARD` + `avformat_flush`.
+- Non-audio streams set to `AVDISCARD_ALL`.
+- Flat EQ skips zero-gain bands; non-finite gains are ignored.
+
+Open:
+
+1. **HTTP**: custom `AVIOContext` over `URLSession` (works with any FFmpeg
+   build), or enable `network`/`http`/`https` + `securetransport` in the fork
+   build (another multi-hour run).
+2. Separate the control queue from the render queue so pause/seek stay snappy
+   during a refill burst.
+3. Probe tuning (`probesize`/`analyzeduration`) and one open instead of
+   probe + decode.
+4. Channel-layout mapping for 5.1/7.1 (FFmpeg order vs Apple tags).
+5. Lookahead limiter and click-free EQ changes.
+6. AVPlayer: probe queued tracks for ReplayGain; Now Playing artwork and
+   `MPNowPlayingInfoPropertyMediaType`.
+7. Tests: JOC/`dec3`, ReplayGain parsing, tap lifetime, gapless integration.
+
+Note: `CMSampleTimingInfo.duration = 1/sampleRate` with one timing entry is
+**correct** (CoreMedia treats it per-sample; verified against AetherEngine).
+Do not "fix" it to the buffer total.
+
 ## Decisions
 
 - **No embedded libmpv.** We take mpv's codec/filter ideas into our own FFmpeg
