@@ -403,7 +403,7 @@ final class AudioDecoder {
         }
 
         var outputLayout = AVChannelLayout()
-        av_channel_layout_default(&outputLayout, channels)
+        Self.makeResamplerOutputLayout(channels: channels, into: &outputLayout)
 
         defer {
             av_channel_layout_uninit(&inputLayout)
@@ -631,6 +631,21 @@ final class AudioDecoder {
         pendingBytes.removeAll(keepingCapacity: true)
         pendingSamples = 0
         pendingStartPTS = .invalid
+    }
+
+    /// The layout the resampler writes. Everything is FFmpeg's default except
+    /// 7 channels: 6.1's default order (FL FR FC LFE BC SL SR) is the one count
+    /// CoreAudio has no tag for, so point the resampler at 6.1(back)
+    /// (FL FR FC LFE BL BR BC), which `MPEG_6_1_A` does describe.
+    static func makeResamplerOutputLayout(
+        channels: Int32,
+        into layout: inout AVChannelLayout
+    ) {
+        if channels == 7,
+           av_channel_layout_from_string(&layout, "6.1(back)") >= 0 {
+            return
+        }
+        av_channel_layout_default(&layout, channels)
     }
 
     private func createFormatDescription() throws {

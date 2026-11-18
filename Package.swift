@@ -36,7 +36,10 @@ let package = Package(
         ),
         .testTarget(
             name: "ApoloEngineTests",
-            dependencies: ["ApoloEngine"]
+            dependencies: [
+                "ApoloEngine",
+                .product(name: "AetherLibavutil", package: "FFmpegBuild"),
+            ]
         ),
     ]
 )
