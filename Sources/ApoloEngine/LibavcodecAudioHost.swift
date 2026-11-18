@@ -96,9 +96,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             do {
                 try decoder.seek(to: seconds)
                 self.renderer.flush()
-                self.synchronizer.currentTime = CMTime(
-                    seconds: seconds,
-                    preferredTimescale: 600
+                self.synchronizer.setRate(
+                    self.wantsToPlay ? 1 : 0,
+                    time: CMTime(seconds: seconds, preferredTimescale: 600)
                 )
                 self.started = false
                 if self.wantsToPlay {
@@ -156,7 +156,6 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         renderer.stopRequestingMediaData()
         renderer.flush()
         synchronizer.setRate(0, time: .zero)
-        synchronizer.currentTime = .zero
         decoder?.close()
         decoder = nil
         started = false
