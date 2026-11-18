@@ -1,0 +1,155 @@
+import Foundation
+import AetherLibavcodec
+import AetherLibavformat
+import AetherLibavutil
+
+/// A demuxer that has already run `avformat_find_stream_info`.
+///
+/// The engine opens it once on a background task, reads `info` to decide the
+/// route, and either closes it (AVPlayer path) or hands the `AVFormatContext`
+/// to `AudioDecoder` (libavcodec path) so the source is not opened twice.
+///
+/// Ownership moves between threads; it is never used concurrently, which is
+/// what the `@unchecked Sendable` promises.
+final class OpenedSource: @unchecked Sendable {
+    let info: MediaInfo
+    private var formatContext: UnsafeMutablePointer<AVFormatContext>?
+
+    private init(
+        info: MediaInfo,
+        formatContext: UnsafeMutablePointer<AVFormatContext>
+    ) {
+        self.info = info
+        self.formatContext = formatContext
+    }
+
+    static func open(
+        url: URL,
+        httpHeaders: [String: String] = [:]
+    ) throws -> OpenedSource {
+        var options: OpaquePointer?
+        if !httpHeaders.isEmpty {
+            let joined = httpHeaders
+                .map { "\($0.key): \($0.value)" }
+                .joined(separator: "\r\n")
+            joined.withCString { _ = av_dict_set(&options, "headers", $0, 0) }
+        }
+
+        var context: UnsafeMutablePointer<AVFormatContext>?
+        let openCode = url.absoluteString.withCString {
+            avformat_open_input(&context, $0, nil, &options)
+        }
+        av_dict_free(&options)
+        guard openCode == 0, let context else {
+            throw ApoloError.openFailed(code: openCode)
+        }
+
+        do {
+            let info = try buildInfo(context)
+            return OpenedSource(info: info, formatContext: context)
+        } catch {
+            var closing: UnsafeMutablePointer<AVFormatContext>? = context
+            avformat_close_input(&closing)
+            throw error
+        }
+    }
+
+    /// Transfers ownership to the caller. The source no longer closes it.
+    func takeFormatContext() -> UnsafeMutablePointer<AVFormatContext>? {
+        let context = formatContext
+        formatContext = nil
+        return context
+    }
+
+    func close() {
+        guard formatContext != nil else { return }
+        avformat_close_input(&formatContext)
+    }
+
+    deinit {
+        close()
+    }
+
+    private static func buildInfo(
+        _ context: UnsafeMutablePointer<AVFormatContext>
+    ) throws -> MediaInfo {
+        guard avformat_find_stream_info(context, nil) >= 0 else {
+            throw ApoloError.unsupportedFormat
+        }
+
+        var tracks: [AudioTrackInfo] = []
+        var audioMetadata: OpaquePointer?
+        var streamDuration: TimeInterval = 0
+
+        for index in 0..<Int(context.pointee.nb_streams) {
+            guard let stream = context.pointee.streams[index],
+                  let codecpar = stream.pointee.codecpar,
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO
+            else { continue }
+
+            if audioMetadata == nil {
+                audioMetadata = stream.pointee.metadata
+            }
+            if streamDuration == 0, stream.pointee.duration != Int64.min {
+                let base = stream.pointee.time_base
+                if base.num > 0, base.den > 0 {
+                    streamDuration = Double(stream.pointee.duration)
+                        * Double(base.num) / Double(base.den)
+                }
+            }
+
+            let codec = avcodec_get_name(codecpar.pointee.codec_id)
+                .map { String(cString: $0) } ?? "unknown"
+
+            tracks.append(
+                AudioTrackInfo(
+                    index: index,
+                    codec: codec,
+                    sampleRate: Int(codecpar.pointee.sample_rate),
+                    channels: Int(codecpar.pointee.ch_layout.nb_channels),
+                    isAtmos: codecpar.pointee.profile == MediaProbe.eac3JOCProfile
+                )
+            )
+        }
+
+        guard !tracks.isEmpty else { throw ApoloError.noAudioTrack }
+
+        let container = context.pointee.iformat
+            .map { String(cString: $0.pointee.name) } ?? "unknown"
+
+        let duration: TimeInterval
+        if context.pointee.duration != Int64.min, context.pointee.duration > 0 {
+            duration = TimeInterval(context.pointee.duration)
+                / TimeInterval(AV_TIME_BASE)
+        } else {
+            duration = streamDuration
+        }
+
+        let trackGain = replayGain(from: context.pointee.metadata)
+            ?? replayGain(from: audioMetadata)
+
+        return MediaInfo(
+            container: container,
+            duration: duration,
+            audioTracks: tracks,
+            trackGainDB: trackGain
+        )
+    }
+
+    /// Reads `replaygain_track_gain` ("-7.23 dB") and returns the number.
+    private static func replayGain(from metadata: OpaquePointer?) -> Double? {
+        guard let metadata,
+              let entry = av_dict_get(metadata, "replaygain_track_gain", nil, 0),
+              let value = entry.pointee.value
+        else { return nil }
+
+        var text = String(cString: value).trimmingCharacters(in: .whitespaces)
+        text = text.replacingOccurrences(
+            of: "dB",
+            with: "",
+            options: .caseInsensitive
+        )
+        text = text.trimmingCharacters(in: .whitespaces)
+        return Double(text)
+    }
+}

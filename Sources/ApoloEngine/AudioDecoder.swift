@@ -66,12 +66,42 @@ final class AudioDecoder {
             avformat_open_input(&formatContext, $0, nil, &options)
         }
         av_dict_free(&options)
-        guard openCode == 0, let formatContext else {
+        guard openCode == 0, formatContext != nil else {
             throw ApoloError.openFailed(code: openCode)
         }
 
-        guard avformat_find_stream_info(formatContext, nil) >= 0 else {
-            throw ApoloError.unsupportedFormat
+        do {
+            try configure(alreadyProbed: false)
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    /// Adopts a context that already ran `avformat_find_stream_info`, so the
+    /// source is opened once instead of once for the probe and once here.
+    func adopt(_ source: OpenedSource) throws {
+        guard let context = source.takeFormatContext() else {
+            throw ApoloError.openFailed(code: -1)
+        }
+        formatContext = context
+        do {
+            try configure(alreadyProbed: true)
+        } catch {
+            close()
+            throw error
+        }
+    }
+
+    private func configure(alreadyProbed: Bool) throws {
+        guard let formatContext else {
+            throw ApoloError.openFailed(code: -1)
+        }
+
+        if !alreadyProbed {
+            guard avformat_find_stream_info(formatContext, nil) >= 0 else {
+                throw ApoloError.unsupportedFormat
+            }
         }
 
         let found = av_find_best_stream(

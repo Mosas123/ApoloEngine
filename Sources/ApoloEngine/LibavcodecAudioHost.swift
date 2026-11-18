@@ -97,6 +97,27 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         }
     }
 
+    /// Adopts a source the engine already opened and probed.
+    func load(source: OpenedSource) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.reset()
+            do {
+                let decoder = AudioDecoder()
+                decoder.processingSettings = self.equalizer
+                decoder.limiterEnabled = self.limiterEnabled
+                decoder.trackGainDB = self.trackGainDB
+                try decoder.adopt(source)
+                self.decoder = decoder
+                self.wantsToPlay = true
+                self.publish(.loading)
+                self.startRequesting()
+            } catch {
+                self.publish(.failed(Self.describe(error)))
+            }
+        }
+    }
+
     func play() {
         queue.async { [weak self] in
             guard let self else { return }

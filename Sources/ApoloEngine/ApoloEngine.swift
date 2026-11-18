@@ -149,10 +149,24 @@ public final class ApoloEngine {
             return
         }
 
-        let info: MediaInfo
+        if let cached = MediaProbe.cachedInfo(
+            url: track.url,
+            httpHeaders: track.httpHeaders
+        ) {
+            media = cached
+            try await applyRoute(
+                track: track,
+                info: cached,
+                source: nil,
+                epoch: epoch
+            )
+            return
+        }
+
+        let source: OpenedSource
         do {
-            info = try await Task.detached(priority: .userInitiated) {
-                try MediaProbe.probe(
+            source = try await Task.detached(priority: .userInitiated) {
+                try OpenedSource.open(
                     url: track.url,
                     httpHeaders: track.httpHeaders
                 )
@@ -164,10 +178,38 @@ public final class ApoloEngine {
             throw error
         }
 
-        guard epoch == loadEpoch else { return }
-        media = info
+        guard epoch == loadEpoch else {
+            source.close()
+            return
+        }
+
+        media = source.info
+        MediaProbe.remember(
+            source.info,
+            url: track.url,
+            httpHeaders: track.httpHeaders
+        )
+        try await applyRoute(
+            track: track,
+            info: source.info,
+            source: source,
+            epoch: epoch
+        )
+    }
+
+    private func applyRoute(
+        track: ApoloTrack,
+        info: MediaInfo,
+        source: OpenedSource?,
+        epoch: UInt64
+    ) async throws {
+        guard epoch == loadEpoch else {
+            source?.close()
+            return
+        }
 
         guard let audioTrack = info.audioTracks.first else {
+            source?.close()
             state = .failed("No audio track")
             throw ApoloError.noAudioTrack
         }
@@ -181,16 +223,21 @@ public final class ApoloEngine {
 
         switch CodecSupport.route(forCodec: audioTrack.codec) {
         case .avPlayer:
+            source?.close()
             route = .avPlayer
             libavHost?.stop()
             await host.load(track: track)
         case .libavcodec:
             route = .libavcodec
             host.stop()
-            libavHost?.load(
-                url: track.url,
-                httpHeaders: track.httpHeaders
-            )
+            if let source {
+                libavHost?.load(source: source)
+            } else {
+                libavHost?.load(
+                    url: track.url,
+                    httpHeaders: track.httpHeaders
+                )
+            }
         }
 
         refreshNowPlaying()
