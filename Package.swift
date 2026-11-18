@@ -14,8 +14,8 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/superuser404notfound/FFmpegBuild",
-            .upToNextMinor(from: "3.15.0")
+            url: "https://github.com/Mosas123/FFmpegBuild",
+            branch: "apolo-union"
         ),
     ],
     targets: [
@@ -38,6 +38,8 @@ let package = Package(
             name: "ApoloEngineTests",
             dependencies: [
                 "ApoloEngine",
+                .product(name: "AetherLibavcodec", package: "FFmpegBuild"),
+                .product(name: "AetherLibavfilter", package: "FFmpegBuild"),
                 .product(name: "AetherLibavutil", package: "FFmpegBuild"),
             ]
         ),
