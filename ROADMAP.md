@@ -21,6 +21,9 @@ never depends on a chat.
 - Gapless: `AVQueuePlayer` with one tap per item on the AVPlayer route; the
   libavcodec route opens the next source on the running synchronizer and offsets
   its PTS by the previous track's end. `ApoloEngine.enqueueNext(_:)` feeds it.
+- Manual `skipToNext()` / `skipToPrevious()` over a pure `PlayQueue` (unit
+  tested). Skips reload through the normal route decision, so a codec change
+  between tracks is handled; a skip may re-introduce a small gap.
 - Now Playing + remote commands, `AVAudioSession` with
   `setSupportsMultichannelContent(true)`.
 
@@ -58,10 +61,11 @@ build adds roughly 380 MB to the FFmpegBuild git history.
 
 ## Next
 
-1. APAC encode for AirPlay / HomePod Atmos.
+1. APAC (AirPlay / HomePod Atmos): iOS 26+, `AVAudioConverter` with the APAC
+   format, the `dapa` box, and an fMP4/HLS delivery path. Deferred until the
+   FFmpeg union build is in and there is a real Atmos route to test on.
 2. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
-3. Manual skip / previous.
-4. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
+3. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
 ## Known constraints
