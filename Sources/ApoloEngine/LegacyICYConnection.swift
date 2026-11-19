@@ -38,9 +38,9 @@ final class LegacyICYConnection: @unchecked Sendable {
               let hostname = url.host,
               !hostname.isEmpty,
               url.user == nil, url.password == nil,
-              let endpointPort = NWEndpoint.Port(
-                rawValue: UInt16(exactly: url.port ?? 80) ?? 0
-              ) else {
+              let rawPort = UInt16(exactly: url.port ?? 80),
+              rawPort > 0,
+              let endpointPort = NWEndpoint.Port(rawValue: rawPort) else {
             buffer.fail()
             return
         }
