@@ -10,6 +10,7 @@ final class AVPlayerHost {
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var finished = false
+    private var isLiveStream = false
     private(set) var loadGeneration: UInt64 = 0
     private var lastState: PlaybackState = .idle
     private var tapProcessors: [AudioTapProcessor] = []
@@ -79,6 +80,7 @@ final class AVPlayerHost {
         let generation = loadGeneration
         resetItems()
         finished = false
+        isLiveStream = false
         wantsToPlay = true
         publish(.loading)
 
@@ -101,6 +103,26 @@ final class AVPlayerHost {
         player.play()
     }
 
+    /// Native live streams have no finite audio track table or meaningful
+    /// end time. Attach the player immediately instead of awaiting
+    /// loadTracks(), which may stall on an endless HTTP response.
+    func loadLive(track: ApoloTrack) async {
+        loadGeneration &+= 1
+        resetItems()
+        finished = false
+        isLiveStream = true
+        wantsToPlay = true
+        publish(.loading)
+
+        let item = AVPlayerItem(asset: makeAsset(track))
+        observeEnd(of: item)
+        observeFailure(of: item)
+        // Do not attach MTAudioProcessingTap to live transport yet: native
+        // HLS and indefinite audio may not expose a stable asset track.
+        player.insert(item, after: nil)
+        player.play()
+    }
+
     func clearUpcoming() {
         let items = player.items()
         guard items.count > 1 else { return }
@@ -110,6 +132,7 @@ final class AVPlayerHost {
     }
 
     func enqueueNext(_ track: ApoloTrack) async {
+        guard !isLiveStream else { return }
         let generation = loadGeneration
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
@@ -152,6 +175,7 @@ final class AVPlayerHost {
     }
 
     func seek(to seconds: TimeInterval) async {
+        guard !isLiveStream else { return }
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         _ = await player.seek(
             to: time,
@@ -216,6 +240,11 @@ final class AVPlayerHost {
     }
 
     private func handleEnd(of ended: AVPlayerItem) {
+        if isLiveStream {
+            // A live station going silent is not the end of a song or queue.
+            publish(.failed("Live stream ended"))
+            return
+        }
         guard let last = player.items().last else {
             finished = true
             publish(.finished)
@@ -236,13 +265,14 @@ final class AVPlayerHost {
             NotificationCenter.default.removeObserver(observer)
         }
         endObservers.removeAll()
+        isLiveStream = false
         tapProcessors.removeAll()
         player.removeAllItems()
     }
 
     private func tick(_ time: CMTime) {
         if time.isNumeric {
-            onTime?(time.seconds)
+            onTime?(isLiveStream ? 0 : time.seconds)
         }
         refreshState()
     }
