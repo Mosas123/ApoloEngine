@@ -45,6 +45,7 @@ public final class ApoloEngine {
     private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
     private var resumeAfterInterruption = false
+    private var liveCancellation: LiveStreamCancellation?
 
     private var queue = PlayQueue()
 
@@ -203,6 +204,11 @@ public final class ApoloEngine {
     }
 
     private func startPlayback(_ track: ApoloTrack, epoch: UInt64) async throws {
+        guard epoch == loadEpoch else { return }
+        // A stop or station switch must cancel a blocked FFmpeg read before
+        // the serial decoder queue can execute its normal stop operation.
+        liveCancellation?.cancel()
+        liveCancellation = nil
         state = .loading
         elapsed = 0
         media = nil
@@ -229,6 +235,8 @@ public final class ApoloEngine {
                 throw ApoloError.unsupportedFormat
             }
 
+            let cancellation = LiveStreamCancellation()
+            liveCancellation = cancellation
             let onTitle: @Sendable (String) -> Void = { [weak self] title in
                 Task { @MainActor [weak self] in
                     guard let self, self.loadEpoch == epoch else { return }
@@ -242,7 +250,8 @@ public final class ApoloEngine {
                         url: track.url,
                         httpHeaders: track.httpHeaders,
                         isLive: true,
-                        onICYTitle: onTitle
+                        onICYTitle: onTitle,
+                        liveCancellation: cancellation
                     )
                 }.value
             } catch {
@@ -483,6 +492,8 @@ public final class ApoloEngine {
 
     public func stop() {
         loadEpoch &+= 1
+        liveCancellation?.cancel()
+        liveCancellation = nil
         host.stop()
         libavHost?.stop()
         route = .avPlayer
