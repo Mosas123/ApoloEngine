@@ -122,17 +122,26 @@ public final class ApoloEngine {
         }
 
         libavHost = LibavcodecAudioHost(
-            onState: { [weak self] state in
+            onState: { [weak self] state, epoch in
                 Task { @MainActor [weak self] in
-                    guard let self, self.route == .libavcodec else { return }
+                    guard let self, self.route == .libavcodec,
+                          self.loadEpoch == epoch else { return }
                     self.apply(state)
                 }
             },
-            onTime: { [weak self] time in
-                Task { @MainActor in self?.elapsed = time }
+            onTime: { [weak self] time, epoch in
+                Task { @MainActor [weak self] in
+                    guard let self, self.route == .libavcodec,
+                          self.loadEpoch == epoch else { return }
+                    self.elapsed = time
+                }
             },
-            onTrackChange: { [weak self] track in
-                Task { @MainActor in self?.advance(to: track) }
+            onTrackChange: { [weak self] track, epoch in
+                Task { @MainActor [weak self] in
+                    guard let self, self.route == .libavcodec,
+                          self.loadEpoch == epoch else { return }
+                    self.advance(to: track)
+                }
             }
         )
     }
@@ -345,7 +354,7 @@ public final class ApoloEngine {
             applyProcessing()
             route = .libavcodec
             host.stop()
-            libavHost?.load(source: source, isLive: true)
+            libavHost?.load(source: source, isLive: true, epoch: epoch)
             refreshNowPlaying()
             return
         }
@@ -455,11 +464,12 @@ public final class ApoloEngine {
             route = .libavcodec
             host.stop()
             if let source {
-                libavHost?.load(source: source)
+                libavHost?.load(source: source, epoch: epoch)
             } else {
                 libavHost?.load(
                     url: track.url,
-                    httpHeaders: track.httpHeaders
+                    httpHeaders: track.httpHeaders,
+                    epoch: epoch
                 )
             }
         }
