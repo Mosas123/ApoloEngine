@@ -48,6 +48,7 @@ public final class ApoloEngine {
     private var liveCancellation: LiveStreamCancellation?
     private var liveReconnectTask: Task<Void, Never>?
     private var liveRetryAttempts = 0
+    private var liveRetryOpening = false
     private var livePlayingSince: Date?
     private var liveShouldPlay = true
 
@@ -190,6 +191,7 @@ public final class ApoloEngine {
         )
         cancelLiveReconnect()
         liveRetryAttempts = 0
+        liveRetryOpening = false
         livePlayingSince = nil
         liveShouldPlay = true
         queue.start(track)
@@ -272,7 +274,7 @@ public final class ApoloEngine {
                 }
                 throw error
             }
-            guard epoch == loadEpoch else {
+            guard epoch == loadEpoch, liveShouldPlay else {
                 source.close()
                 return
             }
@@ -425,6 +427,9 @@ public final class ApoloEngine {
         if queue.current?.streamMode == .live {
             liveShouldPlay = false
             cancelLiveReconnect()
+            if case .loading = state {
+                liveCancellation?.cancel()
+            }
         }
         pauseInternal()
     }
@@ -527,6 +532,7 @@ public final class ApoloEngine {
         cancelLiveReconnect()
         liveShouldPlay = false
         liveRetryAttempts = 0
+        liveRetryOpening = false
         livePlayingSince = nil
         loadEpoch &+= 1
         liveCancellation?.cancel()
@@ -667,6 +673,7 @@ public final class ApoloEngine {
     /// would corrupt compressed packets.
     private func scheduleLiveReconnect() {
         guard liveShouldPlay,
+              !liveRetryOpening,
               liveReconnectTask == nil,
               let track = queue.current,
               track.streamMode == .live,
@@ -689,12 +696,16 @@ public final class ApoloEngine {
                   self.liveShouldPlay,
                   self.queue.current == track else { return }
             self.liveReconnectTask = nil
+            self.liveRetryOpening = true
             self.loadEpoch &+= 1
             let retryEpoch = self.loadEpoch
             do {
                 try await self.startPlayback(track, epoch: retryEpoch)
+                self.liveRetryOpening = false
             } catch {
-                guard self.loadEpoch == retryEpoch else { return }
+                self.liveRetryOpening = false
+                guard self.loadEpoch == retryEpoch,
+                      self.liveShouldPlay else { return }
                 self.apply(.failed("Live stream reconnect failed"))
             }
         }
