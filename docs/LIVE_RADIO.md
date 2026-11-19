@@ -100,6 +100,39 @@ actually sends HLS timed ID3 metadata; handling of HLS `EXT-X-DATERANGE`
 requires the separate metadata collector API and is **not** implemented here.
 Likewise, older raw `ICY 200 OK` response formats remain unsupported.
 
+## Phase 2E — legacy ICY status compatibility (draft v6)
+
+Some old Icecast/Shoutcast servers reply with a non-HTTP `ICY 200 OK`
+status line. URLSession can reject that response as malformed HTTP.
+For the **FFmpeg live HTTP route only**, Apolo now attempts a single raw
+TCP fallback when URLSession fails specifically with
+`NSURLErrorCannotParseResponse` *and the original station URL is plain HTTP*.
+
+- Strict incremental parser for `ICY NNN` status, headers and the first
+  encoded audio bytes; 16 KiB maximum header size.
+- Bounded receive chunks feed the existing 512 KiB ring and ICY metadata
+  stripping; backpressure stops receiving at 75% and resumes below 25%.
+- A fresh fallback connection uses the same host/port only, sends a minimal
+  request with `Icy-MetaData: 1`, **no arbitrary resolver headers or
+  credentials**, and follows no redirects. HTTPS never downgrades to TCP.
+- Original URLSession errors such as certificate failures, timeouts, 403 or
+  invalid MIME do **not** activate this fallback.
+- To intentionally route a native-playable HTTP MP3/AAC station through
+  the FFmpeg legacy-compatible path, callers may pass
+  `sourceMIMEType: "application/x-icy"` to `loadLive(...)`.
+  Without that explicit hint, existing MP3/AAC native playback is unchanged.
+- Legacy 401/403/404/410 statuses feed existing terminal retry logic;
+  malformed headers, exhausted ring and premature EOF fail closed.
+- Raw TCP is restricted to plain `http://` stations; HTTPS ICY with
+  nonstandard status is not claimed. Native HLS and on-demand routes
+  remain unchanged.
+
+**Pending verification:** CI compilation and unit tests, local-network
+fixture server with an actual legacy status line, real-device playback,
+network handovers and measured memory/energy. Normal HTTP status and
+TLS validation remain exclusively on URLSession; do not ship v6 before
+these validations.
+
 ## Phase 3 — integration and acceptance
 
 After the engine's transport APIs and on-device validations are ready, make live radio an opt-in route in Thrum, retaining an MPVKit fallback until confidence is high. Acceptance tests:
