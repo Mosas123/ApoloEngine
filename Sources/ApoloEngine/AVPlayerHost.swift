@@ -244,7 +244,9 @@ final class AVPlayerHost {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.publish(.failed("Playback failed"))
+                guard let self else { return }
+                if self.isLiveStream { self.finished = true }
+                self.publish(.failed("Playback failed"))
             }
         }
         endObservers.append(token)
@@ -253,6 +255,9 @@ final class AVPlayerHost {
     private func handleEnd(of ended: AVPlayerItem) {
         if isLiveStream {
             // A live station going silent is not the end of a song or queue.
+            // Keep the failure stable; the periodic tick must not turn it
+            // back into "loading" before a reconnection is attempted.
+            finished = true
             publish(.failed("Live stream ended"))
             return
         }
