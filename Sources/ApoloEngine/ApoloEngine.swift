@@ -124,6 +124,7 @@ public final class ApoloEngine {
     }
 
     public var duration: TimeInterval {
+        if queue.current?.streamMode == .live { return 0 }
         let hostDuration = host.duration
         return hostDuration > 0 ? hostDuration : (media?.duration ?? 0)
     }
@@ -164,17 +165,37 @@ public final class ApoloEngine {
         url: URL,
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
-        sourceMIMEType: String? = nil
+        sourceMIMEType: String? = nil,
+        streamMode: StreamMode = .onDemand
     ) async throws {
         let track = ApoloTrack(
             url: url,
             httpHeaders: httpHeaders,
             metadata: metadata,
-            sourceMIMEType: sourceMIMEType
+            sourceMIMEType: sourceMIMEType,
+            streamMode: streamMode
         )
         queue.start(track)
         loadEpoch &+= 1
         try await startPlayback(track, epoch: loadEpoch)
+    }
+
+    /// Start a live radio broadcast. This first route supports HLS and direct
+    /// Apple-playable HTTP audio; Ogg/Opus live transport is a future route.
+    /// Live mode never seeks or treats an unknown duration as end-of-file.
+    public func loadLive(
+        url: URL,
+        httpHeaders: [String: String] = [:],
+        metadata: NowPlayingMetadata? = nil,
+        sourceMIMEType: String? = nil
+    ) async throws {
+        try await load(
+            url: url,
+            httpHeaders: httpHeaders,
+            metadata: metadata,
+            sourceMIMEType: sourceMIMEType,
+            streamMode: .live
+        )
     }
 
     private func startPlayback(_ track: ApoloTrack, epoch: UInt64) async throws {
@@ -182,6 +203,22 @@ public final class ApoloEngine {
         elapsed = 0
         media = nil
         metadata = track.metadata
+
+        if track.streamMode == .live {
+            guard Self.supportsNativeLive(track.url, hint: track.sourceMIMEType) else {
+                state = .failed("Live format requires a streaming transport")
+                throw ApoloError.unsupportedFormat
+            }
+            guard epoch == loadEpoch else { return }
+            try? session.activateMultichannel()
+            metadataGainDB = nil
+            applyProcessing()
+            route = .avPlayer
+            libavHost?.stop()
+            await host.loadLive(track: track)
+            refreshNowPlaying()
+            return
+        }
 
         // The FFmpeg build has no network protocols, and AVFoundation is the
         // native path for remote music (including Spatial/Atmos). Remote
@@ -329,6 +366,7 @@ public final class ApoloEngine {
     }
 
     public func seek(to seconds: TimeInterval) async {
+        guard queue.current?.streamMode != .live else { return }
         switch route {
         case .avPlayer:
             await host.seek(to: seconds)
@@ -444,6 +482,18 @@ public final class ApoloEngine {
     /// source downloads a finite file.
     private func isExoticRemote(_ url: URL, hint: String? = nil) -> Bool {
         Self.shouldUseFFmpegForRemote(url, hint: hint)
+    }
+
+    /// The native live route handles HLS and Apple-playable HTTP audio only.
+    /// Explicit mode avoids misclassifying ordinary songs with unknown length.
+    nonisolated static func supportsNativeLive(
+        _ url: URL, hint: String? = nil
+    ) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        guard scheme == "http" || scheme == "https" else { return false }
+        let ext = url.pathExtension.lowercased()
+        guard !["pls", "m3u", "xspf", "asx"].contains(ext) else { return false }
+        return !shouldUseFFmpegForRemote(url, hint: hint)
     }
 
     /// True when a remote URL must go through FFmpeg. Local files are never
