@@ -490,10 +490,7 @@ final class AudioDecoder {
             return
         }
 
-        processIfNeeded(
-            memory.assumingMemoryBound(to: UInt8.self),
-            frames: Int(converted)
-        )
+        processIfNeeded(memory, frames: Int(converted))
 
         let ticks = frame.pointee.pts == Int64.min
             ? runningSamples
@@ -544,10 +541,7 @@ final class AudioDecoder {
             return
         }
 
-        processIfNeeded(
-            memory.assumingMemoryBound(to: UInt8.self),
-            frames: Int(converted)
-        )
+        processIfNeeded(memory, frames: Int(converted))
 
         let ticks = runningSamples
         runningSamples += Int64(converted)
@@ -563,7 +557,7 @@ final class AudioDecoder {
     }
 
     private func processIfNeeded(
-        _ pointer: UnsafeMutablePointer<UInt8>,
+        _ pointer: UnsafeMutableRawPointer,
         frames: Int
     ) {
         guard let chain = processingChain else { return }
