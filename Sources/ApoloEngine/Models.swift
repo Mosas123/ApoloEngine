@@ -85,11 +85,19 @@ public struct NowPlayingMetadata: Sendable, Equatable {
     public let title: String
     public let artist: String
     public let album: String?
+    /// Encoded image (PNG/JPEG) for the lock screen and Control Center.
+    public let artworkData: Data?
 
-    public init(title: String, artist: String, album: String? = nil) {
+    public init(
+        title: String,
+        artist: String,
+        album: String? = nil,
+        artworkData: Data? = nil
+    ) {
         self.title = title
         self.artist = artist
         self.album = album
+        self.artworkData = artworkData
     }
 }
 

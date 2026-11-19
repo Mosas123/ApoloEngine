@@ -41,6 +41,7 @@ public final class ApoloEngine {
     private var libavHost: LibavcodecAudioHost?
     private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
+    private var resumeAfterInterruption = false
 
     private var queue = PlayQueue()
 
@@ -66,6 +67,25 @@ public final class ApoloEngine {
             Task { await self?.seek(to: time) }
         }
         nowPlaying.activate()
+
+        session.onInterruptionBegan = { [weak self] in
+            guard let self else { return }
+            self.resumeAfterInterruption = self.state == .playing
+            if self.resumeAfterInterruption {
+                self.pauseInternal()
+            }
+        }
+        session.onInterruptionEnded = { [weak self] shouldResume in
+            guard let self, shouldResume, self.resumeAfterInterruption else {
+                return
+            }
+            self.resumeAfterInterruption = false
+            self.play()
+        }
+        session.onRouteLost = { [weak self] in
+            self?.resumeAfterInterruption = false
+            self?.pauseInternal()
+        }
 
         libavHost = LibavcodecAudioHost(
             onState: { [weak self] state in
@@ -244,6 +264,7 @@ public final class ApoloEngine {
     }
 
     public func play() {
+        resumeAfterInterruption = false
         switch route {
         case .avPlayer: host.play()
         case .libavcodec: libavHost?.play()
@@ -251,6 +272,11 @@ public final class ApoloEngine {
     }
 
     public func pause() {
+        resumeAfterInterruption = false
+        pauseInternal()
+    }
+
+    private func pauseInternal() {
         switch route {
         case .avPlayer: host.pause()
         case .libavcodec: libavHost?.pause()
@@ -370,7 +396,8 @@ public final class ApoloEngine {
             album: metadata.album,
             duration: duration,
             elapsed: elapsed,
-            isPlaying: state == .playing
+            isPlaying: state == .playing,
+            artworkData: metadata.artworkData
         )
     }
 }

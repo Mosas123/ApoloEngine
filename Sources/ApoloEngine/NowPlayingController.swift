@@ -1,11 +1,13 @@
 import Foundation
 import MediaPlayer
+import UIKit
 
 /// Publishes the Now Playing card and binds the remote commands.
 @MainActor
 final class NowPlayingController {
     private let infoCenter = MPNowPlayingInfoCenter.default()
     private let commands = MPRemoteCommandCenter.shared()
+    private var cachedArtwork: (hash: Int, artwork: MPMediaItemArtwork)?
 
     var onPlay: (@MainActor () -> Void)?
     var onPause: (@MainActor () -> Void)?
@@ -33,6 +35,10 @@ final class NowPlayingController {
             Task { @MainActor in self?.onSeek?(position) }
             return .success
         }
+        commands.playCommand.isEnabled = true
+        commands.pauseCommand.isEnabled = true
+        commands.togglePlayPauseCommand.isEnabled = true
+        commands.changePlaybackPositionCommand.isEnabled = true
     }
 
     func update(
@@ -41,7 +47,8 @@ final class NowPlayingController {
         album: String?,
         duration: TimeInterval,
         elapsed: TimeInterval,
-        isPlaying: Bool
+        isPlaying: Bool,
+        artworkData: Data?
     ) {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
@@ -49,14 +56,32 @@ final class NowPlayingController {
             MPMediaItemPropertyPlaybackDuration: duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
+            MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
+            MPNowPlayingInfoPropertyIsLiveStream: false,
         ]
         if let album {
             info[MPMediaItemPropertyAlbumTitle] = album
+        }
+        if let artwork = artwork(from: artworkData) {
+            info[MPMediaItemPropertyArtwork] = artwork
         }
         infoCenter.nowPlayingInfo = info
     }
 
     func clear() {
         infoCenter.nowPlayingInfo = nil
+        cachedArtwork = nil
+    }
+
+    private func artwork(from data: Data?) -> MPMediaItemArtwork? {
+        guard let data, let image = UIImage(data: data) else { return nil }
+        let hash = data.hashValue
+        if let cached = cachedArtwork, cached.hash == hash {
+            return cached.artwork
+        }
+        let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        cachedArtwork = (hash, artwork)
+        return artwork
     }
 }
