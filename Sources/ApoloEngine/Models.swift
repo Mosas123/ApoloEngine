@@ -82,6 +82,38 @@ public struct ApoloTrack: Sendable, Equatable {
     }
 }
 
+/// Read-only snapshot for a debug/diagnostics screen or on-device support.
+public struct PlaybackDiagnostics: Sendable, Equatable {
+    public let route: AudioRoute
+    public let container: String?
+    public let codec: String?
+    public let sampleRate: Int?
+    public let channels: Int?
+    public let isAtmos: Bool
+    public let duration: TimeInterval
+    public let state: PlaybackState
+
+    public init(
+        route: AudioRoute,
+        container: String?,
+        codec: String?,
+        sampleRate: Int?,
+        channels: Int?,
+        isAtmos: Bool,
+        duration: TimeInterval,
+        state: PlaybackState
+    ) {
+        self.route = route
+        self.container = container
+        self.codec = codec
+        self.sampleRate = sampleRate
+        self.channels = channels
+        self.isAtmos = isAtmos
+        self.duration = duration
+        self.state = state
+    }
+}
+
 /// Playback lifecycle.
 public enum PlaybackState: Sendable, Equatable {
     case idle
@@ -118,4 +150,19 @@ public enum ApoloError: Error, Sendable, Equatable {
     case unsupportedFormat
     case noAudioTrack
     case playbackUnavailable
+}
+
+extension ApoloError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .openFailed(let code):
+            return "The source could not be opened (FFmpeg error \(code))."
+        case .unsupportedFormat:
+            return "This audio format is not supported."
+        case .noAudioTrack:
+            return "The source has no audio track."
+        case .playbackUnavailable:
+            return "Playback is not available right now."
+        }
+    }
 }

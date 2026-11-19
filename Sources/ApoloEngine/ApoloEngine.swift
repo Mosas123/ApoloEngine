@@ -114,6 +114,21 @@ public final class ApoloEngine {
         return hostDuration > 0 ? hostDuration : (media?.duration ?? 0)
     }
 
+    /// Snapshot for a diagnostics screen: route, codec and stream shape.
+    public var diagnostics: PlaybackDiagnostics {
+        let track = media?.audioTracks.first
+        return PlaybackDiagnostics(
+            route: route,
+            container: media?.container,
+            codec: track?.codec,
+            sampleRate: track?.sampleRate,
+            channels: track?.channels,
+            isAtmos: track?.isAtmos ?? false,
+            duration: duration,
+            state: state
+        )
+    }
+
     public var volume: Float {
         get {
             switch route {
