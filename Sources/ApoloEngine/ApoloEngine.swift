@@ -465,7 +465,7 @@ public final class ApoloEngine {
             || mime.contains("flac")
     }
 
-    private static let exoticRemoteExtensions: Set<String> = [
+    nonisolated private static let exoticRemoteExtensions: Set<String> = [
         "ape", "tta", "wv", "tak", "mpc", "mp+",
         "dsf", "dff", "dsdiff", "aiff", "aif", "wma", "mka",
         "webm", "weba", "ogg", "oga", "opus", "flac",
