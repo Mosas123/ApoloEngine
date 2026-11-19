@@ -36,8 +36,9 @@ public final class ApoloEngine {
     private var loadEpoch: UInt64 = 0
 
     private let host = AVPlayerHost()
-    private let session = AudioSessionController()
+    private let session: AudioSessionController
     private let nowPlaying = NowPlayingController()
+    private let managesSystemMediaControls: Bool
     private var libavHost: LibavcodecAudioHost?
     private var route: AudioRoute = .avPlayer
     private var metadata: NowPlayingMetadata?
@@ -50,7 +51,18 @@ public final class ApoloEngine {
     public var nextTracks: [ApoloTrack] { queue.upcoming }
     public var currentTrack: ApoloTrack? { queue.current }
 
-    public init() {
+    /// `managesSystemMediaControls` registers the remote commands and the Now
+    /// Playing card; `managesAudioSession` configures and observes
+    /// `AVAudioSession`. Pass `false` for either when the host app owns it.
+    public init(
+        managesSystemMediaControls: Bool = true,
+        managesAudioSession: Bool = true
+    ) {
+        self.managesSystemMediaControls = managesSystemMediaControls
+        self.session = AudioSessionController(
+            managesSession: managesAudioSession
+        )
+
         host.onState = { [weak self] state in
             self?.apply(state)
         }
@@ -66,7 +78,9 @@ public final class ApoloEngine {
         nowPlaying.onSeek = { [weak self] time in
             Task { await self?.seek(to: time) }
         }
-        nowPlaying.activate()
+        if managesSystemMediaControls {
+            nowPlaying.activate()
+        }
 
         session.onInterruptionBegan = { [weak self] in
             guard let self else { return }
@@ -448,7 +462,7 @@ public final class ApoloEngine {
     }
 
     private func refreshNowPlaying() {
-        guard let metadata else { return }
+        guard managesSystemMediaControls, let metadata else { return }
         nowPlaying.update(
             title: metadata.title,
             artist: metadata.artist,

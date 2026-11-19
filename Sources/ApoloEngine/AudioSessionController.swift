@@ -10,13 +10,16 @@ import Foundation
 @MainActor
 final class AudioSessionController {
     private let session = AVAudioSession.sharedInstance()
+    private let managesSession: Bool
     private var observers: [NSObjectProtocol] = []
 
     var onInterruptionBegan: (@MainActor () -> Void)?
     var onInterruptionEnded: (@MainActor (Bool) -> Void)?
     var onRouteLost: (@MainActor () -> Void)?
 
-    init() {
+    init(managesSession: Bool = true) {
+        self.managesSession = managesSession
+        guard managesSession else { return }
         let center = NotificationCenter.default
         observers.append(
             center.addObserver(
@@ -53,12 +56,14 @@ final class AudioSessionController {
     }
 
     func activateMultichannel() throws {
+        guard managesSession else { return }
         try session.setCategory(.playback, mode: .default, options: [])
         try session.setSupportsMultichannelContent(true)
         try session.setActive(true)
     }
 
     func deactivate() {
+        guard managesSession else { return }
         try? session.setActive(false, options: [.notifyOthersOnDeactivation])
     }
 

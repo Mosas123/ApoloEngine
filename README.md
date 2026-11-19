@@ -53,7 +53,7 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 ## Install
 
 ```swift
-.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.1")
+.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.2")
 ```
 
 ## Use
@@ -61,7 +61,11 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 ```swift
 import ApoloEngine
 
-let engine = ApoloEngine()
+// Host apps that already own the remote commands and the audio session:
+let engine = ApoloEngine(
+    managesSystemMediaControls: false,
+    managesAudioSession: false
+)
 
 try await engine.load(
     url: trackURL,
