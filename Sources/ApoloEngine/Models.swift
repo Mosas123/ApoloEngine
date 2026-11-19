@@ -52,6 +52,13 @@ public enum AudioRoute: Sendable, Equatable {
     case libavcodec
 }
 
+/// Explicit source lifetime. A live broadcast is never inferred from a
+/// missing duration: unresolved songs may also report zero duration.
+public enum StreamMode: Sendable, Equatable {
+    case onDemand
+    case live
+}
+
 /// One queued source. The engine uses it to keep gapless playback going and to
 /// update the Now Playing card across track boundaries.
 public struct ApoloTrack: Sendable, Equatable {
@@ -61,6 +68,7 @@ public struct ApoloTrack: Sendable, Equatable {
     /// MIME from the resolver. It lets opaque signed URLs (no extension and no
     /// `mime` query) pick the right route.
     public let sourceMIMEType: String?
+    public let streamMode: StreamMode
 
     // Filled by the engine when the track is queued. They are playback
     // details, not identity, so equality ignores them.
@@ -72,18 +80,21 @@ public struct ApoloTrack: Sendable, Equatable {
         url: URL,
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
-        sourceMIMEType: String? = nil
+        sourceMIMEType: String? = nil,
+        streamMode: StreamMode = .onDemand
     ) {
         self.url = url
         self.httpHeaders = httpHeaders
         self.metadata = metadata
         self.sourceMIMEType = sourceMIMEType
+        self.streamMode = streamMode
     }
 
     public static func == (lhs: ApoloTrack, rhs: ApoloTrack) -> Bool {
         lhs.url == rhs.url
             && lhs.httpHeaders == rhs.httpHeaders
             && lhs.metadata == rhs.metadata
+            && lhs.streamMode == rhs.streamMode
     }
 }
 
