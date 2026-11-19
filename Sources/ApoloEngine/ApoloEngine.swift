@@ -46,6 +46,8 @@ public final class ApoloEngine {
     private var metadata: NowPlayingMetadata?
     private var resumeAfterInterruption = false
     private var liveCancellation: LiveStreamCancellation?
+    private var livePlaylistResolverTask: Task<URL, Error>?
+    private var livePlaylistPausedInFlight = false
     private var liveReconnectTask: Task<Void, Never>?
     private var liveRetryAttempts = 0
     private var liveRetryOpening = false
@@ -193,6 +195,7 @@ public final class ApoloEngine {
             streamMode: streamMode
         )
         cancelLiveReconnect()
+        livePlaylistPausedInFlight = false
         liveRetryAttempts = 0
         liveRetryOpening = false
         livePlayingSince = nil
@@ -222,8 +225,11 @@ public final class ApoloEngine {
 
     private func startPlayback(_ track: ApoloTrack, epoch: UInt64) async throws {
         guard epoch == loadEpoch else { return }
-        // A stop or station switch must cancel a blocked FFmpeg read before
-        // the serial decoder queue can execute its normal stop operation.
+        // A stop or station switch cancels pending playlist fetches as well as
+        // blocked FFmpeg reads. Old epochs cannot publish after cancellation.
+        livePlaylistResolverTask?.cancel()
+        livePlaylistResolverTask = nil
+        livePlaylistPausedInFlight = false
         liveCancellation?.cancel()
         liveCancellation = nil
         state = .loading
@@ -241,12 +247,16 @@ public final class ApoloEngine {
                 track.url, hint: track.sourceMIMEType
             ) {
                 do {
-                    let endpoint = try await LivePlaylistResolver.resolve(
-                        url: track.url,
-                        headers: track.httpHeaders,
-                        hint: track.sourceMIMEType
-                    )
+                    let task = Task(priority: .userInitiated) {
+                        try await LivePlaylistResolver.resolve(
+                            url: track.url,
+                            headers: track.httpHeaders
+                        )
+                    }
+                    livePlaylistResolverTask = task
+                    let endpoint = try await task.value
                     guard epoch == loadEpoch, liveShouldPlay else { return }
+                    livePlaylistResolverTask = nil
                     let safeHeaders = LiveStationPlaylist.sameOrigin(
                         track.url, endpoint
                     ) ? track.httpHeaders : [:]
@@ -260,6 +270,7 @@ public final class ApoloEngine {
                     )
                 } catch {
                     guard epoch == loadEpoch, liveShouldPlay else { return }
+                    livePlaylistResolverTask = nil
                     let cancellation = LiveStreamCancellation()
                     if case LivePlaylistResolver.Failure.httpStatus(let status) = error {
                         cancellation.recordHTTPStatus(status)
@@ -451,6 +462,13 @@ public final class ApoloEngine {
         resumeAfterInterruption = false
         if queue.current?.streamMode == .live {
             liveShouldPlay = true
+            if livePlaylistPausedInFlight {
+                livePlaylistPausedInFlight = false
+                liveRetryAttempts = 0
+                liveRetryOpening = false
+                scheduleLiveReconnect()
+                return
+            }
             if case .failed = state {
                 liveRetryAttempts = 0
                 scheduleLiveReconnect()
@@ -468,6 +486,12 @@ public final class ApoloEngine {
         if queue.current?.streamMode == .live {
             liveShouldPlay = false
             cancelLiveReconnect()
+            if livePlaylistResolverTask != nil {
+                livePlaylistResolverTask?.cancel()
+                livePlaylistResolverTask = nil
+                livePlaylistPausedInFlight = true
+                loadEpoch &+= 1
+            }
             if case .loading = state {
                 liveCancellation?.cancel()
             }
@@ -571,6 +595,9 @@ public final class ApoloEngine {
 
     public func stop() {
         cancelLiveReconnect()
+        livePlaylistResolverTask?.cancel()
+        livePlaylistResolverTask = nil
+        livePlaylistPausedInFlight = false
         liveShouldPlay = false
         liveRetryAttempts = 0
         liveRetryOpening = false
