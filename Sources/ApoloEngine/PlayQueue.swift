@@ -19,6 +19,21 @@ struct PlayQueue {
         upcoming.removeAll()
     }
 
+    /// Replaces a track (matched by identity) with a version that carries the
+    /// probed metadata and gain.
+    @discardableResult
+    mutating func replace(_ track: ApoloTrack, with updated: ApoloTrack) -> Bool {
+        if let index = upcoming.firstIndex(of: track) {
+            upcoming[index] = updated
+            return true
+        }
+        if current == track {
+            current = updated
+            return true
+        }
+        return false
+    }
+
     /// Moves to the next queued track and returns it.
     mutating func advance() -> ApoloTrack? {
         guard !upcoming.isEmpty else { return nil }

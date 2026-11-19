@@ -279,7 +279,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             let decoder = AudioDecoder()
             decoder.processingSettings = equalizer
             decoder.limiterEnabled = limiterEnabled
-            decoder.trackGainDB = trackGainDB
+            decoder.trackGainDB = track.effectiveGainDB
+            self.trackGainDB = track.effectiveGainDB
             decoder.startOffsetSeconds = max(
                 timelineEnd,
                 synchronizer.currentTime().seconds

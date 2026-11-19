@@ -30,6 +30,8 @@ never depends on a chat.
   enabled.
 - Audio interruptions and route loss: a call/Siri pauses, resumes only when the
   system asks and the user had not paused; unplugging headphones pauses.
+- Queued local tracks are probed at enqueue time, so their ReplayGain and
+  duration survive a gapless automatic advance.
 - Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
   protocol dependency). Local files keep the full FFmpeg probe and route.
 - The libavcodec tail is no longer cut: at EOF the clock keeps running until
@@ -139,8 +141,9 @@ Open:
    envelope kept). A lookahead limiter is deliberately **not** used: it adds
    5 ms of latency and a 5 ms silence at every gapless boundary, because the
    processing chain is per track.
-6. AVPlayer: probe queued tracks for ReplayGain (the Now Playing artwork and
-   `MediaType` are done).
+6. ~~AVPlayer: probe queued tracks for ReplayGain.~~ Queued local tracks are
+   probed when enqueued; the gain and duration travel with `ApoloTrack` and are
+   applied on advance (both routes).
 7. Tests: JOC/`dec3`, ReplayGain parsing, tap lifetime, gapless integration.
 
 Note: `CMSampleTimingInfo.duration = 1/sampleRate` with one timing entry is

@@ -59,6 +59,12 @@ public struct ApoloTrack: Sendable, Equatable {
     public let httpHeaders: [String: String]
     public let metadata: NowPlayingMetadata?
 
+    // Filled by the engine when the track is queued. They are playback
+    // details, not identity, so equality ignores them.
+    var media: MediaInfo?
+    var replayGainDB: Double?
+    var effectiveGainDB: Double = 0
+
     public init(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -67,6 +73,12 @@ public struct ApoloTrack: Sendable, Equatable {
         self.url = url
         self.httpHeaders = httpHeaders
         self.metadata = metadata
+    }
+
+    public static func == (lhs: ApoloTrack, rhs: ApoloTrack) -> Bool {
+        lhs.url == rhs.url
+            && lhs.httpHeaders == rhs.httpHeaders
+            && lhs.metadata == rhs.metadata
     }
 }
 

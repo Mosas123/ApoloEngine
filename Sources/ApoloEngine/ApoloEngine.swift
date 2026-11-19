@@ -156,8 +156,7 @@ public final class ApoloEngine {
         // native path for remote music (including Spatial/Atmos). Remote
         // sources skip the probe entirely; the local FFmpeg route keeps the
         // full codec/container probe.
-        let scheme = track.url.scheme?.lowercased()
-        if scheme == "http" || scheme == "https" {
+        if isRemote(track.url) {
             guard epoch == loadEpoch else { return }
             try? session.activateMultichannel()
             metadataGainDB = nil
@@ -306,11 +305,37 @@ public final class ApoloEngine {
     /// libavcodec route and no audible one on AVQueuePlayer.
     public func enqueueNext(_ track: ApoloTrack) async {
         queue.enqueue(track)
+
+        var prepared = track
+        prepared.effectiveGainDB = trackGainDB
+        if !isRemote(track.url) {
+            let info: MediaInfo?
+            if let cached = MediaProbe.cachedInfo(
+                url: track.url,
+                httpHeaders: track.httpHeaders
+            ) {
+                info = cached
+            } else {
+                info = try? await Task.detached(priority: .utility) {
+                    try MediaProbe.probe(
+                        url: track.url,
+                        httpHeaders: track.httpHeaders
+                    )
+                }.value
+            }
+            if let info {
+                prepared.media = info
+                prepared.replayGainDB = info.trackGainDB
+                prepared.effectiveGainDB = (info.trackGainDB ?? 0) + trackGainDB
+                queue.replace(track, with: prepared)
+            }
+        }
+
         switch route {
         case .avPlayer:
-            await host.enqueueNext(track)
+            await host.enqueueNext(prepared)
         case .libavcodec:
-            libavHost?.enqueueNext(track)
+            libavHost?.enqueueNext(prepared)
         }
     }
 
@@ -361,12 +386,16 @@ public final class ApoloEngine {
 
     private func applyAdvanced(_ track: ApoloTrack) {
         metadata = track.metadata
-        metadataGainDB = nil
-        // The previous track's probed duration no longer applies.
-        media = nil
+        metadataGainDB = track.replayGainDB
+        media = track.media
         elapsed = 0
         applyProcessing()
         refreshNowPlaying()
+    }
+
+    private func isRemote(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        return scheme == "http" || scheme == "https"
     }
 
     private func applyProcessing() {

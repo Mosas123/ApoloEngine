@@ -50,6 +50,28 @@ final class PlayQueueTests: XCTestCase {
         XCTAssertFalse(queue.consume(track("z")))
     }
 
+    func testReplaceUpdatesQueuedTrack() {
+        var queue = PlayQueue()
+        let a = track("a")
+        queue.enqueue(a)
+
+        var updated = a
+        updated.replayGainDB = -7
+        updated.effectiveGainDB = 3
+
+        XCTAssertTrue(queue.replace(a, with: updated))
+        XCTAssertEqual(queue.upcoming.first?.replayGainDB, -7)
+        XCTAssertEqual(queue.upcoming.first?.effectiveGainDB, 3)
+    }
+
+    func testTrackEqualityIgnoresProbedFields() {
+        let a = track("a")
+        var b = a
+        b.replayGainDB = -7
+        b.effectiveGainDB = 3
+        XCTAssertEqual(a, b)
+    }
+
     func testClearEmptiesEverything() {
         var queue = PlayQueue()
         queue.start(track("a"))
