@@ -10,6 +10,7 @@ final class AVPlayerHost {
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var finished = false
+    private(set) var loadGeneration: UInt64 = 0
     private var lastState: PlaybackState = .idle
     private var tapProcessors: [AudioTapProcessor] = []
     private var endObservers: [NSObjectProtocol] = []
@@ -74,6 +75,8 @@ final class AVPlayerHost {
     }
 
     func load(track: ApoloTrack) async {
+        loadGeneration &+= 1
+        let generation = loadGeneration
         resetItems()
         finished = false
         wantsToPlay = true
@@ -81,10 +84,11 @@ final class AVPlayerHost {
 
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
-        guard let audioTrack = try? await asset
+        let audioTrack = try? await asset
             .loadTracks(withMediaType: .audio)
             .first
-        else {
+        guard generation == loadGeneration else { return }
+        guard let audioTrack else {
             // Fail fast: the monitor then hands the source to mpv without
             // waiting for the loading timeout.
             publish(.failed("This source has no audio track"))
@@ -106,14 +110,14 @@ final class AVPlayerHost {
     }
 
     func enqueueNext(_ track: ApoloTrack) async {
+        let generation = loadGeneration
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
-        guard let audioTrack = try? await asset
+        let audioTrack = try? await asset
             .loadTracks(withMediaType: .audio)
             .first
-        else {
-            return
-        }
+        guard generation == loadGeneration else { return }
+        guard let audioTrack else { return }
         observeEnd(of: item)
         observeFailure(of: item)
         attachTap(to: item, track: audioTrack)
@@ -139,6 +143,7 @@ final class AVPlayerHost {
     }
 
     func stop() {
+        loadGeneration &+= 1
         wantsToPlay = false
         finished = false
         player.pause()
@@ -249,8 +254,9 @@ final class AVPlayerHost {
             return
         }
         if item.status == .failed {
-            let message = item.error?.localizedDescription ?? "Playback failed"
-            publish(.failed(message))
+            // Never surface AVFoundation's error text: it can contain the
+            // signed URL. The app only needs to know that it failed.
+            publish(.failed("Playback failed"))
         } else if wantsToPlay {
             publish(player.timeControlStatus == .playing ? .playing : .loading)
         } else {

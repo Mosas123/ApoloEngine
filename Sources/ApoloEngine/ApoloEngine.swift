@@ -33,7 +33,7 @@ public final class ApoloEngine {
     private var metadataGainDB: Double?
     /// Incremented on every load/skip so a slow, superseded probe cannot
     /// overwrite the engine after the user moved on.
-    private var loadEpoch: UInt64 = 0
+    private(set) var loadEpoch: UInt64 = 0
 
     private let host = AVPlayerHost()
     private let session: AudioSessionController
@@ -389,11 +389,14 @@ public final class ApoloEngine {
     }
 
     public func stop() {
+        loadEpoch &+= 1
         host.stop()
         libavHost?.stop()
         route = .avPlayer
         session.deactivate()
-        nowPlaying.clear()
+        if managesSystemMediaControls {
+            nowPlaying.clear()
+        }
         media = nil
         elapsed = 0
         state = .idle
