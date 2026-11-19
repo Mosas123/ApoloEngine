@@ -93,9 +93,8 @@ per-slice install names (or drop the x86_64 simulator slice).
 1. APAC (AirPlay / HomePod Atmos): iOS 26+, `AVAudioConverter` with the APAC
    format, the `dapa` box, and an fMP4/HLS delivery path. Deferred until the
    FFmpeg union build is in and there is a real Atmos route to test on.
-2. Decode tests for the union containers: **TTA done** (generated 6.9 KB tone
-   fixture, decoded through `OpenedSource` + `AudioDecoder`). APE/WavPack still
-   need a permissive sample: FFmpeg has no encoder for them here.
+2. Decode tests for the union containers: **TTA and APE done** (generated tone
+   fixtures, 6.9 KB and 3.7 KB, decoded through `OpenedSource` + `AudioDecoder`).
 3. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 

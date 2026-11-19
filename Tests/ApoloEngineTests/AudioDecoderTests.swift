@@ -59,6 +59,29 @@ final class AudioDecoderTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    func testDecodesAPE() throws {
+        let url = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "tone",
+                withExtension: "ape",
+                subdirectory: "Fixtures"
+            )
+        )
+        let source = try OpenedSource.open(url: url)
+        XCTAssertEqual(source.info.audioTracks.first?.codec, "ape")
+        XCTAssertEqual(source.info.audioTracks.first?.channels, 2)
+
+        let decoder = AudioDecoder()
+        try decoder.adopt(source)
+        defer { decoder.close() }
+
+        var samples = 0
+        while let buffer = try decoder.readNextBuffer() {
+            samples += CMSampleBufferGetNumSamples(buffer)
+        }
+        XCTAssertGreaterThan(samples, 0)
+    }
+
     func testDecodesTTA() throws {
         let url = try XCTUnwrap(
             Bundle.module.url(
