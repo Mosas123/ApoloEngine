@@ -1,0 +1,55 @@
+name: RTL HLS Metadata Isolated iPhone Harness
+
+on:
+  pull_request:
+    paths:
+      - "Experiments/RTLMetadataHarness/**"
+      - ".github/workflows/rtl-hls-metadata-harness.yml"
+  workflow_dispatch:
+
+jobs:
+  build-standalone-ios-harness:
+    name: Build unsigned RTL HLS harness IPA
+    runs-on: macos-26-arm64
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+      - name: Generate independent Xcode project
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild -list -project RTLMetadataHarness.xcodeproj
+      - name: Build for physical iPhone (unsigned)
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project RTLMetadataHarness.xcodeproj \
+            -scheme RTLMetadataHarness \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/rtl-hls-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Package independent IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/rtl-hls-derived/Build/Products/Release-iphoneos/RTLMetadataHarness.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/rtl-hls-package/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/rtl-hls-package/Payload/"
+          cd "$RUNNER_TEMP/rtl-hls-package"
+          zip -qry "$RUNNER_TEMP/RTLMetadataHarness-unsigned.ipa" Payload
+          unzip -t "$RUNNER_TEMP/RTLMetadataHarness-unsigned.ipa" > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RTL-HLS-MetadataHarness-unsigned
+          path: ${{ runner.temp }}/RTLMetadataHarness-unsigned.ipa
+          retention-days: 14
