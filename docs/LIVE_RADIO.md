@@ -163,6 +163,27 @@ in the background, memory allocations under Instruments, AirPods/AirPlay route
 changes, repeated device disconnects, or production station behavior.
 Thrum remains on MPVKit for radio until real-device acceptance is complete.
 
+## Phase 2G — iOS 27 live HLS metadata crash containment (draft v8)
+
+Physical iPhone beta feedback reported audible native radio followed by an
+`EXC_BAD_ACCESS` on the main thread. Its top stack was in
+`objc_release` / `__NSFrozenDictionaryM dealloc` while AVFCore executed
+`AVPlayerItemMetadataOutput._pushTimedMetadataGroups`. The log implicates
+the timed-metadata callback path but **does not prove root cause or exclude**
+an Apple framework/lifetime issue.
+
+For the next device beta, native `AVPlayerItemMetadataOutput` attachment is
+**disabled** behind the internal `nativeHLSTimedMetadataEnabled = false`
+constant. HLS audio via AVPlayer remains enabled. This deliberately
+sacrifices native HLS timed song-title events to remove the immediate
+suspected crash trigger. ICY song titles on FFmpeg radio remain functional;
+M3U/PLS, direct AAC/MP3, Ogg/Opus and ordinary music paths are unchanged.
+
+**Do not claim this fully fixes all crashes.** Re-run the same station on
+hardware, then exercise 30+ station changes and background/foreground audio.
+Only re-enable native HLS metadata after a separately measured device-safe
+implementation (and iOS-version coverage), never based on simulator CI alone.
+
 ## Phase 3 — integration and acceptance
 
 After the engine's transport APIs and on-device validations are ready, make live radio an opt-in route in Thrum, retaining an MPVKit fallback until confidence is high. Acceptance tests:
