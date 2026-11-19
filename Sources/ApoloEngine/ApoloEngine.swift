@@ -702,6 +702,10 @@ public final class ApoloEngine {
             do {
                 try await self.startPlayback(track, epoch: retryEpoch)
                 self.liveRetryOpening = false
+                if self.loadEpoch == retryEpoch,
+                   case .failed = self.state {
+                    self.scheduleLiveReconnect()
+                }
             } catch {
                 self.liveRetryOpening = false
                 guard self.loadEpoch == retryEpoch,
