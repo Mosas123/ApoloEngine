@@ -39,7 +39,7 @@ final class LegacyICYConnection: @unchecked Sendable {
               !hostname.isEmpty,
               url.user == nil, url.password == nil,
               let endpointPort = NWEndpoint.Port(
-                rawValue: UInt16(url.port ?? 80)
+                rawValue: UInt16(exactly: url.port ?? 80) ?? 0
               ) else {
             buffer.fail()
             return
@@ -83,9 +83,9 @@ final class LegacyICYConnection: @unchecked Sendable {
             path += "?" + query
         }
         let host = url.host ?? ""
-        let hostHeader = host.contains(":") ? "[\\(host)]" : host
-        let portSuffix = (url.port ?? 80) == 80 ? "" : ":\\(url.port ?? 80)"
-        let request = "GET \\(path) HTTP/1.0\\r\\nHost: \\(hostHeader)\\(portSuffix)\\r\\nIcy-MetaData: 1\\r\\nAccept: */*\\r\\nConnection: close\\r\\n\\r\\n"
+        let hostHeader = host.contains(":") ? "[\(host)]" : host
+        let portSuffix = (url.port ?? 80) == 80 ? "" : ":\(url.port ?? 80)"
+        let request = "GET \(path) HTTP/1.0\r\nHost: \(hostHeader)\(portSuffix)\r\nIcy-MetaData: 1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
         connection.send(
             content: Data(request.utf8),
             completion: .contentProcessed { [weak self] error in
