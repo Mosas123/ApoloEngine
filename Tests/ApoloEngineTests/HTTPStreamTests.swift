@@ -4,6 +4,11 @@ import XCTest
 @testable import ApoloEngine
 
 final class HTTPStreamTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        MockURLProtocol.resetFailures()
+    }
+
     func testHTTPStreamReadsAndSeeks() {
         MockURLProtocol.supportsRange = true
         MockURLProtocol.payload = Data([0, 1, 2, 3, 4, 5, 6, 7])
@@ -106,6 +111,96 @@ final class HTTPStreamTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    func testTransientConnectionLossResumesAtExactByte() {
+        let boundary = 1 << 20
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data(repeating: 7, count: boundary)
+            + Data([11, 12, 13, 14, 15])
+        MockURLProtocol.configureFailure(
+            offset: boundary,
+            remaining: 2,
+            status: nil
+        )
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/stream")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+
+        var prefix = [UInt8](repeating: 0, count: 2)
+        XCTAssertEqual(prefix.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 2)
+        }, 2)
+        XCTAssertEqual(stream.seek(offset: Int64(boundary), whence: 0), Int64(boundary))
+
+        var tail = [UInt8](repeating: 0, count: 5)
+        let count = tail.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 5)
+        }
+        XCTAssertEqual(count, 5)
+        XCTAssertEqual(tail, [11, 12, 13, 14, 15])
+        XCTAssertFalse(stream.hasError)
+        XCTAssertEqual(
+            MockURLProtocol.requests(at: boundary), 3,
+            "two failures plus one successful Range request"
+        )
+    }
+
+    func testTransient503RetriesRangeWithoutSkipping() {
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data([42, 43, 44, 45])
+        MockURLProtocol.configureFailure(offset: 0, remaining: 1, status: 503)
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/stream")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+
+        var buffer = [UInt8](repeating: 0, count: 4)
+        XCTAssertEqual(buffer.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 4)
+        }, 4)
+        XCTAssertEqual(buffer, [42, 43, 44, 45])
+        XCTAssertFalse(stream.hasError)
+        XCTAssertEqual(MockURLProtocol.requests(at: 0), 2)
+    }
+
+    func testForbiddenStreamDoesNotRetry() {
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data([1, 2, 3])
+        MockURLProtocol.configureFailure(offset: 0, remaining: 5, status: 403)
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/expired")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+
+        var bytes = [UInt8](repeating: 0, count: 3)
+        XCTAssertEqual(bytes.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 3)
+        }, 0)
+        XCTAssertTrue(stream.hasError)
+        XCTAssertEqual(MockURLProtocol.requests(at: 0), 1)
+    }
+
+    func testRepeated503StopsAfterBoundedAttempts() {
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data([1, 2, 3])
+        MockURLProtocol.configureFailure(offset: 0, remaining: 5, status: 503)
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/down")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+
+        var bytes = [UInt8](repeating: 0, count: 3)
+        XCTAssertEqual(bytes.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 3)
+        }, 0)
+        XCTAssertTrue(stream.hasError)
+        XCTAssertEqual(MockURLProtocol.requests(at: 0), 3)
+    }
+
     private func makeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -156,6 +251,34 @@ final class HTTPStreamTests: XCTestCase {
 private final class MockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var payload = Data()
     nonisolated(unsafe) static var supportsRange = true
+    private static let failureLock = NSLock()
+    nonisolated(unsafe) private static var failureOffset: Int?
+    nonisolated(unsafe) private static var failuresRemaining = 0
+    nonisolated(unsafe) private static var failureStatus: Int?
+    nonisolated(unsafe) private static var requestOffsets: [Int] = []
+
+    static func resetFailures() {
+        failureLock.lock()
+        failureOffset = nil
+        failuresRemaining = 0
+        failureStatus = nil
+        requestOffsets = []
+        failureLock.unlock()
+    }
+
+    static func configureFailure(offset: Int, remaining: Int, status: Int?) {
+        failureLock.lock()
+        failureOffset = offset
+        failuresRemaining = remaining
+        failureStatus = status
+        failureLock.unlock()
+    }
+
+    static func requests(at offset: Int) -> Int {
+        failureLock.lock()
+        defer { failureLock.unlock() }
+        return requestOffsets.filter { $0 == offset }.count
+    }
 
     override class func canInit(with request: URLRequest) -> Bool {
         request.url?.host == "mock.local"
@@ -172,6 +295,37 @@ private final class MockURLProtocol: URLProtocol {
         }
 
         let full = Self.payload
+        let requestedOffset = request.value(forHTTPHeaderField: "Range")
+            .flatMap { Self.parseRange($0, total: full.count) }?
+            .lowerBound ?? 0
+        Self.failureLock.lock()
+        Self.requestOffsets.append(requestedOffset)
+        let shouldFail = Self.failureOffset == requestedOffset
+            && Self.failuresRemaining > 0
+        if shouldFail { Self.failuresRemaining -= 1 }
+        let injectedStatus = Self.failureStatus
+        Self.failureLock.unlock()
+
+        if shouldFail {
+            if let injectedStatus {
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: injectedStatus,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: [:]
+                )!
+                client?.urlProtocol(
+                    self,
+                    didReceive: response,
+                    cacheStoragePolicy: .notAllowed
+                )
+                client?.urlProtocolDidFinishLoading(self)
+            } else {
+                client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            }
+            return
+        }
+
         var body = full
         var status = 200
         var headers = [
