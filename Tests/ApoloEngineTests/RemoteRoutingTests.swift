@@ -2,6 +2,40 @@ import XCTest
 @testable import ApoloEngine
 
 final class RemoteRoutingTests: XCTestCase {
+    func testAppleCompatibleLocalAudioUsesNativeRoute() {
+        for ext in ["m4a", "M4A", "m4b", "mp3", "aac", "mp4"] {
+            let local = URL(fileURLWithPath: "/tmp/Apolo Test/song.\(ext)")
+            XCTAssertTrue(
+                ApoloEngine.supportsNativeLocal(local, hint: "audio/mp4"),
+                "Native sandbox audio should not require FFmpeg preflight: \(ext)"
+            )
+        }
+    }
+
+    func testExoticLocalAudioKeepsFFmpegRoute() {
+        for ext in ["flac", "ogg", "opus", "wav", "ape", "tta", "webm"] {
+            XCTAssertFalse(ApoloEngine.supportsNativeLocal(
+                URL(fileURLWithPath: "/tmp/song.\(ext)")
+            ))
+        }
+    }
+
+    func testExplicitExoticCodecOverridesAppleExtension() {
+        let local = URL(fileURLWithPath: "/tmp/song.m4a")
+        XCTAssertFalse(ApoloEngine.supportsNativeLocal(
+            local, hint: "audio/flac"
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLocal(
+            local, hint: "audio/ogg; codecs=opus"
+        ))
+    }
+
+    func testRemoteURLCannotUseSandboxShortcut() {
+        XCTAssertFalse(ApoloEngine.supportsNativeLocal(
+            URL(string: "https://example.org/song.mp3")!
+        ))
+    }
+
     func testRemoteFLACUsesFFmpeg() {
         XCTAssertTrue(
             ApoloEngine.shouldUseFFmpegForRemote(
