@@ -7,12 +7,25 @@ import AVFoundation
 @MainActor
 final class AVPlayerHost {
     private let player = AVQueuePlayer()
-    // Device crash mitigation: iOS 27.0.1 can EXC_BAD_ACCESS within
-    // AVFCore's _pushTimedMetadataGroups while releasing an internal
-    // metadata dictionary. Avoid installing AVPlayerItemMetadataOutput on
-    // untrusted live HLS until a separately validated collector is ready.
-    // ICY metadata on the FFmpeg live route remains fully supported.
-    nonisolated static let nativeHLSTimedMetadataEnabled = false
+    // EXPERIMENTAL IPA ONLY: previous iOS 27.0.1 crash occurred inside
+    // AVFCore's _pushTimedMetadataGroups. Keep the main beta OFF; limit this
+    // isolated hardware A/B to explicit HLS URLs/MIME + title identifiers.
+    // This is an experiment, NOT a confirmed fix or production-safe change.
+    nonisolated static let nativeHLSTimedMetadataEnabled = true
+
+    nonisolated static func shouldCollectNativeHLSTimedMetadata(for track: ApoloTrack) -> Bool {
+        guard nativeHLSTimedMetadataEnabled, track.streamMode == .live,
+              let scheme = track.url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http" else { return false }
+        let ext = track.url.pathExtension.lowercased()
+        let mime = (track.sourceMIMEType ?? "")
+            .lowercased()
+            .split(separator: ";", maxSplits: 1)
+            .first.map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        return ext == "m3u8"
+            || ["application/vnd.apple.mpegurl", "application/x-mpegurl",
+                "audio/mpegurl", "audio/x-mpegurl"].contains(mime)
+    }
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var finished = false
@@ -127,20 +140,24 @@ final class AVPlayerHost {
         publish(.loading)
 
         let item = AVPlayerItem(asset: makeAsset(track))
-        // Avoid AVPlayerItemMetadataOutput on iOS 27.0.1 live streams:
-        // one physical-device crash occurred inside the AVFoundation
-        // timed-metadata callback, after audio had started successfully.
-        // The parser is retained for future investigation, but the native
-        // output is explicitly disabled for the device beta.
-        if Self.nativeHLSTimedMetadataEnabled {
+        // EXPERIMENTAL: only HLS, only ID3/common song-title identifiers.
+        // Avoid fetching all timed metadata (identifiers: nil), especially
+        // for raw MP3/AAC radio which does not need the HLS observer.
+        if Self.shouldCollectNativeHLSTimedMetadata(for: track) {
             let generation = loadGeneration
-            let output = AVPlayerItemMetadataOutput(identifiers: nil)
+            let titleIdentifiers = [
+                AVMetadataIdentifier.id3MetadataTitleDescription.rawValue,
+                AVMetadataIdentifier.commonIdentifierTitle.rawValue
+            ]
+            let output = AVPlayerItemMetadataOutput(identifiers: titleIdentifiers)
+            NSLog("APOLO_HLS_META attach generation=\(generation)")
             let handler = LiveTimedMetadataHandler { [weak self] title in
                 Task { @MainActor [weak self] in
                     guard let self, self.isLiveStream,
                           self.loadGeneration == generation,
                           self.lastLiveTitle != title else { return }
                     self.lastLiveTitle = title
+                    NSLog("APOLO_HLS_META titleAccepted generation=\(generation)")
                     self.onLiveTitle?(title)
                 }
             }
@@ -312,6 +329,7 @@ final class AVPlayerHost {
         // AVPlayerItemMetadataOutput retains no delegate. Remove it before
         // releasing the handler, so obsolete station events stop arriving.
         if let output = liveMetadataOutput {
+            NSLog("APOLO_HLS_META detach generation=\(loadGeneration)")
             output.setDelegate(nil, queue: nil)
             for item in player.items() {
                 item.remove(output)
