@@ -188,7 +188,7 @@ final class HTTPStream: @unchecked Sendable {
                     ), range.start == start,
                        range.end >= range.start,
                        Int64(data.count) == range.end - range.start + 1,
-                       (range.total == nil || range.end < range.total!) else {
+                       (range.total.map { range.end < $0 } ?? true) else {
                         fail(URLError(.badServerResponse))
                         return false
                     }
