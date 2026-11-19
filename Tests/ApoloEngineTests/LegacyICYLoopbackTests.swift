@@ -85,10 +85,12 @@ final class LegacyICYLoopbackTests: XCTestCase {
         var collected = [UInt8](repeating: 0, count: 8)
         var count = 0
         while count < collected.count {
+            let remaining = collected.count - count
+            let offset = count
             let amount = collected.withUnsafeMutableBufferPointer { pointer in
                 stream.read(
-                    into: pointer.baseAddress!.advanced(by: count),
-                    count: collected.count - count
+                    into: pointer.baseAddress!.advanced(by: offset),
+                    count: remaining
                 )
             }
             if amount == 0 { break }
