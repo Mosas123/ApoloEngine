@@ -83,6 +83,12 @@ public final class ApoloEngine {
         host.onTrackChange = { [weak self] in
             self?.advanceFromQueue()
         }
+        host.onLiveTitle = { [weak self] title in
+            guard let self, self.queue.current?.streamMode == .live else {
+                return
+            }
+            self.liveTitle = title
+        }
         nowPlaying.onPlay = { [weak self] in self?.play() }
         nowPlaying.onPause = { [weak self] in self?.pause() }
         nowPlaying.onToggle = { [weak self] in self?.togglePlayPause() }
@@ -614,6 +620,7 @@ public final class ApoloEngine {
         }
         media = nil
         elapsed = 0
+        liveTitle = nil
         state = .idle
         queue.clear()
         metadata = nil
