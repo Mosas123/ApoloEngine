@@ -3,11 +3,35 @@ import XCTest
 @testable import ApoloEngine
 
 final class LiveTimedMetadataTests: XCTestCase {
-    func testDeviceBetaDoesNotAttachUnsafeNativeMetadataOutput() {
-        // Physical iOS 27.0.1 crash stack points into AVFCore's
-        // AVPlayerItemMetadataOutput private callback. ICY metadata remains
-        // available on the separate FFmpeg transport.
-        XCTAssertFalse(AVPlayerHost.nativeHLSTimedMetadataEnabled)
+    func testIsolatedMetadataExperimentOnlyAttachesForHLS() {
+        // The general beta must retain its safe opt-out. This experimental
+        // branch intentionally enables narrow collection solely for HLS.
+        XCTAssertTrue(AVPlayerHost.nativeHLSTimedMetadataEnabled)
+        let hls = ApoloTrack(
+            url: URL(string: "https://radio.example/live.m3u8")!,
+            streamMode: .live
+        )
+        let hintedHLS = ApoloTrack(
+            url: URL(string: "https://radio.example/opaque")!,
+            sourceMIMEType: "application/vnd.apple.mpegurl; charset=utf-8",
+            streamMode: .live
+        )
+        let mp3 = ApoloTrack(
+            url: URL(string: "https://radio.example/live.mp3")!,
+            streamMode: .live
+        )
+        let aac = ApoloTrack(
+            url: URL(string: "https://radio.example/live.aac")!,
+            streamMode: .live
+        )
+        let normalMusic = ApoloTrack(
+            url: URL(string: "https://radio.example/song.m3u8")!
+        )
+        XCTAssertTrue(AVPlayerHost.shouldCollectNativeHLSTimedMetadata(for: hls))
+        XCTAssertTrue(AVPlayerHost.shouldCollectNativeHLSTimedMetadata(for: hintedHLS))
+        XCTAssertFalse(AVPlayerHost.shouldCollectNativeHLSTimedMetadata(for: mp3))
+        XCTAssertFalse(AVPlayerHost.shouldCollectNativeHLSTimedMetadata(for: aac))
+        XCTAssertFalse(AVPlayerHost.shouldCollectNativeHLSTimedMetadata(for: normalMusic))
     }
 
     func testAcceptsID3SongTitle() {
