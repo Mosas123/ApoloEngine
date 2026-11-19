@@ -53,7 +53,7 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 ## Install
 
 ```swift
-.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.3")
+.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.5")
 ```
 
 ## Use
@@ -102,7 +102,7 @@ computes a per-track gain when the container has no ReplayGain tag.
 | Local, Apple codec | AVPlayer | Probe once, then hand the file to AVFoundation |
 | Local, exotic codec | libavcodec → `AVSampleBufferAudioRenderer` | APE/TTA/WavPack/Tak/MPC/DSD-ish |
 | Remote, standard | AVPlayer | AAC/ALAC/MP3/FLAC/E-AC-3, native Spatial/Atmos |
-| Remote, exotic | FFmpeg HTTP AVIO | `ape/tta/wv/tak/mpc/dsf/aiff/wma/mka` and `webm/ogg/opus` (also detected from the URL `mime`); finite files |
+| Remote, exotic | FFmpeg HTTP AVIO | `ape/tta/wv/tak/mpc/dsf/aiff/wma/mka`, `webm/ogg/opus` and **remote FLAC** (also detected from the URL `mime`); finite files |
 
 Live or segmented streams are not handled by the FFmpeg HTTP path; standard
 remote music goes through AVPlayer.
@@ -139,6 +139,8 @@ xcodebuild test \
   arm64 (device and Apple Silicon simulator) is the production path.
 - JOC passthrough depends on the system Atmos decoder; there is no bundled
   primer.
+- Remote FLAC is detected from the extension or the URL `mime`. An opaque
+  signed URL needs a source hint (planned); local FLAC still uses AVPlayer.
 - The AVPlayer tap is attached as soon as the audio track loads, so a remote
   asset can play a few unprocessed frames before the tap is in place.
 

@@ -269,7 +269,13 @@ public final class ApoloEngine {
         metadataGainDB = info.trackGainDB
         applyProcessing()
 
-        switch CodecSupport.route(forCodec: audioTrack.codec, container: info.container) {
+        let codecRoute: AudioRoute = isRemote(track.url)
+            ? .libavcodec
+            : CodecSupport.route(
+                forCodec: audioTrack.codec,
+                container: info.container
+            )
+        switch codecRoute {
         case .avPlayer:
             source?.close()
             route = .avPlayer
@@ -434,8 +440,15 @@ public final class ApoloEngine {
     /// the HTTP AVIO. Live/segmented streams are excluded on purpose: the HTTP
     /// source downloads a finite file.
     private func isExoticRemote(_ url: URL) -> Bool {
-        guard isRemote(url) else { return false }
-        if Self.exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
+        Self.shouldUseFFmpegForRemote(url)
+    }
+
+    /// True when a remote URL must go through FFmpeg. Local files are never
+    /// included: local FLAC still plays through AVPlayer.
+    static func shouldUseFFmpegForRemote(_ url: URL) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        guard scheme == "http" || scheme == "https" else { return false }
+        if exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
             return true
         }
         // Signed CDN URLs often have no extension; the MIME query is the
@@ -449,12 +462,13 @@ public final class ApoloEngine {
             || mime.contains("ogg")
             || mime.contains("opus")
             || mime.contains("matroska")
+            || mime.contains("flac")
     }
 
     private static let exoticRemoteExtensions: Set<String> = [
         "ape", "tta", "wv", "tak", "mpc", "mp+",
         "dsf", "dff", "dsdiff", "aiff", "aif", "wma", "mka",
-        "webm", "weba", "ogg", "oga", "opus",
+        "webm", "weba", "ogg", "oga", "opus", "flac",
     ]
 
     private func applyProcessing() {
