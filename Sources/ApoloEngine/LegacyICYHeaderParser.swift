@@ -52,7 +52,11 @@ struct LegacyICYHeaderParser {
         guard let string = String(data: headerBytes, encoding: .isoLatin1) else {
             throw Failure.malformedHeaders
         }
-        let lines = string.split(separator: "\n", omittingEmptySubsequences: false)
+        // Swift Character segmentation treats CRLF as a single grapheme;
+        // splitting directly on "\n" does not split HTTP-style CRLF lines.
+        // Normalize CRLF first, then parse each header independently.
+        let lines = string.replacingOccurrences(of: "\r\n", with: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
         guard let statusLine = lines.first, statusLine.hasPrefix("ICY ") else {
             throw Failure.invalidStatus
