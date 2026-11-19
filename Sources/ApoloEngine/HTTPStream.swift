@@ -33,6 +33,13 @@ final class HTTPStream: @unchecked Sendable {
         session.invalidateAndCancel()
     }
 
+    /// True when the download failed (as opposed to a clean end of file).
+    var hasError: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return loadError != nil
+    }
+
     func read(into buffer: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
         loadIfNeeded()
         lock.lock()
@@ -95,18 +102,26 @@ final class HTTPStream: @unchecked Sendable {
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        session.dataTask(with: request) { data, response, error in
+        let task = session.dataTask(with: request) { data, response, error in
             if let http = response as? HTTPURLResponse,
                !(200...299).contains(http.statusCode) {
-                result.error = URLError(.badServerResponse)
+                result.set(data: nil, error: URLError(.badServerResponse))
             } else if let error {
-                result.error = error
+                result.set(data: nil, error: error)
             } else {
-                result.data = data
+                result.set(data: data, error: nil)
             }
             semaphore.signal()
-        }.resume()
-        semaphore.wait()
+        }
+        task.resume()
+
+        if semaphore.wait(timeout: .now() + 60) == .timedOut {
+            task.cancel()
+            lock.lock()
+            loadError = URLError(.timedOut)
+            lock.unlock()
+            return
+        }
 
         lock.lock()
         if let data = result.data {
@@ -119,8 +134,28 @@ final class HTTPStream: @unchecked Sendable {
 }
 
 private final class LoadResult: @unchecked Sendable {
-    var data: Data?
-    var error: Error?
+    private let lock = NSLock()
+    private var storedData: Data?
+    private var storedError: Error?
+
+    func set(data: Data?, error: Error?) {
+        lock.lock()
+        storedData = data
+        storedError = error
+        lock.unlock()
+    }
+
+    var data: Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedData
+    }
+
+    var error: Error? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedError
+    }
 }
 
 /// Owns the `AVIOContext`, its read buffer and the stream behind it.
@@ -184,7 +219,12 @@ private let httpReadPacket: @convention(c) (
     let stream = Unmanaged<HTTPStream>
         .fromOpaque(opaque)
         .takeUnretainedValue()
-    return Int32(stream.read(into: buffer, count: Int(size)))
+    let read = stream.read(into: buffer, count: Int(size))
+    if read > 0 {
+        return Int32(read)
+    }
+    // The AVIO contract wants AVERROR_EOF, not 0. A failed download is EIO.
+    return stream.hasError ? -5 : -541_478_725
 }
 
 private let httpSeek: @convention(c) (

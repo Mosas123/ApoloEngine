@@ -45,8 +45,14 @@ final class HTTPStreamTests: XCTestCase {
         defer { decoder.close() }
 
         var samples = 0
+        var buffers = 0
         while let buffer = decoder.readNextBuffer() {
             samples += CMSampleBufferGetNumSamples(buffer)
+            buffers += 1
+            if buffers > 2_000 {
+                XCTFail("the decoder never signalled EOF")
+                break
+            }
         }
         XCTAssertGreaterThan(samples, 0)
     }
