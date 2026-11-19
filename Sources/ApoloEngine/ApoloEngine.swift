@@ -14,6 +14,8 @@ public final class ApoloEngine {
     public private(set) var state: PlaybackState = .idle
     public private(set) var media: MediaInfo?
     public private(set) var elapsed: TimeInterval = 0
+    /// ICY track title for a direct live radio source, when available.
+    public private(set) var liveTitle: String?
 
     /// Five-band EQ. Applied on both routes: the libavcodec chain and the
     /// AVPlayer `MTAudioProcessingTap`.
@@ -205,22 +207,61 @@ public final class ApoloEngine {
         elapsed = 0
         media = nil
         metadata = track.metadata
+        liveTitle = nil
 
         if track.streamMode == .live {
-            guard Self.supportsNativeLive(track.url, hint: track.sourceMIMEType) else {
-                // The old source must not keep playing after a rejected switch.
+            if Self.supportsNativeLive(track.url, hint: track.sourceMIMEType) {
+                guard epoch == loadEpoch else { return }
+                try? session.activateMultichannel()
+                metadataGainDB = nil
+                applyProcessing()
+                route = .avPlayer
+                libavHost?.stop()
+                await host.loadLive(track: track)
+                refreshNowPlaying()
+                return
+            }
+
+            guard Self.supportsFFmpegLive(track.url, hint: track.sourceMIMEType) else {
                 host.stop()
                 libavHost?.stop()
-                state = .failed("Live format requires a streaming transport")
+                state = .failed("Unsupported live radio format")
                 throw ApoloError.unsupportedFormat
             }
-            guard epoch == loadEpoch else { return }
+
+            let onTitle: @Sendable (String) -> Void = { [weak self] title in
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadEpoch == epoch else { return }
+                    self.liveTitle = title
+                }
+            }
+            let source: OpenedSource
+            do {
+                source = try await Task.detached(priority: .userInitiated) {
+                    try OpenedSource.open(
+                        url: track.url,
+                        httpHeaders: track.httpHeaders,
+                        isLive: true,
+                        onICYTitle: onTitle
+                    )
+                }.value
+            } catch {
+                if epoch == loadEpoch {
+                    state = .failed("Could not open live audio")
+                }
+                throw error
+            }
+            guard epoch == loadEpoch else {
+                source.close()
+                return
+            }
+            media = source.info
             try? session.activateMultichannel()
-            metadataGainDB = nil
+            metadataGainDB = source.info.trackGainDB
             applyProcessing()
-            route = .avPlayer
-            libavHost?.stop()
-            await host.loadLive(track: track)
+            route = .libavcodec
+            host.stop()
+            libavHost?.load(source: source)
             refreshNowPlaying()
             return
         }
@@ -499,6 +540,20 @@ public final class ApoloEngine {
         let ext = url.pathExtension.lowercased()
         guard !["pls", "m3u", "xspf", "asx"].contains(ext) else { return false }
         return !shouldUseFFmpegForRemote(url, hint: hint)
+    }
+
+    /// Only exotic direct streams use the nonseekable FFmpeg live transport.
+    /// Playlist URLs require a playlist resolver, not a byte-stream decoder.
+    nonisolated static func supportsFFmpegLive(
+        _ url: URL, hint: String? = nil
+    ) -> Bool {
+        let scheme = url.scheme?.lowercased()
+        guard scheme == "http" || scheme == "https" else { return false }
+        let ext = url.pathExtension.lowercased()
+        guard !["m3u", "m3u8", "pls", "xspf", "asx"].contains(ext) else {
+            return false
+        }
+        return shouldUseFFmpegForRemote(url, hint: hint)
     }
 
     /// True when a remote URL must go through FFmpeg. Local files are never
