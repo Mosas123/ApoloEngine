@@ -98,7 +98,9 @@ final class AVPlayerHost {
         }
         observeEnd(of: item)
         observeFailure(of: item)
-        attachTap(to: item, track: audioTrack)
+        if !(track.isAtmos || Self.isSpatialCompressed(track.sourceMIMEType)) {
+            attachTap(to: item, track: audioTrack)
+        }
         player.insert(item, after: nil)
         player.play()
     }
@@ -143,7 +145,9 @@ final class AVPlayerHost {
         guard let audioTrack else { return }
         observeEnd(of: item)
         observeFailure(of: item)
-        attachTap(to: item, track: audioTrack)
+        if !(track.isAtmos || Self.isSpatialCompressed(track.sourceMIMEType)) {
+            attachTap(to: item, track: audioTrack)
+        }
         player.insert(item, after: player.items().last)
         if finished {
             finished = false
@@ -192,6 +196,13 @@ final class AVPlayerHost {
             url: track.url,
             options: ["AVURLAssetHTTPHeaderFieldsKey": track.httpHeaders]
         )
+    }
+
+    nonisolated static func isSpatialCompressed(_ mime: String?) -> Bool {
+        let normalized = (mime ?? "").lowercased()
+        return normalized.contains("eac3")
+            || normalized.contains("ec+3")
+            || normalized.contains("ac3")
     }
 
     private func attachTap(to item: AVPlayerItem, track: AVAssetTrack) {

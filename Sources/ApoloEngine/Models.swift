@@ -68,6 +68,7 @@ public struct ApoloTrack: Sendable, Equatable {
     /// MIME from the resolver. It lets opaque signed URLs (no extension and no
     /// `mime` query) pick the right route.
     public let sourceMIMEType: String?
+    public let isAtmos: Bool
     public let streamMode: StreamMode
 
     // Filled by the engine when the track is queued. They are playback
@@ -81,12 +82,14 @@ public struct ApoloTrack: Sendable, Equatable {
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
         sourceMIMEType: String? = nil,
+        isAtmos: Bool = false,
         streamMode: StreamMode = .onDemand
     ) {
         self.url = url
         self.httpHeaders = httpHeaders
         self.metadata = metadata
         self.sourceMIMEType = sourceMIMEType
+        self.isAtmos = isAtmos
         self.streamMode = streamMode
     }
 

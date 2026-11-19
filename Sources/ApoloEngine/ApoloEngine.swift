@@ -166,6 +166,7 @@ public final class ApoloEngine {
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
         sourceMIMEType: String? = nil,
+        isAtmos: Bool = false,
         streamMode: StreamMode = .onDemand
     ) async throws {
         let track = ApoloTrack(
@@ -173,6 +174,7 @@ public final class ApoloEngine {
             httpHeaders: httpHeaders,
             metadata: metadata,
             sourceMIMEType: sourceMIMEType,
+            isAtmos: isAtmos,
             streamMode: streamMode
         )
         queue.start(track)
