@@ -42,7 +42,8 @@ let package = Package(
                 .product(name: "AetherLibavfilter", package: "FFmpegBuild"),
                 .product(name: "AetherLibavformat", package: "FFmpegBuild"),
                 .product(name: "AetherLibavutil", package: "FFmpegBuild"),
-            ]
+            ],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )
