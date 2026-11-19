@@ -51,6 +51,31 @@ final class RemoteRoutingTests: XCTestCase {
         ))
     }
 
+    func testFFmpegLiveSupportsOggOpusAndFLAC() {
+        XCTAssertTrue(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/live.ogg")!
+        ))
+        XCTAssertTrue(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/live.opus")!
+        ))
+        XCTAssertTrue(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/stream")!,
+            hint: "audio/ogg; codecs=opus"
+        ))
+        XCTAssertTrue(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/live.flac")!
+        ))
+        XCTAssertFalse(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/live.m3u8")!
+        ))
+        XCTAssertFalse(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/station.pls")!
+        ))
+        XCTAssertFalse(ApoloEngine.supportsFFmpegLive(
+            URL(string: "https://station.example/live.mp3")!
+        ))
+    }
+
     func testNativeLiveRejectsUnsupportedOrPlaylistSources() {
         XCTAssertFalse(ApoloEngine.supportsNativeLive(
             URL(string: "https://radio.example/live.ogg")!,
