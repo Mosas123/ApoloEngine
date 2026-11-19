@@ -46,6 +46,10 @@ public final class ApoloEngine {
     private var metadata: NowPlayingMetadata?
     private var resumeAfterInterruption = false
     private var liveCancellation: LiveStreamCancellation?
+    private var liveReconnectTask: Task<Void, Never>?
+    private var liveRetryAttempts = 0
+    private var livePlayingSince: Date?
+    private var liveShouldPlay = true
 
     private var queue = PlayQueue()
 
@@ -67,7 +71,8 @@ public final class ApoloEngine {
         )
 
         host.onState = { [weak self] state in
-            self?.apply(state)
+            guard let self, self.route == .avPlayer else { return }
+            self.apply(state)
         }
         host.onTime = { [weak self] time in
             self?.elapsed = time
@@ -106,7 +111,10 @@ public final class ApoloEngine {
 
         libavHost = LibavcodecAudioHost(
             onState: { [weak self] state in
-                Task { @MainActor in self?.apply(state) }
+                Task { @MainActor [weak self] in
+                    guard let self, self.route == .libavcodec else { return }
+                    self.apply(state)
+                }
             },
             onTime: { [weak self] time in
                 Task { @MainActor in self?.elapsed = time }
@@ -180,6 +188,10 @@ public final class ApoloEngine {
             isAtmos: isAtmos,
             streamMode: streamMode
         )
+        cancelLiveReconnect()
+        liveRetryAttempts = 0
+        livePlayingSince = nil
+        liveShouldPlay = true
         queue.start(track)
         loadEpoch &+= 1
         try await startPlayback(track, epoch: loadEpoch)
@@ -394,6 +406,14 @@ public final class ApoloEngine {
 
     public func play() {
         resumeAfterInterruption = false
+        if queue.current?.streamMode == .live {
+            liveShouldPlay = true
+            if case .failed = state {
+                liveRetryAttempts = 0
+                scheduleLiveReconnect()
+                return
+            }
+        }
         switch route {
         case .avPlayer: host.play()
         case .libavcodec: libavHost?.play()
@@ -402,6 +422,10 @@ public final class ApoloEngine {
 
     public func pause() {
         resumeAfterInterruption = false
+        if queue.current?.streamMode == .live {
+            liveShouldPlay = false
+            cancelLiveReconnect()
+        }
         pauseInternal()
     }
 
@@ -480,17 +504,29 @@ public final class ApoloEngine {
     /// codec change between tracks is handled.
     public func skipToNext() async throws {
         guard let next = queue.advance() else { return }
+        cancelLiveReconnect()
+        liveRetryAttempts = 0
+        livePlayingSince = nil
+        liveShouldPlay = true
         loadEpoch &+= 1
         try await startPlayback(next, epoch: loadEpoch)
     }
 
     public func skipToPrevious() async throws {
         guard let previous = queue.previous() else { return }
+        cancelLiveReconnect()
+        liveRetryAttempts = 0
+        livePlayingSince = nil
+        liveShouldPlay = true
         loadEpoch &+= 1
         try await startPlayback(previous, epoch: loadEpoch)
     }
 
     public func stop() {
+        cancelLiveReconnect()
+        liveShouldPlay = false
+        liveRetryAttempts = 0
+        livePlayingSince = nil
         loadEpoch &+= 1
         liveCancellation?.cancel()
         liveCancellation = nil
@@ -620,8 +656,67 @@ public final class ApoloEngine {
         )
     }
 
+    private func cancelLiveReconnect() {
+        liveReconnectTask?.cancel()
+        liveReconnectTask = nil
+    }
+
+    /// Only reconnect explicitly-live sources. A new connection always opens
+    /// a fresh demuxer; reconnecting at an arbitrary Ogg/Opus byte boundary
+    /// would corrupt compressed packets.
+    private func scheduleLiveReconnect() {
+        guard liveShouldPlay,
+              liveReconnectTask == nil,
+              let track = queue.current,
+              track.streamMode == .live,
+              liveCancellation?.terminalHTTPStatus == nil,
+              let delay = LiveRetryPolicy.delay(forAttempt: liveRetryAttempts + 1)
+        else { return }
+
+        liveRetryAttempts += 1
+        let expectedEpoch = loadEpoch
+        liveReconnectTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(
+                    for: .milliseconds(Int(delay * 1_000))
+                )
+            } catch {
+                return
+            }
+            guard let self,
+                  self.loadEpoch == expectedEpoch,
+                  self.liveShouldPlay,
+                  self.queue.current == track else { return }
+            self.liveReconnectTask = nil
+            self.loadEpoch &+= 1
+            let retryEpoch = self.loadEpoch
+            do {
+                try await self.startPlayback(track, epoch: retryEpoch)
+            } catch {
+                guard self.loadEpoch == retryEpoch else { return }
+                self.apply(.failed("Live stream reconnect failed"))
+            }
+        }
+    }
+
     private func apply(_ newState: PlaybackState) {
         state = newState
+        if queue.current?.streamMode == .live {
+            switch newState {
+            case .playing:
+                if livePlayingSince == nil { livePlayingSince = Date() }
+                cancelLiveReconnect()
+            case .failed:
+                if let since = livePlayingSince,
+                   Date().timeIntervalSince(since) >= LiveRetryPolicy.resetAfterPlaying {
+                    liveRetryAttempts = 0
+                }
+                livePlayingSince = nil
+                scheduleLiveReconnect()
+            case .idle, .loading, .paused, .finished:
+                break
+            }
+        }
         refreshNowPlaying()
     }
 
