@@ -24,6 +24,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var timeObserver: Any?
     private var requesting = false
     private var started = false
+    private var isLive = false
     private var wantsToPlay = false
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
@@ -98,10 +99,11 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     /// Adopts a source the engine already opened and probed.
-    func load(source: OpenedSource) {
+    func load(source: OpenedSource, isLive: Bool = false) {
         queue.async { [weak self] in
             guard let self else { return }
             self.reset()
+            self.isLive = isLive
             do {
                 let decoder = AudioDecoder()
                 decoder.processingSettings = self.equalizer
@@ -225,6 +227,16 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             return
         }
 
+        if isLive {
+            // Indefinite stations must not complete the track or auto-advance
+            // a song queue when a decoder reports EOF.
+            requesting = false
+            renderer.stopRequestingMediaData()
+            synchronizer.setRate(0, time: synchronizer.currentTime())
+            publish(.failed("Live stream ended"))
+            return
+        }
+
         if let next = nextTrack, start(next: next) {
             nextTrack = nil
             if let newDecoder = self.decoder,
@@ -257,6 +269,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             started = true
             let start = CMSampleBufferGetPresentationTimeStamp(buffer)
             synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
+            if isLive && wantsToPlay {
+                publish(.playing)
+            }
         }
         timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
         renderer.enqueue(buffer)
@@ -264,7 +279,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     func enqueueNext(_ track: ApoloTrack) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isLive else { return }
             self.nextTrack = track
             self.finishToken &+= 1
             // The host may have already reached `.finished`; restart the
@@ -310,6 +325,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     private func reset() {
+        isLive = false
         requesting = false
         renderer.stopRequestingMediaData()
         renderer.flush()
