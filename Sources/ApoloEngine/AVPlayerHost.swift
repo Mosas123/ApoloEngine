@@ -11,6 +11,9 @@ final class AVPlayerHost {
     private var wantsToPlay = false
     private var finished = false
     private var isLiveStream = false
+    private var liveMetadataOutput: AVPlayerItemMetadataOutput?
+    private var liveMetadataHandler: LiveTimedMetadataHandler?
+    private var lastLiveTitle: String?
     private(set) var loadGeneration: UInt64 = 0
     private var lastState: PlaybackState = .idle
     private var tapProcessors: [AudioTapProcessor] = []
@@ -22,6 +25,7 @@ final class AVPlayerHost {
     var onState: (@MainActor (PlaybackState) -> Void)?
     var onTime: (@MainActor (TimeInterval) -> Void)?
     var onTrackChange: (@MainActor () -> Void)?
+    var onLiveTitle: (@MainActor (String) -> Void)?
 
     init() {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -117,6 +121,24 @@ final class AVPlayerHost {
         publish(.loading)
 
         let item = AVPlayerItem(asset: makeAsset(track))
+        // Timed ID3 (e.g. TIT2) is emitted for some live HLS stations.
+        // Keep the delegate alive for this item and discard late callbacks
+        // if another station superseded it.
+        let generation = loadGeneration
+        let output = AVPlayerItemMetadataOutput(identifiers: nil)
+        let handler = LiveTimedMetadataHandler { [weak self] title in
+            Task { @MainActor [weak self] in
+                guard let self, self.isLiveStream,
+                      self.loadGeneration == generation,
+                      self.lastLiveTitle != title else { return }
+                self.lastLiveTitle = title
+                self.onLiveTitle?(title)
+            }
+        }
+        output.setDelegate(handler, queue: .main)
+        item.add(output)
+        liveMetadataOutput = output
+        liveMetadataHandler = handler
         observeEnd(of: item)
         observeFailure(of: item)
         // Do not attach MTAudioProcessingTap to live transport yet: native
@@ -277,6 +299,17 @@ final class AVPlayerHost {
     }
 
     private func resetItems() {
+        // AVPlayerItemMetadataOutput retains no delegate. Remove it before
+        // releasing the handler, so obsolete station events stop arriving.
+        if let output = liveMetadataOutput {
+            output.setDelegate(nil, queue: nil)
+            for item in player.items() {
+                item.remove(output)
+            }
+        }
+        liveMetadataOutput = nil
+        liveMetadataHandler = nil
+        lastLiveTitle = nil
         for observer in endObservers {
             NotificationCenter.default.removeObserver(observer)
         }
