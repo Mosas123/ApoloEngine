@@ -16,8 +16,7 @@ enum LivePlaylistResolver {
 
     static func resolve(
         url: URL,
-        headers: [String: String],
-        hint: String? = nil
+        headers: [String: String]
     ) async throws -> URL {
         var seen = Set<URL>()
         var current = url
