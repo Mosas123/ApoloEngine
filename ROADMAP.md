@@ -39,6 +39,7 @@ never depends on a chat.
   conforms to `LocalizedError`.
 - Demux read errors are no longer mistaken for EOF: `readNextBuffer()` throws
   `readFailed(code:)` and the host publishes `.failed`.
+- Real TTA decode test with a bundled generated fixture.
 - Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
   protocol dependency). Local files keep the full FFmpeg probe and route.
 - The libavcodec tail is no longer cut: at EOF the clock keeps running until
@@ -92,7 +93,9 @@ per-slice install names (or drop the x86_64 simulator slice).
 1. APAC (AirPlay / HomePod Atmos): iOS 26+, `AVAudioConverter` with the APAC
    format, the `dapa` box, and an fMP4/HLS delivery path. Deferred until the
    FFmpeg union build is in and there is a real Atmos route to test on.
-2. Decode tests that exercise the FFmpeg union containers (APE, TTA, WavPack).
+2. Decode tests for the union containers: **TTA done** (generated 6.9 KB tone
+   fixture, decoded through `OpenedSource` + `AudioDecoder`). APE/WavPack still
+   need a permissive sample: FFmpeg has no encoder for them here.
 3. Optional: analyse a downloaded track with `LoudnessAnalyzer` and feed the
    result into `trackGainDB` when there is no ReplayGain tag.
 
