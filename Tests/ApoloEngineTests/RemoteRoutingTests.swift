@@ -37,11 +37,19 @@ final class RemoteRoutingTests: XCTestCase {
     }
 
     func testOpaqueRemoteURLNeedsAHint() {
-        // No extension and no MIME: the future source hint covers this case.
-        XCTAssertFalse(
+        let opaque = URL(string: "https://cdn.example/stream?token=x")!
+        XCTAssertFalse(ApoloEngine.shouldUseFFmpegForRemote(opaque))
+        XCTAssertTrue(
+            ApoloEngine.shouldUseFFmpegForRemote(opaque, hint: "audio/flac")
+        )
+        XCTAssertTrue(
             ApoloEngine.shouldUseFFmpegForRemote(
-                URL(string: "https://cdn.example/stream?token=x")!
+                opaque,
+                hint: "audio/webm; codecs=\"opus\""
             )
+        )
+        XCTAssertFalse(
+            ApoloEngine.shouldUseFFmpegForRemote(opaque, hint: "audio/mp4")
         )
     }
 }

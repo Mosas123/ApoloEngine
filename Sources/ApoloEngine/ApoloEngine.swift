@@ -163,12 +163,14 @@ public final class ApoloEngine {
     public func load(
         url: URL,
         httpHeaders: [String: String] = [:],
-        metadata: NowPlayingMetadata? = nil
+        metadata: NowPlayingMetadata? = nil,
+        sourceMIMEType: String? = nil
     ) async throws {
         let track = ApoloTrack(
             url: url,
             httpHeaders: httpHeaders,
-            metadata: metadata
+            metadata: metadata,
+            sourceMIMEType: sourceMIMEType
         )
         queue.start(track)
         loadEpoch &+= 1
@@ -185,7 +187,8 @@ public final class ApoloEngine {
         // native path for remote music (including Spatial/Atmos). Remote
         // sources skip the probe entirely; the local FFmpeg route keeps the
         // full codec/container probe.
-        if isRemote(track.url) && !isExoticRemote(track.url) {
+        if isRemote(track.url)
+            && !isExoticRemote(track.url, hint: track.sourceMIMEType) {
             guard epoch == loadEpoch else { return }
             try? session.activateMultichannel()
             metadataGainDB = nil
@@ -439,15 +442,26 @@ public final class ApoloEngine {
     /// Remote containers AVFoundation cannot play. They go through FFmpeg over
     /// the HTTP AVIO. Live/segmented streams are excluded on purpose: the HTTP
     /// source downloads a finite file.
-    private func isExoticRemote(_ url: URL) -> Bool {
-        Self.shouldUseFFmpegForRemote(url)
+    private func isExoticRemote(_ url: URL, hint: String? = nil) -> Bool {
+        Self.shouldUseFFmpegForRemote(url, hint: hint)
     }
 
     /// True when a remote URL must go through FFmpeg. Local files are never
     /// included: local FLAC still plays through AVPlayer.
-    nonisolated static func shouldUseFFmpegForRemote(_ url: URL) -> Bool {
+    nonisolated static func shouldUseFFmpegForRemote(
+        _ url: URL,
+        hint: String? = nil
+    ) -> Bool {
         let scheme = url.scheme?.lowercased()
         guard scheme == "http" || scheme == "https" else { return false }
+        let normalizedHint = (hint ?? "").lowercased()
+        if normalizedHint.contains("webm")
+            || normalizedHint.contains("ogg")
+            || normalizedHint.contains("opus")
+            || normalizedHint.contains("matroska")
+            || normalizedHint.contains("flac") {
+            return true
+        }
         if exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
             return true
         }

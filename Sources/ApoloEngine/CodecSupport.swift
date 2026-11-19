@@ -13,7 +13,6 @@ public enum CodecSupport {
         "alac",
         "mp3",
         "mp2",
-        "flac",
         "ac3",
         "eac3",
         "amr_nb",

@@ -3,9 +3,17 @@ import XCTest
 
 final class CodecSupportTests: XCTestCase {
     func testKnownCodecsUseAVPlayer() {
-        XCTAssertEqual(CodecSupport.route(forCodec: "flac"), .avPlayer)
+        XCTAssertEqual(CodecSupport.route(forCodec: "aac"), .avPlayer)
         XCTAssertEqual(CodecSupport.route(forCodec: "EAC3"), .avPlayer)
         XCTAssertEqual(CodecSupport.route(forCodec: "alac"), .avPlayer)
+    }
+
+    func testFLACUsesLibavcodec() {
+        XCTAssertEqual(CodecSupport.route(forCodec: "flac"), .libavcodec)
+        XCTAssertEqual(
+            CodecSupport.route(forCodec: "flac", container: "flac"),
+            .libavcodec
+        )
     }
 
     func testContainerWinsOverCodec() {

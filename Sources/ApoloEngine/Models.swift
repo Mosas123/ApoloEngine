@@ -58,6 +58,9 @@ public struct ApoloTrack: Sendable, Equatable {
     public let url: URL
     public let httpHeaders: [String: String]
     public let metadata: NowPlayingMetadata?
+    /// MIME from the resolver. It lets opaque signed URLs (no extension and no
+    /// `mime` query) pick the right route.
+    public let sourceMIMEType: String?
 
     // Filled by the engine when the track is queued. They are playback
     // details, not identity, so equality ignores them.
@@ -68,11 +71,13 @@ public struct ApoloTrack: Sendable, Equatable {
     public init(
         url: URL,
         httpHeaders: [String: String] = [:],
-        metadata: NowPlayingMetadata? = nil
+        metadata: NowPlayingMetadata? = nil,
+        sourceMIMEType: String? = nil
     ) {
         self.url = url
         self.httpHeaders = httpHeaders
         self.metadata = metadata
+        self.sourceMIMEType = sourceMIMEType
     }
 
     public static func == (lhs: ApoloTrack, rhs: ApoloTrack) -> Bool {
