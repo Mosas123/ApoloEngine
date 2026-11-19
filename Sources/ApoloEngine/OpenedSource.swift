@@ -31,7 +31,8 @@ final class OpenedSource: @unchecked Sendable {
         httpHeaders: [String: String] = [:],
         sessionConfiguration: URLSessionConfiguration = .default,
         isLive: Bool = false,
-        onICYTitle: (@Sendable (String) -> Void)? = nil
+        onICYTitle: (@Sendable (String) -> Void)? = nil,
+        liveCancellation: LiveStreamCancellation? = nil
     ) throws -> OpenedSource {
         var options: OpaquePointer?
         // Music headers resolve well within this; the defaults (5 MB / 5 s)
@@ -55,6 +56,9 @@ final class OpenedSource: @unchecked Sendable {
                     configuration: sessionConfiguration,
                     onICYTitle: onICYTitle
                 )
+                // Register before starting the request/probe so stop() can
+                // interrupt a blocking FFmpeg read immediately.
+                liveCancellation?.register(liveStream)
                 guard let live = LiveHTTPTransport(stream: liveStream) else {
                     av_dict_free(&options)
                     throw ApoloError.openFailed(code: -1)
