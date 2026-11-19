@@ -6,6 +6,21 @@ final class LiveStreamCancellation: @unchecked Sendable {
     private let lock = NSLock()
     private var stream: LiveHTTPStream?
     private var cancelled = false
+    private var lastHTTPStatus: Int?
+
+    var terminalHTTPStatus: Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let status = lastHTTPStatus,
+              [401, 403, 404, 410].contains(status) else { return nil }
+        return status
+    }
+
+    func recordHTTPStatus(_ status: Int) {
+        lock.lock()
+        lastHTTPStatus = status
+        lock.unlock()
+    }
 
     func register(_ stream: LiveHTTPStream) {
         lock.lock()
