@@ -127,11 +127,16 @@ TCP fallback when URLSession fails specifically with
   nonstandard status is not claimed. Native HLS and on-demand routes
   remain unchanged.
 
-**Pending verification:** CI compilation and unit tests, local-network
-fixture server with an actual legacy status line, real-device playback,
-network handovers and measured memory/energy. Normal HTTP status and
-TLS validation remain exclusively on URLSession; do not ship v6 before
-these validations.
+**Integration coverage:** an in-process TCP loopback station emits a real
+`ICY 200 OK` response, audio bytes and interleaved title metadata. A mock
+URLSession parse error triggers the production TCP fallback, proving the
+`LiveHTTPStream` -> `LegacyICYConnection` path and checking that credentials
+are not forwarded to the raw request. This does **not** reproduce a physical
+radio station or the exact CFNetwork parsing behavior on iPhone.
+
+**Pending verification:** final iOS simulator CI, physical-device playback,
+network handovers, and measured memory/energy. Normal HTTP status and TLS
+validation remain on URLSession; do not ship v6 before these validations.
 
 ## Phase 3 — integration and acceptance
 
