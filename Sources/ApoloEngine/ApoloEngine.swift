@@ -206,6 +206,9 @@ public final class ApoloEngine {
 
         if track.streamMode == .live {
             guard Self.supportsNativeLive(track.url, hint: track.sourceMIMEType) else {
+                // The old source must not keep playing after a rejected switch.
+                host.stop()
+                libavHost?.stop()
                 state = .failed("Live format requires a streaming transport")
                 throw ApoloError.unsupportedFormat
             }
