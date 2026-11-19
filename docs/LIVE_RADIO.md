@@ -21,16 +21,22 @@ try await engine.loadLive(
 
 **Not shipped to the Thrum radio UI yet.** Thrum continues to use MPVKit for all live stations during this stage. Source URLs may redirect; the native playback result must be verified on real stations.
 
-## Phase 2 — independent continuous HTTP transport
+## Phase 2 — independent continuous HTTP transport (in development)
 
-Introduce a separate, non-seekable `LiveTransport` for direct Icecast/Shoutcast and other endless formats:
+This branch introduces `LiveHTTPStream` + `LiveHTTPTransport` for direct Icecast/Shoutcast and other endless formats, separate from file `HTTPStream`:
 
-- Streaming `URLSessionDataDelegate` rather than full-response `dataTask` and finite-file `Range` windows
-- Bounded ring buffer with backpressure; no unbounded `Data` accumulation
-- Proper startup, cancellation, EOF, timeout and closed-connection semantics
-- ICY `icy-metaint` parsing; strip metadata blocks before the codec decoder; publish sanitized station/track titles
-- Feed FFmpeg via a **non-seekable** AVIO context for Ogg/Opus and other unsupported native formats
-- Bounded reconnection/backoff for transient failures; stop and report permanent 401/403/404 errors
+- `URLSessionDataDelegate` consumes chunks without downloading an infinite response as one `Data` object
+- Fixed-capacity (512 KiB) ring buffer, high-/low-water task suspension and explicit overflow failure
+- Stateful `icy-metaint` parser strips metadata from audio and publishes track titles via `ApoloEngine.liveTitle` for FFmpeg-routed stations
+- Nonseekable FFmpeg AVIO for direct Ogg/Opus/FLAC live streams
+- No playlist `.m3u/.pls` resolution or automatic reconnection yet; live response ending is a failure, not song EOF
+
+Remaining acceptance work and hardening:
+
+- Validate real Icecast/Shoutcast and Ogg/Opus stations on device, including playback, cancellation and memory usage
+- Add bounded reconnection/backoff for transient failures; maintain terminal status on 401/403/404
+- Add `.m3u/.pls` playlist resolution, legacy ICY response handling and native timed metadata for HLS
+- Avoid long decode-queue stops when a network read is blocked; add explicit interruption/cancellation support
 
 Do **not** retrofit the existing seekable `HTTPStream` class with an infinite-radio code path.
 
