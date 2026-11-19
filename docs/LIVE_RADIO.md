@@ -78,6 +78,28 @@ legacy `ICY 200 OK` HTTP behavior, native HLS timed metadata, and identifying
 opaque Ogg/Opus endpoint MIME types. CI parser tests are not live station tests.
 Keep the PR in draft until simulator CI and iPhone validation pass.
 
+## Phase 2D — native HLS timed song metadata (draft v5)
+
+Native live AVFoundation playback now installs an `AVPlayerItemMetadataOutput`
+delegate on the active live item, using the current recommended API instead of
+the deprecated `AVPlayerItem.timedMetadata` observer.
+
+- Decode recognizable ID3 `TIT2` and common song-title items (when provided
+  by the broadcaster) into the existing `ApoloEngine.liveTitle` property.
+- Strip control characters, trim whitespace, cap display values at 256 Unicode
+  scalars, and ignore non-title metadata.
+- Skip duplicate consecutive titles on the same station; reject callbacks
+  whose AVPlayer host generation is no longer current.
+- Detach output and delegate when switching streams or stopping playback.
+- Preserve the existing ICY title callback for FFmpeg-routed live stations.
+- No HLS segment downloader, background polling, album art fetching, playlist
+  parser changes, or mutation of on-demand music processing.
+
+**Acceptance still required:** physical iPhone tests with a broadcaster that
+actually sends HLS timed ID3 metadata; handling of HLS `EXT-X-DATERANGE`
+requires the separate metadata collector API and is **not** implemented here.
+Likewise, older raw `ICY 200 OK` response formats remain unsupported.
+
 ## Phase 3 — integration and acceptance
 
 After the engine's transport APIs and on-device validations are ready, make live radio an opt-in route in Thrum, retaining an MPVKit fallback until confidence is high. Acceptance tests:
