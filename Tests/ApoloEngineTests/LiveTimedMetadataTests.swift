@@ -3,6 +3,13 @@ import XCTest
 @testable import ApoloEngine
 
 final class LiveTimedMetadataTests: XCTestCase {
+    func testDeviceBetaDoesNotAttachUnsafeNativeMetadataOutput() {
+        // Physical iOS 27.0.1 crash stack points into AVFCore's
+        // AVPlayerItemMetadataOutput private callback. ICY metadata remains
+        // available on the separate FFmpeg transport.
+        XCTAssertFalse(AVPlayerHost.nativeHLSTimedMetadataEnabled)
+    }
+
     func testAcceptsID3SongTitle() {
         let item = metadata(.id3MetadataTitleDescription, "Artist - Song")
         XCTAssertEqual(LiveTimedMetadata.title(in: [item]), "Artist - Song")
