@@ -7,6 +7,12 @@ import AVFoundation
 @MainActor
 final class AVPlayerHost {
     private let player = AVQueuePlayer()
+    // Device crash mitigation: iOS 27.0.1 can EXC_BAD_ACCESS within
+    // AVFCore's _pushTimedMetadataGroups while releasing an internal
+    // metadata dictionary. Avoid installing AVPlayerItemMetadataOutput on
+    // untrusted live HLS until a separately validated collector is ready.
+    // ICY metadata on the FFmpeg live route remains fully supported.
+    nonisolated static let nativeHLSTimedMetadataEnabled = false
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var finished = false
@@ -121,24 +127,28 @@ final class AVPlayerHost {
         publish(.loading)
 
         let item = AVPlayerItem(asset: makeAsset(track))
-        // Timed ID3 (e.g. TIT2) is emitted for some live HLS stations.
-        // Keep the delegate alive for this item and discard late callbacks
-        // if another station superseded it.
-        let generation = loadGeneration
-        let output = AVPlayerItemMetadataOutput(identifiers: nil)
-        let handler = LiveTimedMetadataHandler { [weak self] title in
-            Task { @MainActor [weak self] in
-                guard let self, self.isLiveStream,
-                      self.loadGeneration == generation,
-                      self.lastLiveTitle != title else { return }
-                self.lastLiveTitle = title
-                self.onLiveTitle?(title)
+        // Avoid AVPlayerItemMetadataOutput on iOS 27.0.1 live streams:
+        // one physical-device crash occurred inside the AVFoundation
+        // timed-metadata callback, after audio had started successfully.
+        // The parser is retained for future investigation, but the native
+        // output is explicitly disabled for the device beta.
+        if Self.nativeHLSTimedMetadataEnabled {
+            let generation = loadGeneration
+            let output = AVPlayerItemMetadataOutput(identifiers: nil)
+            let handler = LiveTimedMetadataHandler { [weak self] title in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isLiveStream,
+                          self.loadGeneration == generation,
+                          self.lastLiveTitle != title else { return }
+                    self.lastLiveTitle = title
+                    self.onLiveTitle?(title)
+                }
             }
+            output.setDelegate(handler, queue: .main)
+            item.add(output)
+            liveMetadataOutput = output
+            liveMetadataHandler = handler
         }
-        output.setDelegate(handler, queue: .main)
-        item.add(output)
-        liveMetadataOutput = output
-        liveMetadataHandler = handler
         observeEnd(of: item)
         observeFailure(of: item)
         // Do not attach MTAudioProcessingTap to live transport yet: native
