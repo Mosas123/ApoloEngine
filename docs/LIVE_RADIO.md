@@ -29,16 +29,28 @@ This branch introduces `LiveHTTPStream` + `LiveHTTPTransport` for direct Icecast
 - Fixed-capacity (512 KiB) ring buffer, high-/low-water task suspension and explicit overflow failure
 - Stateful `icy-metaint` parser strips metadata from audio and publishes track titles via `ApoloEngine.liveTitle` for FFmpeg-routed stations
 - Nonseekable FFmpeg AVIO for direct Ogg/Opus/FLAC live streams
-- No playlist `.m3u/.pls` resolution or automatic reconnection yet; live response ending is a failure, not song EOF
+- No playlist `.m3u/.pls` resolution yet; live response ending is a failure, not song EOF
 
 Remaining acceptance work and hardening:
 
 - Validate real Icecast/Shoutcast and Ogg/Opus stations on device, including playback, cancellation and memory usage
-- Add bounded reconnection/backoff for transient failures; maintain terminal status on 401/403/404
+- Validate reconnect/backoff against real device network interruptions and statuses outside the known terminal set
 - Add `.m3u/.pls` playlist resolution, legacy ICY response handling and native timed metadata for HLS
-- Avoid long decode-queue stops when a network read is blocked; add explicit interruption/cancellation support
+- Stress-test cancellation while a decoder is blocked in FFmpeg opening/probing as well as active playback
 
 Do **not** retrofit the existing seekable `HTTPStream` class with an infinite-radio code path.
+
+## Phase 2B — lifecycle and bounded reconnection (this branch)
+
+- `LiveStreamCancellation` closes the network reader immediately from the main-actor stop/switch path, even when FFmpeg's decoder queue is blocked in a synchronous read or source probe.
+- Live playback uses fresh demuxers on reconnection (never splice a fresh Ogg/Opus response into old compressed packets).
+- `LiveRetryPolicy` schedules at most three retries after failure (1, 2, and 4 seconds); the attempt budget only resets after at least 60 seconds of confirmed playback, or explicit station selection.
+- HTTP 401/403/404/410 responses stop automatic FFmpeg radio retries; no signed station URLs are logged.
+- Pausing, stopping, changing stations, or losing the audio route cancels pending retry timers.
+- FFmpeg radio publishes playing only after the first decoded audio buffer; unexpected EOF does not advance the song queue.
+- Unit coverage includes cancellation of a blocked read, late registration after cancel, terminal HTTP statuses and bounded retry schedule.
+
+**Still pending:** verified on-device reconnects for actual ICY/Ogg/Opus stations, transient disconnections during demux probe, station playlist `.m3u/.pls` resolution, HLS timed metadata, and measured memory/energy over long sessions. This branch is not enabled in Thrum radio.
 
 ## Phase 3 — integration and acceptance
 
