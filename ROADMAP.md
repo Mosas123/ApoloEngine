@@ -32,6 +32,8 @@ never depends on a chat.
   system asks and the user had not paused; unplugging headphones pauses.
 - Queued local tracks are probed at enqueue time, so their ReplayGain and
   duration survive a gapless automatic advance.
+- Hot path reuses one `AVPacket`, one `AVFrame` and the swresample scratch
+  instead of allocating per buffer.
 - Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
   protocol dependency). Local files keep the full FFmpeg probe and route.
 - The libavcodec tail is no longer cut: at EOF the clock keeps running until
@@ -147,7 +149,10 @@ Open:
 6. ~~AVPlayer: probe queued tracks for ReplayGain.~~ Queued local tracks are
    probed when enqueued; the gain and duration travel with `ApoloTrack` and are
    applied on advance (both routes).
-7. Tests: JOC/`dec3`, ReplayGain parsing, tap lifetime, gapless integration.
+7. Tests: JOC/`dec3` and ReplayGain done; tap lifetime and gapless integration
+   still manual.
+8. Remaining PCM copy: swresample -> scratch -> pending -> `CMBlockBuffer`.
+   A zero-copy block buffer per frame is the next perf step.
 
 Note: `CMSampleTimingInfo.duration = 1/sampleRate` with one timing entry is
 **correct** (CoreMedia treats it per-sample; verified against AetherEngine).
