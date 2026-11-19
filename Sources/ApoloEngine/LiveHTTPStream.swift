@@ -16,6 +16,9 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     private var task: URLSessionDataTask?
     private var stopped = false
     private var suspended = false
+    private var receivedHTTPResponse = false
+    private var legacyAttempted = false
+    private var legacyConnection: LegacyICYConnection?
 
     init(
         url: URL,
@@ -83,7 +86,9 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
             suspended = false
             task?.resume()
         }
+        let fallback = legacyConnection
         stateLock.unlock()
+        fallback?.resumeIfDrained()
         return readCount
     }
 
@@ -96,8 +101,10 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         stopped = true
         let connection = session
         let download = task
+        let legacy = legacyConnection
         session = nil
         task = nil
+        legacyConnection = nil
         if suspended {
             suspended = false
             download?.resume()
@@ -105,6 +112,7 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         stateLock.unlock()
 
         buffer.close()
+        legacy?.close()
         download?.cancel()
         connection?.invalidateAndCancel()
     }
@@ -117,6 +125,9 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
+        stateLock.lock()
+        receivedHTTPResponse = true
+        stateLock.unlock()
         guard let http = response as? HTTPURLResponse else {
             buffer.fail()
             completionHandler(.cancel)
@@ -187,10 +198,35 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         didCompleteWithError error: Error?
     ) {
         stateLock.lock()
+        let errorCode = (error as NSError?)?.code
+        let errorDomain = (error as NSError?)?.domain
+        let canFallback = !stopped && !receivedHTTPResponse
+            && !legacyAttempted && url.scheme?.lowercased() == "http"
+            && errorDomain == NSURLErrorDomain
+            && errorCode == NSURLErrorCannotParseResponse
+        legacyAttempted = legacyAttempted || canFallback
+        let fallback: LegacyICYConnection?
+        if canFallback {
+            fallback = LegacyICYConnection(
+                url: url,
+                buffer: buffer,
+                onTitle: onICYTitle,
+                onStatus: onHTTPStatus
+            )
+            legacyConnection = fallback
+        } else {
+            fallback = nil
+        }
         let cancelledByCaller = stopped
         stateLock.unlock()
-        if !cancelledByCaller {
-            // A live broadcast ending unexpectedly is not a song EOF.
+
+        if let fallback {
+            // URLSession cannot parse the legacy ICY status line. Retry only
+            // over plain HTTP to the same host; raw transport never receives
+            // app credentials/headers and cannot follow redirects.
+            fallback.start()
+        } else if !cancelledByCaller {
+            // A continuous radio stream ending is a failure, not song EOF.
             buffer.fail()
         }
     }
