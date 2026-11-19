@@ -72,7 +72,7 @@ final class LiveResilienceTests: XCTestCase {
 
         // More than 3 MiB of traffic over a 4 KiB ring. No fixture/network
         // responses or unbounded arrays need to be retained by the engine.
-        for index in 0..<8_000 {
+        for index in 0..<12_000 {
             let size = 96 + ((index * 37) % 512)
             let payload = (0..<size).map {
                 UInt8(truncatingIfNeeded: index + $0)
