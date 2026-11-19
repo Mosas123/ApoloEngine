@@ -10,6 +10,7 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
     private let buffer: LiveAudioBuffer
     private let stateLock = NSLock()
     private let onICYTitle: (@Sendable (String) -> Void)?
+    private let onHTTPStatus: (@Sendable (Int) -> Void)?
     private var parser = ICYMetadataParser(interval: 0)
     private var session: URLSession?
     private var task: URLSessionDataTask?
@@ -21,13 +22,15 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         headers: [String: String],
         capacity: Int = 512 * 1_024,
         configuration: URLSessionConfiguration = .ephemeral,
-        onICYTitle: (@Sendable (String) -> Void)? = nil
+        onICYTitle: (@Sendable (String) -> Void)? = nil,
+        onHTTPStatus: (@Sendable (Int) -> Void)? = nil
     ) {
         self.url = url
         self.headers = headers
         self.configuration = configuration
         buffer = LiveAudioBuffer(capacity: capacity)
         self.onICYTitle = onICYTitle
+        self.onHTTPStatus = onHTTPStatus
         super.init()
         configuration.timeoutIntervalForRequest = 20
         // A radio stream lasts much longer than a file download.
@@ -114,8 +117,13 @@ final class LiveHTTPStream: NSObject, URLSessionDataDelegate, @unchecked Sendabl
         didReceive response: URLResponse,
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
-        guard let http = response as? HTTPURLResponse,
-              http.statusCode == 200 else {
+        guard let http = response as? HTTPURLResponse else {
+            buffer.fail()
+            completionHandler(.cancel)
+            return
+        }
+        onHTTPStatus?(http.statusCode)
+        guard http.statusCode == 200 else {
             buffer.fail()
             completionHandler(.cancel)
             return
