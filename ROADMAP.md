@@ -112,6 +112,8 @@ Fixed in phase 1 (CI green, 19 tests):
 - Remote HTTP(S) routed to AVPlayer; probe duration falls back to the audio
   stream when the container has none; `failedToPlayToEndTime` surfaces AVPlayer
   failures.
+- Exotic remote containers (ape/tta/wv/tak/mpc/dsf/aiff/wma/mka) go through the
+  FFmpeg HTTP AVIO with Range requests; standard remote music stays on AVPlayer.
 - Probe results cached (LRU 32, keyed by path + size + mtime, or URL + headers).
 - Single open for local files: `OpenedSource` runs `avformat_find_stream_info`
   once and hands the `AVFormatContext` to `AudioDecoder` on the libavcodec
@@ -128,10 +130,11 @@ Fixed in phase 1 (CI green, 19 tests):
 
 Open:
 
-1. **FFmpeg over HTTP** for exotic remote formats (APE/TTA/WavPack over HTTP):
-   custom `AVIOContext` over `URLSession`, or enable `network`/`http`/`https` +
-   `securetransport` in the fork build (another multi-hour run). Standard
-   remote music already plays through AVPlayer.
+1. ~~FFmpeg over HTTP~~ Done: `HTTPStream`/`HTTPTransport` (custom AVIO over
+   `URLSession`) read with 1 MB `Range` windows and fall back to a full body
+   when the server ignores `Range`; `read_packet` returns `AVERROR_EOF`. Live
+   or segmented streams are still out of scope. Covered by an end-to-end test
+   with a mocked `URLProtocol`.
 2. ~~Separate the control queue from the render queue.~~ The refill now
    enqueues one buffer per `requestMediaDataWhenReady` callback, so pause/seek
    queued on the same serial queue run between steps. No second queue needed.

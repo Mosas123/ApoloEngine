@@ -5,6 +5,7 @@ import XCTest
 
 final class HTTPStreamTests: XCTestCase {
     func testHTTPStreamReadsAndSeeks() {
+        MockURLProtocol.supportsRange = true
         MockURLProtocol.payload = Data([0, 1, 2, 3, 4, 5, 6, 7])
         let stream = HTTPStream(
             url: URL(string: "https://mock.local/bytes")!,
@@ -31,7 +32,25 @@ final class HTTPStreamTests: XCTestCase {
         XCTAssertEqual(stream.seek(offset: -2, whence: 2), 6)
     }
 
+    func testHTTPStreamFallsBackWhenRangeIsIgnored() {
+        MockURLProtocol.supportsRange = false
+        MockURLProtocol.payload = Data([9, 8, 7, 6])
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/full")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+
+        var buffer = [UInt8](repeating: 0, count: 4)
+        let read = buffer.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 4)
+        }
+        XCTAssertEqual(read, 4)
+        XCTAssertEqual(buffer, [9, 8, 7, 6])
+    }
+
     func testHTTPAVIOProbesAndDecodesAWAV() throws {
+        MockURLProtocol.supportsRange = true
         MockURLProtocol.payload = makeWAV()
         let url = URL(string: "https://mock.local/tone.wav")!
         let source = try OpenedSource.open(
@@ -106,6 +125,7 @@ final class HTTPStreamTests: XCTestCase {
 
 private final class MockURLProtocol: URLProtocol {
     nonisolated(unsafe) static var payload = Data()
+    nonisolated(unsafe) static var supportsRange = true
 
     override class func canInit(with request: URLRequest) -> Bool {
         request.url?.host == "mock.local"
@@ -116,17 +136,35 @@ private final class MockURLProtocol: URLProtocol {
     }
 
     override func startLoading() {
-        guard let url = request.url,
-              let response = HTTPURLResponse(
-                  url: url,
-                  statusCode: 200,
-                  httpVersion: "HTTP/1.1",
-                  headerFields: [
-                      "Content-Length": "\(Self.payload.count)",
-                      "Accept-Ranges": "bytes",
-                  ]
-              )
-        else {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+
+        let full = Self.payload
+        var body = full
+        var status = 200
+        var headers = [
+            "Content-Length": "\(full.count)",
+            "Accept-Ranges": Self.supportsRange ? "bytes" : "none",
+        ]
+
+        if Self.supportsRange,
+           let header = request.value(forHTTPHeaderField: "Range"),
+           let requested = Self.parseRange(header, total: full.count) {
+            status = 206
+            body = full.subdata(in: requested.lowerBound..<requested.upperBound)
+            headers["Content-Length"] = "\(body.count)"
+            headers["Content-Range"] =
+                "bytes \(requested.lowerBound)-\(requested.upperBound - 1)/\(full.count)"
+        }
+
+        guard let response = HTTPURLResponse(
+            url: url,
+            statusCode: status,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        ) else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
         }
@@ -135,9 +173,24 @@ private final class MockURLProtocol: URLProtocol {
             didReceive: response,
             cacheStoragePolicy: .notAllowed
         )
-        client?.urlProtocol(self, didLoad: Self.payload)
+        client?.urlProtocol(self, didLoad: body)
         client?.urlProtocolDidFinishLoading(self)
     }
 
     override func stopLoading() {}
+
+    private static func parseRange(
+        _ header: String,
+        total: Int
+    ) -> Range<Int>? {
+        guard header.hasPrefix("bytes=") else { return nil }
+        let parts = header.dropFirst("bytes=".count).split(separator: "-")
+        guard parts.count == 2,
+              let start = Int(parts[0]),
+              let end = Int(parts[1])
+        else { return nil }
+        let lower = max(0, min(start, total))
+        let upper = max(lower, min(end + 1, total))
+        return lower..<upper
+    }
 }

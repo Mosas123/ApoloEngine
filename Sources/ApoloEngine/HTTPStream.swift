@@ -2,18 +2,23 @@ import Foundation
 import AetherLibavformat
 import AetherLibavutil
 
-/// Synchronous byte source for FFmpeg's custom AVIO.
+/// Synchronous, seekable byte source for FFmpeg's custom AVIO.
 ///
-/// It downloads the whole resource once through `URLSession` (the headers and
-/// redirect handling come for free) and then serves reads and seeks from
-/// memory. Music album files are small enough for this; a live stream is not a
-/// case this path covers, because it never ends.
+/// Reads go through `URLSession` with `Range` requests, one 1 MB window at a
+/// time, so FFmpeg can start after the first chunk instead of waiting for the
+/// whole file. Servers that ignore `Range` (200 with the full body) are
+/// served from memory. Live/segmented streams are out of scope.
 final class HTTPStream: @unchecked Sendable {
     private let url: URL
     private let headers: [String: String]
     private let session: URLSession
+    private let chunkSize = 1 << 20
     private let lock = NSLock()
-    private var data: Data?
+
+    private var totalSize: Int64?
+    private var cache = Data()
+    private var cacheStart: Int64 = 0
+    private var fullData: Data?
     private var loadError: Error?
     private var position: Int64 = 0
 
@@ -33,7 +38,7 @@ final class HTTPStream: @unchecked Sendable {
         session.invalidateAndCancel()
     }
 
-    /// True when the download failed (as opposed to a clean end of file).
+    /// True when the transport failed (as opposed to a clean end of file).
     var hasError: Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -41,18 +46,41 @@ final class HTTPStream: @unchecked Sendable {
     }
 
     func read(into buffer: UnsafeMutablePointer<UInt8>, count: Int) -> Int {
-        loadIfNeeded()
+        guard count > 0 else { return 0 }
+
+        lock.lock()
+        let start = position
+        lock.unlock()
+
+        guard ensureData(at: start, needed: count) else { return 0 }
+
         lock.lock()
         defer { lock.unlock() }
-        guard count > 0, let data, position < Int64(data.count) else {
-            return 0
+
+        if let fullData {
+            guard start < Int64(fullData.count) else { return 0 }
+            let available = Int(fullData.count) - Int(start)
+            let toCopy = min(count, available)
+            fullData.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                buffer.update(
+                    from: base.advanced(by: Int(start))
+                        .assumingMemoryBound(to: UInt8.self),
+                    count: toCopy
+                )
+            }
+            position += Int64(toCopy)
+            return toCopy
         }
-        let available = Int(data.count) - Int(position)
+
+        let offset = Int(start - cacheStart)
+        guard offset >= 0, offset < cache.count else { return 0 }
+        let available = cache.count - offset
         let toCopy = min(count, available)
-        data.withUnsafeBytes { raw in
+        cache.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             buffer.update(
-                from: base.advanced(by: Int(position))
+                from: base.advanced(by: offset)
                     .assumingMemoryBound(to: UInt8.self),
                 count: toCopy
             )
@@ -62,99 +90,183 @@ final class HTTPStream: @unchecked Sendable {
     }
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
-        loadIfNeeded()
-        lock.lock()
-        defer { lock.unlock() }
+        let code = whence & ~0x20000
 
-        let size = Int64(data?.count ?? 0)
+        if code == 0x10000 {
+            ensureSize()
+            lock.lock()
+            defer { lock.unlock() }
+            return totalSize ?? 0
+        }
+
         let base: Int64
-        switch whence & ~0x20000 {
+        switch code {
         case 0:
             base = 0
         case 1:
+            lock.lock()
             base = position
+            lock.unlock()
         case 2:
-            base = size
-        case 0x10000:
-            return size
+            ensureSize()
+            lock.lock()
+            base = totalSize ?? 0
+            lock.unlock()
         default:
             return -1
         }
 
         let target = base + offset
-        guard target >= 0, target <= size else { return -1 }
+        guard target >= 0 else { return -1 }
+        lock.lock()
+        defer { lock.unlock() }
+        if let totalSize, target > totalSize {
+            return -1
+        }
         position = target
         return target
     }
 
-    private func loadIfNeeded() {
+    private func ensureData(at start: Int64, needed: Int) -> Bool {
         lock.lock()
-        if data != nil || loadError != nil {
+        if loadError != nil {
             lock.unlock()
-            return
+            return false
+        }
+        if let fullData {
+            let ok = start < Int64(fullData.count)
+            lock.unlock()
+            return ok
+        }
+        if start >= cacheStart,
+           start + Int64(needed) <= cacheStart + Int64(cache.count) {
+            lock.unlock()
+            return true
+        }
+        if let totalSize, start >= totalSize {
+            lock.unlock()
+            return false
         }
         lock.unlock()
+        return fetch(from: start)
+    }
 
-        let result = LoadResult()
+    private func ensureSize() {
+        lock.lock()
+        let known = totalSize != nil || fullData != nil
+        lock.unlock()
+        if known { return }
+        _ = fetch(from: 0)
+    }
+
+    private func fetch(from start: Int64) -> Bool {
         var request = URLRequest(url: url)
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
+        request.setValue(
+            "bytes=\(start)-\(start + Int64(chunkSize) - 1)",
+            forHTTPHeaderField: "Range"
+        )
 
+        let result = FetchResult()
         let semaphore = DispatchSemaphore(value: 0)
         let task = session.dataTask(with: request) { data, response, error in
-            if let http = response as? HTTPURLResponse,
-               !(200...299).contains(http.statusCode) {
-                result.set(data: nil, error: URLError(.badServerResponse))
-            } else if let error {
-                result.set(data: nil, error: error)
-            } else {
-                result.set(data: data, error: nil)
-            }
+            result.set(data: data, response: response, error: error)
             semaphore.signal()
         }
         task.resume()
 
         if semaphore.wait(timeout: .now() + 60) == .timedOut {
             task.cancel()
-            lock.lock()
-            loadError = URLError(.timedOut)
-            lock.unlock()
-            return
+            fail(URLError(.timedOut))
+            return false
         }
 
+        let fetched = result.value()
+        if let error = fetched.error {
+            fail(error)
+            return false
+        }
+        guard let http = fetched.response as? HTTPURLResponse,
+              let data = fetched.data
+        else {
+            fail(URLError(.badServerResponse))
+            return false
+        }
+
+        switch http.statusCode {
+        case 206:
+            let range = Self.parseContentRange(
+                http.value(forHTTPHeaderField: "Content-Range")
+            )
+            lock.lock()
+            if let range {
+                totalSize = range.total ?? totalSize
+                cacheStart = range.start
+            } else {
+                cacheStart = start
+            }
+            cache = data
+            lock.unlock()
+            return true
+        case 200:
+            lock.lock()
+            fullData = data
+            totalSize = Int64(data.count)
+            cacheStart = 0
+            cache = data
+            lock.unlock()
+            return true
+        default:
+            fail(URLError(.badServerResponse))
+            return false
+        }
+    }
+
+    private func fail(_ error: Error) {
         lock.lock()
-        if let data = result.data {
-            self.data = data
-        } else {
-            loadError = result.error ?? URLError(.unknown)
+        if loadError == nil {
+            loadError = error
         }
         lock.unlock()
+    }
+
+    /// `"bytes 0-1048575/5000000"` -> (start: 0, total: 5000000).
+    static func parseContentRange(
+        _ value: String?
+    ) -> (start: Int64, total: Int64?)? {
+        guard let value else { return nil }
+        let parts = value.split(separator: " ")
+        guard parts.count == 2 else { return nil }
+        let halves = parts[1].split(separator: "/")
+        guard halves.count == 2 else { return nil }
+        let bounds = halves[0].split(separator: "-")
+        guard bounds.count == 2, let start = Int64(bounds[0]) else {
+            return nil
+        }
+        return (start, Int64(halves[1]))
     }
 }
 
-private final class LoadResult: @unchecked Sendable {
+private final class FetchResult: @unchecked Sendable {
     private let lock = NSLock()
-    private var storedData: Data?
-    private var storedError: Error?
+    private var data: Data?
+    private var response: URLResponse?
+    private var error: Error?
 
-    func set(data: Data?, error: Error?) {
+    func set(data: Data?, response: URLResponse?, error: Error?) {
         lock.lock()
-        storedData = data
-        storedError = error
+        self.data = data
+        self.response = response
+        self.error = error
         lock.unlock()
     }
 
-    var data: Data? {
+    func value() -> (data: Data?, response: URLResponse?, error: Error?) {
         lock.lock()
         defer { lock.unlock() }
-        return storedData
-    }
-
-    var error: Error? {
-        lock.lock()
-        defer { lock.unlock() }
-        return storedError
+        return (data, response, error)
     }
 }
 
