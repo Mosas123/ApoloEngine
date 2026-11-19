@@ -445,7 +445,7 @@ public final class ApoloEngine {
 
     /// True when a remote URL must go through FFmpeg. Local files are never
     /// included: local FLAC still plays through AVPlayer.
-    static func shouldUseFFmpegForRemote(_ url: URL) -> Bool {
+    nonisolated static func shouldUseFFmpegForRemote(_ url: URL) -> Bool {
         let scheme = url.scheme?.lowercased()
         guard scheme == "http" || scheme == "https" else { return false }
         if exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
