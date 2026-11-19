@@ -53,7 +53,7 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 ## Install
 
 ```swift
-.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.2")
+.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.3")
 ```
 
 ## Use
@@ -102,7 +102,7 @@ computes a per-track gain when the container has no ReplayGain tag.
 | Local, Apple codec | AVPlayer | Probe once, then hand the file to AVFoundation |
 | Local, exotic codec | libavcodec → `AVSampleBufferAudioRenderer` | APE/TTA/WavPack/Tak/MPC/DSD-ish |
 | Remote, standard | AVPlayer | AAC/ALAC/MP3/FLAC/E-AC-3, native Spatial/Atmos |
-| Remote, exotic | FFmpeg HTTP AVIO | `ape/tta/wv/tak/mpc/dsf/aiff/wma/mka`; finite files |
+| Remote, exotic | FFmpeg HTTP AVIO | `ape/tta/wv/tak/mpc/dsf/aiff/wma/mka` and `webm/ogg/opus` (also detected from the URL `mime`); finite files |
 
 Live or segmented streams are not handled by the FFmpeg HTTP path; standard
 remote music goes through AVPlayer.

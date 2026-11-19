@@ -81,13 +81,20 @@ final class AVPlayerHost {
 
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
+        guard let audioTrack = try? await asset
+            .loadTracks(withMediaType: .audio)
+            .first
+        else {
+            // Fail fast: the monitor then hands the source to mpv without
+            // waiting for the loading timeout.
+            publish(.failed("This source has no audio track"))
+            return
+        }
         observeEnd(of: item)
         observeFailure(of: item)
-        // Start first; the tap is attached as soon as the track loads so a
-        // remote asset does not delay time-to-first-audio.
+        attachTap(to: item, track: audioTrack)
         player.insert(item, after: nil)
         player.play()
-        await attachTap(to: item, asset: asset)
     }
 
     func clearUpcoming() {
@@ -101,15 +108,21 @@ final class AVPlayerHost {
     func enqueueNext(_ track: ApoloTrack) async {
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
+        guard let audioTrack = try? await asset
+            .loadTracks(withMediaType: .audio)
+            .first
+        else {
+            return
+        }
         observeEnd(of: item)
         observeFailure(of: item)
+        attachTap(to: item, track: audioTrack)
         player.insert(item, after: player.items().last)
         if finished {
             finished = false
             wantsToPlay = true
             player.play()
         }
-        await attachTap(to: item, asset: asset)
     }
 
     func play() {
@@ -152,10 +165,7 @@ final class AVPlayerHost {
         )
     }
 
-    private func attachTap(to item: AVPlayerItem, asset: AVURLAsset) async {
-        guard let track = try? await asset.loadTracks(withMediaType: .audio).first else {
-            return
-        }
+    private func attachTap(to item: AVPlayerItem, track: AVAssetTrack) {
         let processor = AudioTapProcessor(
             equalizer: equalizer,
             limiterEnabled: limiterEnabled,

@@ -269,7 +269,7 @@ public final class ApoloEngine {
         metadataGainDB = info.trackGainDB
         applyProcessing()
 
-        switch CodecSupport.route(forCodec: audioTrack.codec) {
+        switch CodecSupport.route(forCodec: audioTrack.codec, container: info.container) {
         case .avPlayer:
             source?.close()
             route = .avPlayer
@@ -432,14 +432,26 @@ public final class ApoloEngine {
     /// source downloads a finite file.
     private func isExoticRemote(_ url: URL) -> Bool {
         guard isRemote(url) else { return false }
-        return Self.exoticRemoteExtensions.contains(
-            url.pathExtension.lowercased()
-        )
+        if Self.exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+        // Signed CDN URLs often have no extension; the MIME query is the
+        // reliable signal (YouTube: `mime=audio%2Fwebm`).
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let mime = components?.queryItems?
+            .first { $0.name.lowercased() == "mime" }?
+            .value?
+            .lowercased() ?? ""
+        return mime.contains("webm")
+            || mime.contains("ogg")
+            || mime.contains("opus")
+            || mime.contains("matroska")
     }
 
     private static let exoticRemoteExtensions: Set<String> = [
         "ape", "tta", "wv", "tak", "mpc", "mp+",
         "dsf", "dff", "dsdiff", "aiff", "aif", "wma", "mka",
+        "webm", "weba", "ogg", "oga", "opus",
     ]
 
     private func applyProcessing() {
