@@ -76,6 +76,36 @@ final class HTTPStreamTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    func testHTTPAVIODecodesAFLAC() throws {
+        MockURLProtocol.supportsRange = true
+        let fixture = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "tone",
+                withExtension: "flac",
+                subdirectory: "Fixtures"
+            )
+        )
+        MockURLProtocol.payload = try Data(contentsOf: fixture)
+
+        let url = URL(string: "https://mock.local/tone.flac")!
+        let source = try OpenedSource.open(
+            url: url,
+            sessionConfiguration: makeConfiguration()
+        )
+        XCTAssertTrue(source.info.container.contains("flac"))
+        XCTAssertEqual(source.info.audioTracks.first?.codec, "flac")
+
+        let decoder = AudioDecoder()
+        try decoder.adopt(source)
+        defer { decoder.close() }
+
+        var samples = 0
+        while let buffer = try decoder.readNextBuffer() {
+            samples += CMSampleBufferGetNumSamples(buffer)
+        }
+        XCTAssertGreaterThan(samples, 0)
+    }
+
     private func makeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
