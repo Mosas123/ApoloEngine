@@ -17,7 +17,7 @@ try await engine.loadLive(
 - Unexpected end-of-stream is a failure, not an end-of-song queue advance.
 - Existing `load(...)` is `.onDemand` by default, retaining its current AVPlayer/FFmpeg routes, including Dolby passthrough.
 - Native live mode intentionally does not attach `MTAudioProcessingTap` until tests demonstrate that it is safe for indefinite and HLS sources.
-- Unsupported formats (for example Ogg/Opus direct radio), non-HTTP schemes, and `.pls/.m3u/.xspf/.asx` station playlists fail explicitly rather than guessing.
+- At this phase, Ogg/Opus direct audio and station playlist resolution were not available; later phases below extend these capabilities. `.xspf/.asx` and non-HTTP schemes remain unsupported.
 
 **Not shipped to the Thrum radio UI yet.** Thrum continues to use MPVKit for all live stations during this stage. Source URLs may redirect; the native playback result must be verified on real stations.
 
@@ -51,6 +51,32 @@ Do **not** retrofit the existing seekable `HTTPStream` class with an infinite-ra
 - Unit coverage includes cancellation of a blocked read, late registration after cancel, terminal HTTP statuses and bounded retry schedule.
 
 **Still pending:** verified on-device reconnects for actual ICY/Ogg/Opus stations, transient disconnections during demux probe, station playlist `.m3u/.pls` resolution, HLS timed metadata, and measured memory/energy over long sessions. This branch is not enabled in Thrum radio.
+
+## Phase 2C — M3U/PLS station playlist resolution (draft v4)
+
+Explicit `loadLive(...)` requests can now resolve HTTP(S) station playlists
+(`.m3u` / `.pls`, plus recognized MIME hints) before invoking the existing
+native or FFmpeg audio route. The original playlist remains in the queue, so
+bounded reconnects can re-resolve short-lived station destinations.
+
+- Streams playlist contents as bytes with a **64 KiB limit per file**, 8-second
+  request and 12-second resource timeouts; up to 3 nested playlist files.
+- M3U supports comments, EXTINF, and relative links; PLS reads numbered FileN
+  entries in numeric order. The first valid HTTP(S) station entry is used.
+- HLS `.m3u8` remains on its dedicated AVFoundation route; HLS segment
+  playlists are not interpreted as station lists.
+- Rejects file/FTP schemes, URLs with userinfo, malformed manifests and
+  unexpected HTML/JSON responses. Playlist redirects stay on the same origin.
+- For station entries on another origin, **strip all caller-provided request
+  headers** before opening audio. Playlist MIME is never passed as audio MIME.
+- Existing on-demand music, Dolby, finite-file HTTP transport and Thrum radio
+  routing are unchanged.
+
+**Still not established:** live-device reliability, failover to second playlist
+entry if the first station is down, redirecting station playlists across origins,
+legacy `ICY 200 OK` HTTP behavior, native HLS timed metadata, and identifying
+opaque Ogg/Opus endpoint MIME types. CI parser tests are not live station tests.
+Keep the PR in draft until simulator CI and iPhone validation pass.
 
 ## Phase 3 — integration and acceptance
 
