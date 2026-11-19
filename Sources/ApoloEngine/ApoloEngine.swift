@@ -156,7 +156,7 @@ public final class ApoloEngine {
         // native path for remote music (including Spatial/Atmos). Remote
         // sources skip the probe entirely; the local FFmpeg route keeps the
         // full codec/container probe.
-        if isRemote(track.url) {
+        if isRemote(track.url) && !isExoticRemote(track.url) {
             guard epoch == loadEpoch else { return }
             try? session.activateMultichannel()
             metadataGainDB = nil
@@ -397,6 +397,21 @@ public final class ApoloEngine {
         let scheme = url.scheme?.lowercased()
         return scheme == "http" || scheme == "https"
     }
+
+    /// Remote containers AVFoundation cannot play. They go through FFmpeg over
+    /// the HTTP AVIO. Live/segmented streams are excluded on purpose: the HTTP
+    /// source downloads a finite file.
+    private func isExoticRemote(_ url: URL) -> Bool {
+        guard isRemote(url) else { return false }
+        return Self.exoticRemoteExtensions.contains(
+            url.pathExtension.lowercased()
+        )
+    }
+
+    private static let exoticRemoteExtensions: Set<String> = [
+        "ape", "tta", "wv", "tak", "mpc", "mp+",
+        "dsf", "dff", "dsdiff", "aiff", "aif", "wma", "mka",
+    ]
 
     private func applyProcessing() {
         let gain = (metadataGainDB ?? 0) + trackGainDB

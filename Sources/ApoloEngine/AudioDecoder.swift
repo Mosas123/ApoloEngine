@@ -13,6 +13,7 @@ import AetherLibswresample
 /// host guarantees that.
 final class AudioDecoder {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
+    private var transport: HTTPTransport?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     private var resampler: OpaquePointer?
     private var streamIndex: Int32 = -1
@@ -54,28 +55,11 @@ final class AudioDecoder {
     }
 
     func open(url: URL, httpHeaders: [String: String]) throws {
-        var options: OpaquePointer?
-        if !httpHeaders.isEmpty {
-            let joined = httpHeaders
-                .map { "\($0.key): \($0.value)" }
-                .joined(separator: "\r\n")
-            joined.withCString { _ = av_dict_set(&options, "headers", $0, 0) }
-        }
-
-        let openCode = url.absoluteString.withCString {
-            avformat_open_input(&formatContext, $0, nil, &options)
-        }
-        av_dict_free(&options)
-        guard openCode == 0, formatContext != nil else {
-            throw ApoloError.openFailed(code: openCode)
-        }
-
-        do {
-            try configure(alreadyProbed: false)
-        } catch {
-            close()
-            throw error
-        }
+        let source = try OpenedSource.open(
+            url: url,
+            httpHeaders: httpHeaders
+        )
+        try adopt(source)
     }
 
     /// Adopts a context that already ran `avformat_find_stream_info`, so the
@@ -85,6 +69,7 @@ final class AudioDecoder {
             throw ApoloError.openFailed(code: -1)
         }
         formatContext = context
+        transport = source.takeTransport()
         do {
             try configure(alreadyProbed: true)
         } catch {
@@ -365,6 +350,8 @@ final class AudioDecoder {
         if formatContext != nil {
             avformat_close_input(&formatContext)
         }
+        transport?.close()
+        transport = nil
         formatDescription = nil
         passthroughFormat = nil
         processingChain = nil

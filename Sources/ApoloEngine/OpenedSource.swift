@@ -14,18 +14,22 @@ import AetherLibavutil
 final class OpenedSource: @unchecked Sendable {
     let info: MediaInfo
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
+    private var transport: HTTPTransport?
 
     private init(
         info: MediaInfo,
-        formatContext: UnsafeMutablePointer<AVFormatContext>
+        formatContext: UnsafeMutablePointer<AVFormatContext>,
+        transport: HTTPTransport?
     ) {
         self.info = info
         self.formatContext = formatContext
+        self.transport = transport
     }
 
     static func open(
         url: URL,
-        httpHeaders: [String: String] = [:]
+        httpHeaders: [String: String] = [:],
+        sessionConfiguration: URLSessionConfiguration = .default
     ) throws -> OpenedSource {
         var options: OpaquePointer?
         // Music headers resolve well within this; the defaults (5 MB / 5 s)
@@ -39,6 +43,50 @@ final class OpenedSource: @unchecked Sendable {
             joined.withCString { _ = av_dict_set(&options, "headers", $0, 0) }
         }
 
+        let scheme = url.scheme?.lowercased()
+        if scheme == "http" || scheme == "https" {
+            let stream = HTTPStream(
+                url: url,
+                headers: httpHeaders,
+                configuration: sessionConfiguration
+            )
+            guard let transport = HTTPTransport(stream: stream) else {
+                av_dict_free(&options)
+                throw ApoloError.openFailed(code: -1)
+            }
+            guard let allocated = avformat_alloc_context() else {
+                transport.close()
+                av_dict_free(&options)
+                throw ApoloError.unsupportedFormat
+            }
+            allocated.pointee.pb = transport.context
+
+            var context: UnsafeMutablePointer<AVFormatContext>? = allocated
+            let openCode = avformat_open_input(&context, nil, nil, &options)
+            av_dict_free(&options)
+            guard openCode == 0, let context else {
+                if context != nil {
+                    avformat_close_input(&context)
+                }
+                transport.close()
+                throw ApoloError.openFailed(code: openCode)
+            }
+
+            do {
+                let info = try buildInfo(context)
+                return OpenedSource(
+                    info: info,
+                    formatContext: context,
+                    transport: transport
+                )
+            } catch {
+                var closing: UnsafeMutablePointer<AVFormatContext>? = context
+                avformat_close_input(&closing)
+                transport.close()
+                throw error
+            }
+        }
+
         var context: UnsafeMutablePointer<AVFormatContext>?
         let openCode = url.absoluteString.withCString {
             avformat_open_input(&context, $0, nil, &options)
@@ -50,7 +98,11 @@ final class OpenedSource: @unchecked Sendable {
 
         do {
             let info = try buildInfo(context)
-            return OpenedSource(info: info, formatContext: context)
+            return OpenedSource(
+                info: info,
+                formatContext: context,
+                transport: nil
+            )
         } catch {
             var closing: UnsafeMutablePointer<AVFormatContext>? = context
             avformat_close_input(&closing)
@@ -65,9 +117,18 @@ final class OpenedSource: @unchecked Sendable {
         return context
     }
 
+    func takeTransport() -> HTTPTransport? {
+        let transport = self.transport
+        self.transport = nil
+        return transport
+    }
+
     func close() {
-        guard formatContext != nil else { return }
-        avformat_close_input(&formatContext)
+        if formatContext != nil {
+            avformat_close_input(&formatContext)
+        }
+        transport?.close()
+        transport = nil
     }
 
     deinit {
