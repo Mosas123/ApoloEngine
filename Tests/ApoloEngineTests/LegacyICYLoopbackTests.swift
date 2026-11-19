@@ -6,7 +6,7 @@ import XCTest
 /// Loopback integration: an actual TCP listener sends a raw ICY response,
 /// exercising NWConnection, the header parser, and the bounded audio ring.
 final class LegacyICYLoopbackTests: XCTestCase {
-    func testRawICYServerDeliversAudioAndStripsInterleavedMetadata() throws {
+    func testURLSessionParseErrorFallsBackToRawICYAndStripsMetadata() throws {
         let listening = expectation(description: "station listening")
         let requested = expectation(description: "client request")
         let titled = expectation(description: "ICY title")
@@ -62,41 +62,43 @@ final class LegacyICYLoopbackTests: XCTestCase {
 
         let port = try XCTUnwrap(listener.port?.rawValue)
         let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/station"))
-        let ring = LiveAudioBuffer(capacity: 64)
-        let connection = LegacyICYConnection(
+        // Force URLSession's real delegate path to receive the specific
+        // parse error a legacy ICY status line produces. The retry then
+        // connects by TCP to the actual loopback station above.
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockLegacyICYParseErrorProtocol.self]
+        let stream = LiveHTTPStream(
             url: url,
-            buffer: ring,
-            onTitle: { title in
+            headers: ["Authorization": "Bearer not-for-raw-fallback"],
+            capacity: 64,
+            configuration: config,
+            onICYTitle: { title in
                 if title == "A" { titled.fulfill() }
             },
-            onStatus: { status in
+            onHTTPStatus: { status in
                 XCTAssertEqual(status, 200)
             }
         )
-        defer {
-            connection.close()
-            ring.close()
-        }
-        connection.start()
+        defer { stream.close() }
+        stream.start()
 
         var collected = [UInt8](repeating: 0, count: 8)
         var count = 0
         while count < collected.count {
             let amount = collected.withUnsafeMutableBufferPointer { pointer in
-                ring.read(
+                stream.read(
                     into: pointer.baseAddress!.advanced(by: count),
-                    count: collected.count - count,
-                    timeout: 3
+                    count: collected.count - count
                 )
             }
             if amount == 0 { break }
             count += amount
-            connection.resumeIfDrained()
+            // LiveHTTPStream resumes the fallback when ring space frees.
         }
         XCTAssertEqual(count, 8)
         XCTAssertEqual(Data(collected.prefix(count)), Data("abcdefgh".utf8))
         wait(for: [requested, titled], timeout: 5)
-        XCTAssertLessThanOrEqual(ring.bufferedBytes, ring.capacity)
+        XCTAssertLessThanOrEqual(stream.bufferedBytes, stream.capacity)
     }
 }
 
@@ -119,4 +121,25 @@ private final class ICYTestConnections: @unchecked Sendable {
         lock.unlock()
         for connection in existing { connection.cancel() }
     }
+}
+
+private final class MockLegacyICYParseErrorProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "127.0.0.1"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        // Mock only the initial HTTP parse failure; all subsequent legacy
+        // radio bytes come from the real in-process TCP listener.
+        client?.urlProtocol(
+            self,
+            didFailWithError: URLError(.cannotParseResponse)
+        )
+    }
+
+    override func stopLoading() {}
 }
