@@ -14,12 +14,12 @@ import AetherLibavutil
 final class OpenedSource: @unchecked Sendable {
     let info: MediaInfo
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
-    private var transport: HTTPTransport?
+    private var transport: (any AudioTransport)?
 
     private init(
         info: MediaInfo,
         formatContext: UnsafeMutablePointer<AVFormatContext>,
-        transport: HTTPTransport?
+        transport: (any AudioTransport)?
     ) {
         self.info = info
         self.formatContext = formatContext
@@ -29,7 +29,9 @@ final class OpenedSource: @unchecked Sendable {
     static func open(
         url: URL,
         httpHeaders: [String: String] = [:],
-        sessionConfiguration: URLSessionConfiguration = .default
+        sessionConfiguration: URLSessionConfiguration = .default,
+        isLive: Bool = false,
+        onICYTitle: (@Sendable (String) -> Void)? = nil
     ) throws -> OpenedSource {
         var options: OpaquePointer?
         // Music headers resolve well within this; the defaults (5 MB / 5 s)
@@ -45,14 +47,30 @@ final class OpenedSource: @unchecked Sendable {
 
         let scheme = url.scheme?.lowercased()
         if scheme == "http" || scheme == "https" {
-            let stream = HTTPStream(
-                url: url,
-                headers: httpHeaders,
-                configuration: sessionConfiguration
-            )
-            guard let transport = HTTPTransport(stream: stream) else {
-                av_dict_free(&options)
-                throw ApoloError.openFailed(code: -1)
+            let transport: any AudioTransport
+            if isLive {
+                let liveStream = LiveHTTPStream(
+                    url: url,
+                    headers: httpHeaders,
+                    configuration: sessionConfiguration,
+                    onICYTitle: onICYTitle
+                )
+                guard let live = LiveHTTPTransport(stream: liveStream) else {
+                    av_dict_free(&options)
+                    throw ApoloError.openFailed(code: -1)
+                }
+                transport = live
+            } else {
+                let fileStream = HTTPStream(
+                    url: url,
+                    headers: httpHeaders,
+                    configuration: sessionConfiguration
+                )
+                guard let file = HTTPTransport(stream: fileStream) else {
+                    av_dict_free(&options)
+                    throw ApoloError.openFailed(code: -1)
+                }
+                transport = file
             }
             guard let allocated = avformat_alloc_context() else {
                 transport.close()
@@ -117,7 +135,7 @@ final class OpenedSource: @unchecked Sendable {
         return context
     }
 
-    func takeTransport() -> HTTPTransport? {
+    func takeTransport() -> (any AudioTransport)? {
         let transport = self.transport
         self.transport = nil
         return transport
