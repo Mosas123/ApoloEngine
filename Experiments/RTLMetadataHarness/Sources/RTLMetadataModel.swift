@@ -213,8 +213,7 @@ final class RTLMetadataModel: ObservableObject {
         if metadataMode.installsOutput {
             let nextOutput = AVPlayerItemMetadataOutput(identifiers: metadataMode.identifiers)
             let nextSink = TimedMetadataSink { [weak self] count, titlePresent in
-                NSLog("RTL_HLS_REPRO CALLBACK gen=%llu groups=%d titlePresent=%d",
-                      generation, count, titlePresent ? 1 : 0)
+                NSLog("RTL_HLS_REPRO callback gen=\(generation) groups=\(count) hasTitle=\(titlePresent)")
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.event("METADATA_CALLBACK gen=\(generation) groups=\(count) titlePresent=\(titlePresent)")
@@ -227,15 +226,15 @@ final class RTLMetadataModel: ObservableObject {
             nextItem.add(nextOutput)
             metadataOutput = nextOutput
             metadataSink = nextSink
-            event("OUTPUT_ATTACH gen=\(generation) queue=\(queue === DispatchQueue.main ? "main" : "serial")")
+            event("OUTPUT_ATTACH gen=\(generation) queue=\(metadataMode == .titleSerial ? "serial" : "main")")
         }
 
         item = nextItem
-        statusObservation = nextItem.observe(\.status, options: [.new, .initial]) { [weak self] obj, _ in
-            let rawValue = obj.status.rawValue
-            let failure = obj.error.map { String(describing: type(of: $0)) } ?? "none"
+        statusObservation = nextItem.observe(\.status, options: [.new, .initial]) { [weak self] _, _ in
             Task { @MainActor [weak self] in
-                guard let self, self.itemGeneration == generation else { return }
+                guard let self, self.itemGeneration == generation, let item = self.item else { return }
+                let rawValue = item.status.rawValue
+                let failure = item.error.map { String(describing: type(of: $0)) } ?? "none"
                 self.event("ITEM_STATUS gen=\(generation) status=\(rawValue) errorType=\(failure)")
             }
         }
@@ -251,10 +250,10 @@ final class RTLMetadataModel: ObservableObject {
         player = nextPlayer
         timeControlObservation = nextPlayer.observe(
             \.timeControlStatus, options: [.new, .initial]
-        ) { [weak self] obj, _ in
-            let rawValue = obj.timeControlStatus.rawValue
+        ) { [weak self] _, _ in
             Task { @MainActor [weak self] in
-                guard let self, self.itemGeneration == generation else { return }
+                guard let self, self.itemGeneration == generation, let player = self.player else { return }
+                let rawValue = player.timeControlStatus.rawValue
                 self.phase = rawValue == AVPlayer.TimeControlStatus.playing.rawValue
                     ? "Playing · generation \(generation)"
                     : "Player phase \(rawValue) · generation \(generation)"
@@ -306,7 +305,8 @@ final class RTLMetadataModel: ObservableObject {
         // Persist each transition before a possible native AVFCore crash.
         // Bounded log size prevents growing indefinitely across experiments.
         let manager = FileManager.default
-        if (try? manager.attributesOfItem(atPath: logURL.path)[.size] as? Int64) ?? 0 > 512_000 {
+        let logBytes = (try? manager.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        if logBytes > 512_000 {
             try? manager.removeItem(at: logURL)
         }
         if !manager.fileExists(atPath: logURL.path) {
