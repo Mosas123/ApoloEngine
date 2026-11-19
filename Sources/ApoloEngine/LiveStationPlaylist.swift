@@ -56,7 +56,7 @@ enum LiveStationPlaylist {
                 let value = String(line[line.index(after: equal)...])
                 indexed.append((index, value))
             }
-            candidates = indexed.sorted { $0.0 < $1.0 }.map(\.1)
+            candidates = indexed.sorted { $0.0 < $1.0 }.map { $0.1 }
         } else {
             candidates = lines.filter {
                 !$0.isEmpty && !$0.hasPrefix("#")
