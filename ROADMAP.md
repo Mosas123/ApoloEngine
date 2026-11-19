@@ -34,6 +34,9 @@ never depends on a chat.
   duration survive a gapless automatic advance.
 - Hot path reuses one `AVPacket` and one `AVFrame`, and swresample writes
   straight into the `CMBlockBuffer`-owned memory (zero-copy PCM).
+- `ApoloEngine.diagnostics` exposes route, container, codec, sample rate,
+  channels, Atmos flag, duration and state for a debug screen; `ApoloError`
+  conforms to `LocalizedError`.
 - Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
   protocol dependency). Local files keep the full FFmpeg probe and route.
 - The libavcodec tail is no longer cut: at EOF the clock keeps running until
