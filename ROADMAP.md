@@ -54,13 +54,16 @@ lacks, while keeping the Apple output path.
   now installs `autoconf automake libtool pkg-config meson ninja nasm` first.
 - Runs: https://github.com/Mosas123/FFmpegBuild/actions/workflows/build.yml
 
-**When the build lands**, do exactly this in ApoloEngine:
+**Landed.** `Package.swift` now points at
+`https://github.com/Mosas123/FFmpegBuild` (`.branch("apolo-union")`), and CI
+asserts at runtime that the APE/TTA/WavPack/Tak/MPC decoders, the matching
+demuxers, and the EQ/loudness/crossfeed filters are compiled in (21 tests
+green).
 
-1. `Package.swift`: change the FFmpegBuild dependency to
-   `https://github.com/Mosas123/FFmpegBuild`, `.branch("apolo-union")`.
-2. `swift package update` / let CI resolve it.
-3. Run CI. `testMP4MuxerIsAvailable` must stay green.
-4. Add a decode test for a generated APE or TTA file through `AudioDecoder`.
+The first build left absolute install names in the x86_64 simulator slices, so
+those binaries were patched in place and ad-hoc re-signed by the fork's
+`sign.yml` workflow. The union build is now manual (`workflow_dispatch`) so a
+push cannot start a multi-hour job by accident.
 
 Caveats: the macOS build takes hours, can fail on SDK/disk, and each successful
 build adds roughly 380 MB to the FFmpegBuild git history.
