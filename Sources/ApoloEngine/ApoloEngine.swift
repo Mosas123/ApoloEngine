@@ -282,7 +282,7 @@ public final class ApoloEngine {
             applyProcessing()
             route = .libavcodec
             host.stop()
-            libavHost?.load(source: source)
+            libavHost?.load(source: source, isLive: true)
             refreshNowPlaying()
             return
         }
@@ -459,6 +459,7 @@ public final class ApoloEngine {
     /// Queues a source to start when the current one ends, with no gap on the
     /// libavcodec route and no audible one on AVQueuePlayer.
     public func enqueueNext(_ track: ApoloTrack) async {
+        guard queue.current?.streamMode != .live else { return }
         queue.enqueue(track)
 
         var prepared = track
