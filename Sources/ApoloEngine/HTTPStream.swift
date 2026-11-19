@@ -159,8 +159,99 @@ final class HTTPStream: @unchecked Sendable {
         _ = fetch(from: 0)
     }
 
+    // A brief CDN hiccup must not permanently poison the FFmpeg byte stream.
+    // Retry the exact same Range; the read position only moves after bytes
+    // have been copied to the decoder. Never retry authorization failures.
+    private static let maxTransientRetries = 2
+
     private func fetch(from start: Int64) -> Bool {
+        for attempt in 0...Self.maxTransientRetries {
+            if attempt > 0 {
+                // This is FFmpeg's synchronous AVIO worker, not the main actor.
+                Thread.sleep(forTimeInterval: Double(attempt) * 0.15)
+            }
+
+            switch requestRange(from: start) {
+            case .failure(let error):
+                if attempt < Self.maxTransientRetries,
+                   Self.isTransientNetworkError(error) {
+                    continue
+                }
+                fail(error)
+                return false
+
+            case .success(let (http, data)):
+                switch http.statusCode {
+                case 206:
+                    guard let range = Self.parseContentRange(
+                        http.value(forHTTPHeaderField: "Content-Range")
+                    ), range.start == start,
+                       range.end >= range.start,
+                       Int64(data.count) == range.end - range.start + 1,
+                       (range.total.map { range.end < $0 } ?? true) else {
+                        fail(URLError(.badServerResponse))
+                        return false
+                    }
+                    lock.lock()
+                    if let oldSize = totalSize,
+                       let newSize = range.total,
+                       oldSize != newSize {
+                        lock.unlock()
+                        fail(URLError(.badServerResponse))
+                        return false
+                    }
+                    totalSize = range.total ?? totalSize
+                    cacheStart = range.start
+                    cache = data
+                    lock.unlock()
+                    return true
+
+                case 200:
+                    // Some small files ignore Range. Preserve the existing
+                    // compatibility path; these responses contain the full file.
+                    lock.lock()
+                    fullData = data
+                    totalSize = Int64(data.count)
+                    cacheStart = 0
+                    cache = data
+                    lock.unlock()
+                    return true
+
+                case 408, 500, 502, 503, 504:
+                    if attempt < Self.maxTransientRetries { continue }
+                    fail(URLError(.badServerResponse))
+                    return false
+
+                default:
+                    // 401/403/404/410/416 and other nontransient responses:
+                    // do not repeatedly request an expired or rejected URL.
+                    fail(URLError(.badServerResponse))
+                    return false
+                }
+            }
+        }
+        fail(URLError(.badServerResponse))
+        return false
+    }
+
+    private static func isTransientNetworkError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        guard nsError.domain == NSURLErrorDomain else { return false }
+        switch nsError.code {
+        case URLError.Code.timedOut.rawValue,
+             URLError.Code.networkConnectionLost.rawValue,
+             URLError.Code.cannotConnectToHost.rawValue:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func requestRange(
+        from start: Int64
+    ) -> Result<(HTTPURLResponse, Data), Error> {
         var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalCacheData
         for (key, value) in headers {
             request.setValue(value, forHTTPHeaderField: key)
         }
@@ -179,49 +270,18 @@ final class HTTPStream: @unchecked Sendable {
 
         if semaphore.wait(timeout: .now() + 60) == .timedOut {
             task.cancel()
-            fail(URLError(.timedOut))
-            return false
+            return .failure(URLError(.timedOut))
         }
 
         let fetched = result.value()
         if let error = fetched.error {
-            fail(error)
-            return false
+            return .failure(error)
         }
         guard let http = fetched.response as? HTTPURLResponse,
-              let data = fetched.data
-        else {
-            fail(URLError(.badServerResponse))
-            return false
+              let data = fetched.data else {
+            return .failure(URLError(.badServerResponse))
         }
-
-        switch http.statusCode {
-        case 206:
-            let range = Self.parseContentRange(
-                http.value(forHTTPHeaderField: "Content-Range")
-            )
-            lock.lock()
-            if let range {
-                totalSize = range.total ?? totalSize
-                cacheStart = range.start
-            } else {
-                cacheStart = start
-            }
-            cache = data
-            lock.unlock()
-            return true
-        case 200:
-            lock.lock()
-            fullData = data
-            totalSize = Int64(data.count)
-            cacheStart = 0
-            cache = data
-            lock.unlock()
-            return true
-        default:
-            fail(URLError(.badServerResponse))
-            return false
-        }
+        return .success((http, data))
     }
 
     private func fail(_ error: Error) {
@@ -235,17 +295,18 @@ final class HTTPStream: @unchecked Sendable {
     /// `"bytes 0-1048575/5000000"` -> (start: 0, total: 5000000).
     static func parseContentRange(
         _ value: String?
-    ) -> (start: Int64, total: Int64?)? {
+    ) -> (start: Int64, end: Int64, total: Int64?)? {
         guard let value else { return nil }
         let parts = value.split(separator: " ")
         guard parts.count == 2 else { return nil }
         let halves = parts[1].split(separator: "/")
         guard halves.count == 2 else { return nil }
         let bounds = halves[0].split(separator: "-")
-        guard bounds.count == 2, let start = Int64(bounds[0]) else {
-            return nil
-        }
-        return (start, Int64(halves[1]))
+        guard bounds.count == 2,
+              let start = Int64(bounds[0]),
+              let end = Int64(bounds[1]),
+              start >= 0, end >= start else { return nil }
+        return (start, end, Int64(halves[1]))
     }
 }
 
