@@ -95,6 +95,10 @@ public final class ApoloEngine {
             guard let self else { return }
             self.resumeAfterInterruption = self.state == .playing
             if self.resumeAfterInterruption {
+                if self.queue.current?.streamMode == .live {
+                    self.liveShouldPlay = false
+                    self.cancelLiveReconnect()
+                }
                 self.pauseInternal()
             }
         }
@@ -106,8 +110,7 @@ public final class ApoloEngine {
             self.play()
         }
         session.onRouteLost = { [weak self] in
-            self?.resumeAfterInterruption = false
-            self?.pauseInternal()
+            self?.pause()
         }
 
         libavHost = LibavcodecAudioHost(
