@@ -7,6 +7,16 @@ enum LiveRetryPolicy {
     static let maxAttempts = 3
     static let resetAfterPlaying: TimeInterval = 60
 
+    /// The retry budget may be reset only after sustained *confirmed*
+    /// playback, never merely because an HTTP request connected.
+    static func shouldResetBudget(
+        playingSince: Date?,
+        now: Date
+    ) -> Bool {
+        guard let playingSince else { return false }
+        return now.timeIntervalSince(playingSince) >= resetAfterPlaying
+    }
+
     /// The attempt argument is one-based. Nil means retries are exhausted.
     static func delay(forAttempt attempt: Int) -> TimeInterval? {
         guard attempt >= 1, attempt <= maxAttempts else { return nil }
