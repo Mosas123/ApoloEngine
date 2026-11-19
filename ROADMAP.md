@@ -37,6 +37,8 @@ never depends on a chat.
 - `ApoloEngine.diagnostics` exposes route, container, codec, sample rate,
   channels, Atmos flag, duration and state for a debug screen; `ApoloError`
   conforms to `LocalizedError`.
+- Demux read errors are no longer mistaken for EOF: `readNextBuffer()` throws
+  `readFailed(code:)` and the host publishes `.failed`.
 - Remote `http(s)` sources go through AVPlayer directly (no FFmpeg probe, no
   protocol dependency). Local files keep the full FFmpeg probe and route.
 - The libavcodec tail is no longer cut: at EOF the clock keeps running until
