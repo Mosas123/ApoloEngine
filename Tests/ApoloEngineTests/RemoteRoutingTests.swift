@@ -95,6 +95,29 @@ final class RemoteRoutingTests: XCTestCase {
         ))
     }
 
+    func testLegacyICYHintOnlyOptInForLiveRouting() {
+        let station = URL(string: "http://legacy.example/live.mp3")!
+        XCTAssertTrue(ApoloEngine.supportsNativeLive(
+            station, hint: "audio/mpeg"
+        ))
+        XCTAssertFalse(ApoloEngine.supportsFFmpegLive(
+            station, hint: "audio/mpeg"
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            station, hint: "application/x-icy"
+        ))
+        XCTAssertTrue(ApoloEngine.supportsFFmpegLive(
+            station, hint: "application/x-icy"
+        ))
+        XCTAssertFalse(ApoloEngine.shouldUseFFmpegForRemote(
+            station, hint: "application/x-icy"
+        ))
+        XCTAssertFalse(ApoloEngine.supportsFFmpegLive(
+            URL(string: "http://legacy.example/live.m3u8")!,
+            hint: "application/x-icy"
+        ))
+    }
+
     func testOpaqueRemoteURLNeedsAHint() {
         let opaque = URL(string: "https://cdn.example/stream?token=x")!
         XCTAssertFalse(ApoloEngine.shouldUseFFmpegForRemote(opaque))
