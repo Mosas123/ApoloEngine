@@ -420,15 +420,31 @@ public final class ApoloEngine {
     /// the HTTP AVIO. Live/segmented streams are excluded on purpose: the HTTP
     /// source downloads a finite file.
     private func isExoticRemote(_ url: URL) -> Bool {
-        guard isRemote(url) else { return false }
-        return Self.exoticRemoteExtensions.contains(
-            url.pathExtension.lowercased()
-        )
+        Self.prefersFFmpegForRemote(url)
+    }
+
+    /// YouTube Music audio URLs often end in /videoplayback (no extension).
+    /// The signed URL's `mime=audio/webm` query is a format hint that must
+    /// take the libavformat/Opus route, not Apple's AVPlayer route.
+    static func prefersFFmpegForRemote(_ url: URL) -> Bool {
+        guard ["http", "https"].contains(url.scheme?.lowercased() ?? "") else {
+            return false
+        }
+        if exoticRemoteExtensions.contains(url.pathExtension.lowercased()) {
+            return true
+        }
+        let mime = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name.lowercased() == "mime" })?
+            .value?
+            .lowercased() ?? ""
+        return mime.contains("audio/webm") || mime.contains("audio/ogg")
     }
 
     private static let exoticRemoteExtensions: Set<String> = [
         "ape", "tta", "wv", "tak", "mpc", "mp+",
         "dsf", "dff", "dsdiff", "aiff", "aif", "wma", "mka",
+        "webm", "opus", "ogg", "oga",
     ]
 
     private func applyProcessing() {
