@@ -65,7 +65,7 @@ final class HTTPStreamTests: XCTestCase {
 
         var samples = 0
         var buffers = 0
-        while let buffer = decoder.readNextBuffer() {
+        while let buffer = try decoder.readNextBuffer() {
             samples += CMSampleBufferGetNumSamples(buffer)
             buffers += 1
             if buffers > 2_000 {

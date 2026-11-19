@@ -15,7 +15,7 @@ final class AudioDecoderTests: XCTestCase {
 
         var buffers = 0
         var samples = 0
-        while let buffer = decoder.readNextBuffer() {
+        while let buffer = try decoder.readNextBuffer() {
             buffers += 1
             samples += CMSampleBufferGetNumSamples(buffer)
             if buffers > 2_000 { break }
@@ -36,7 +36,7 @@ final class AudioDecoderTests: XCTestCase {
         try decoder.open(url: url, httpHeaders: [:])
         defer { decoder.close() }
 
-        let first = try XCTUnwrap(decoder.readNextBuffer())
+        let first = try XCTUnwrap(try decoder.readNextBuffer())
         let pts = CMSampleBufferGetPresentationTimeStamp(first).seconds
         XCTAssertEqual(pts, 10, accuracy: 0.01)
     }
@@ -53,7 +53,7 @@ final class AudioDecoderTests: XCTestCase {
         defer { decoder.close() }
 
         var samples = 0
-        while let buffer = decoder.readNextBuffer() {
+        while let buffer = try decoder.readNextBuffer() {
             samples += CMSampleBufferGetNumSamples(buffer)
         }
         XCTAssertGreaterThan(samples, 0)

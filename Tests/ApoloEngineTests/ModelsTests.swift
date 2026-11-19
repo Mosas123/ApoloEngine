@@ -21,6 +21,7 @@ final class ModelsTests: XCTestCase {
     func testErrorsHaveMessages() {
         for error: ApoloError in [
             .openFailed(code: -1),
+            .readFailed(code: -5),
             .unsupportedFormat,
             .noAudioTrack,
             .playbackUnavailable,

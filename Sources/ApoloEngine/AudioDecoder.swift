@@ -148,20 +148,23 @@ final class AudioDecoder {
         }
     }
 
+    private static let avErrorEOF: Int32 = -541_478_725
+
     /// Returns the next buffer, decoded or compressed, or nil at end of stream.
-    func readNextBuffer() -> CMSampleBuffer? {
+    /// Real demux errors throw instead of looking like EOF.
+    func readNextBuffer() throws -> CMSampleBuffer? {
         if !readyBuffers.isEmpty {
             return readyBuffers.removeFirst()
         }
         switch passthroughMode {
         case .decode:
-            return readDecodedBuffer()
+            return try readDecodedBuffer()
         case .undecided, .passthrough:
-            return readCompressedBuffer()
+            return try readCompressedBuffer()
         }
     }
 
-    private func readDecodedBuffer() -> CMSampleBuffer? {
+    private func readDecodedBuffer() throws -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
         guard let packet = ensurePacket() else { return nil }
 
@@ -185,8 +188,11 @@ final class AudioDecoder {
 
             let read = av_read_frame(formatContext, packet)
             if read < 0 {
-                reachedEnd = true
-                continue
+                if read == Self.avErrorEOF {
+                    reachedEnd = true
+                    continue
+                }
+                throw ApoloError.readFailed(code: read)
             }
 
             if packet.pointee.stream_index != streamIndex {
@@ -223,7 +229,7 @@ final class AudioDecoder {
         return true
     }
 
-    private func readCompressedBuffer() -> CMSampleBuffer? {
+    private func readCompressedBuffer() throws -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
 
         guard let packet = ensurePacket() else { return nil }
@@ -235,8 +241,11 @@ final class AudioDecoder {
 
             let read = av_read_frame(formatContext, packet)
             if read < 0 {
-                reachedEnd = true
-                return nil
+                if read == Self.avErrorEOF {
+                    reachedEnd = true
+                    return nil
+                }
+                throw ApoloError.readFailed(code: read)
             }
 
             if packet.pointee.stream_index != streamIndex {
@@ -271,7 +280,7 @@ final class AudioDecoder {
                     if accepted, !readyBuffers.isEmpty {
                         return readyBuffers.removeFirst()
                     }
-                    return readDecodedBuffer()
+                    return try readDecodedBuffer()
                 }
             }
 

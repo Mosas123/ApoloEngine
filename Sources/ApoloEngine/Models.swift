@@ -147,6 +147,7 @@ public struct NowPlayingMetadata: Sendable, Equatable {
 
 public enum ApoloError: Error, Sendable, Equatable {
     case openFailed(code: Int32)
+    case readFailed(code: Int32)
     case unsupportedFormat
     case noAudioTrack
     case playbackUnavailable
@@ -157,6 +158,8 @@ extension ApoloError: LocalizedError {
         switch self {
         case .openFailed(let code):
             return "The source could not be opened (FFmpeg error \(code))."
+        case .readFailed(let code):
+            return "The stream could not be read (FFmpeg error \(code))."
         case .unsupportedFormat:
             return "This audio format is not supported."
         case .noAudioTrack:

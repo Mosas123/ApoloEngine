@@ -209,15 +209,27 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             return
         }
 
-        if let buffer = decoder.readNextBuffer() {
+        let buffer: CMSampleBuffer?
+        do {
+            buffer = try decoder.readNextBuffer()
+        } catch {
+            requesting = false
+            renderer.stopRequestingMediaData()
+            synchronizer.setRate(0, time: synchronizer.currentTime())
+            publish(.failed(Self.describe(error)))
+            return
+        }
+
+        if let buffer {
             enqueueDecoded(buffer)
             return
         }
 
         if let next = nextTrack, start(next: next) {
             nextTrack = nil
-            if let buffer = self.decoder?.readNextBuffer() {
-                enqueueDecoded(buffer)
+            if let newDecoder = self.decoder,
+               let first = try? newDecoder.readNextBuffer() {
+                enqueueDecoded(first)
             }
             return
         }
@@ -341,6 +353,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             switch apolo {
             case .openFailed(let code):
                 return "Could not open the stream (\(code))"
+            case .readFailed(let code):
+                return "Could not read the stream (\(code))"
             case .unsupportedFormat:
                 return "Unsupported audio format"
             case .noAudioTrack:
