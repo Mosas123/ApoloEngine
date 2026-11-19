@@ -28,6 +28,10 @@ final class OpenedSource: @unchecked Sendable {
         httpHeaders: [String: String] = [:]
     ) throws -> OpenedSource {
         var options: OpaquePointer?
+        // Music headers resolve well within this; the defaults (5 MB / 5 s)
+        // only add startup latency.
+        _ = av_dict_set(&options, "probesize", "2000000", 0)
+        _ = av_dict_set(&options, "analyzeduration", "2000000", 0)
         if !httpHeaders.isEmpty {
             let joined = httpHeaders
                 .map { "\($0.key): \($0.value)" }
@@ -143,7 +147,12 @@ final class OpenedSource: @unchecked Sendable {
               let value = entry.pointee.value
         else { return nil }
 
-        var text = String(cString: value).trimmingCharacters(in: .whitespaces)
+        return parseReplayGain(String(cString: value))
+    }
+
+    /// Parses `"-7.23 dB"` (the form ReplayGain tags use).
+    static func parseReplayGain(_ value: String) -> Double? {
+        var text = value.trimmingCharacters(in: .whitespaces)
         text = text.replacingOccurrences(
             of: "dB",
             with: "",
