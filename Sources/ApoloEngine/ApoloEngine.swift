@@ -378,12 +378,18 @@ public final class ApoloEngine {
             return
         }
 
-        // The FFmpeg build has no network protocols, and AVFoundation is the
-        // native path for remote music (including Spatial/Atmos). Remote
-        // sources skip the probe entirely; the local FFmpeg route keeps the
-        // full codec/container probe.
-        if isRemote(track.url)
-            && !isExoticRemote(track.url, hint: track.sourceMIMEType) {
+        // Apple-container audio stored inside the app sandbox does not need
+        // a libavformat preflight. A file:// FFmpeg probe could fail before
+        // AVPlayer was ever given the chance to open an ordinary M4A/MP3,
+        // leaving the app reporting "Downloaded" without audible playback.
+        // Keep FLAC, Ogg/Opus and uncommon formats on the FFmpeg route.
+        //
+        // Native and remote AVFoundation sources do not pass through FFmpeg's
+        // network/probe transport; Spatial/Atmos audio remains untouched.
+        if Self.supportsNativeLocal(track.url, hint: track.sourceMIMEType)
+            || (isRemote(track.url)
+                && !isExoticRemote(track.url, hint: track.sourceMIMEType)) {
+
             guard epoch == loadEpoch else { return }
             try? session.activateMultichannel()
             metadataGainDB = nil
@@ -677,6 +683,23 @@ public final class ApoloEngine {
         elapsed = 0
         applyProcessing()
         refreshNowPlaying()
+    }
+
+    /// Common Apple-playable local formats may go straight to AVPlayer.
+    /// Do not guess from duration or a server MIME. Explicit exotic hints
+    /// and FLAC always retain the existing FFmpeg decode route.
+    nonisolated static func supportsNativeLocal(
+        _ url: URL,
+        hint: String? = nil
+    ) -> Bool {
+        guard url.isFileURL else { return false }
+        let ext = url.pathExtension.lowercased()
+        guard ["m4a", "m4b", "mp3", "aac", "mp4"].contains(ext) else {
+            return false
+        }
+        let format = (hint ?? "").lowercased()
+        return !["flac", "ogg", "opus", "webm", "matroska", "vorbis"]
+            .contains { format.contains($0) }
     }
 
     private func isRemote(_ url: URL) -> Bool {
