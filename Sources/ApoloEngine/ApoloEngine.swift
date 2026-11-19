@@ -202,8 +202,8 @@ public final class ApoloEngine {
         try await startPlayback(track, epoch: loadEpoch)
     }
 
-    /// Start a live radio broadcast. This first route supports HLS and direct
-    /// Apple-playable HTTP audio; Ogg/Opus live transport is a future route.
+    /// Start a live broadcast through native HLS/MP3/AAC or FFmpeg Ogg/Opus,
+    /// optionally resolving a bounded .m3u/.pls station playlist first.
     /// Live mode never seeks or treats an unknown duration as end-of-file.
     public func loadLive(
         url: URL,
@@ -233,19 +233,57 @@ public final class ApoloEngine {
         liveTitle = nil
 
         if track.streamMode == .live {
-            if Self.supportsNativeLive(track.url, hint: track.sourceMIMEType) {
+            // Resolve only explicit live station playlists. Keep the original
+            // URL in the queue: retries re-resolve short-lived station links.
+            // No playlist fetch ever occurs on normal music playback.
+            let liveTrack: ApoloTrack
+            if LiveStationPlaylist.isPlaylist(
+                track.url, hint: track.sourceMIMEType
+            ) {
+                do {
+                    let endpoint = try await LivePlaylistResolver.resolve(
+                        url: track.url,
+                        headers: track.httpHeaders,
+                        hint: track.sourceMIMEType
+                    )
+                    guard epoch == loadEpoch, liveShouldPlay else { return }
+                    let safeHeaders = LiveStationPlaylist.sameOrigin(
+                        track.url, endpoint
+                    ) ? track.httpHeaders : [:]
+                    liveTrack = ApoloTrack(
+                        url: endpoint,
+                        httpHeaders: safeHeaders,
+                        metadata: track.metadata,
+                        // Never send a playlist MIME hint to the audio decoder.
+                        sourceMIMEType: nil,
+                        streamMode: .live
+                    )
+                } catch {
+                    guard epoch == loadEpoch, liveShouldPlay else { return }
+                    let cancellation = LiveStreamCancellation()
+                    if case LivePlaylistResolver.Failure.httpStatus(let status) = error {
+                        cancellation.recordHTTPStatus(status)
+                    }
+                    liveCancellation = cancellation
+                    apply(.failed("Could not resolve live station playlist"))
+                    throw error
+                }
+            } else {
+                liveTrack = track
+            }
+            if Self.supportsNativeLive(liveTrack.url, hint: liveTrack.sourceMIMEType) {
                 guard epoch == loadEpoch else { return }
                 try? session.activateMultichannel()
                 metadataGainDB = nil
                 applyProcessing()
                 route = .avPlayer
                 libavHost?.stop()
-                await host.loadLive(track: track)
+                await host.loadLive(track: liveTrack)
                 refreshNowPlaying()
                 return
             }
 
-            guard Self.supportsFFmpegLive(track.url, hint: track.sourceMIMEType) else {
+            guard Self.supportsFFmpegLive(liveTrack.url, hint: liveTrack.sourceMIMEType) else {
                 host.stop()
                 libavHost?.stop()
                 state = .failed("Unsupported live radio format")
@@ -264,8 +302,8 @@ public final class ApoloEngine {
             do {
                 source = try await Task.detached(priority: .userInitiated) {
                     try OpenedSource.open(
-                        url: track.url,
-                        httpHeaders: track.httpHeaders,
+                        url: liveTrack.url,
+                        httpHeaders: liveTrack.httpHeaders,
                         isLive: true,
                         onICYTitle: onTitle,
                         liveCancellation: cancellation
