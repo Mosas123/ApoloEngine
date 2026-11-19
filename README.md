@@ -53,7 +53,7 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 ## Install
 
 ```swift
-.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.0")
+.package(url: "https://github.com/Mosas123/ApoloEngine", from: "0.1.1")
 ```
 
 ## Use
