@@ -54,7 +54,10 @@ final class OpenedSource: @unchecked Sendable {
                     url: url,
                     headers: httpHeaders,
                     configuration: sessionConfiguration,
-                    onICYTitle: onICYTitle
+                    onICYTitle: onICYTitle,
+                    onHTTPStatus: { status in
+                        liveCancellation?.recordHTTPStatus(status)
+                    }
                 )
                 // Register before starting the request/probe so stop() can
                 // interrupt a blocking FFmpeg read immediately.
