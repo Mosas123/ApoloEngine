@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import Darwin
 import Foundation
 import AetherLibavcodec
 import AetherLibavformat
@@ -18,7 +19,7 @@ final class AudioDecoder {
     // Reused across buffers: allocating one packet/frame per read is pure churn.
     private var packet: UnsafeMutablePointer<AVPacket>?
     private var frame: UnsafeMutablePointer<AVFrame>?
-    private var scratch: [UInt8] = []
+    private var readyBuffers: [CMSampleBuffer] = []
     private var resampler: OpaquePointer?
     private var streamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 1)
@@ -47,9 +48,6 @@ final class AudioDecoder {
     /// monotonic across tracks.
     var startOffsetSeconds: Double = 0
 
-    private var pendingBytes: [UInt8] = []
-    private var pendingSamples = 0
-    private var pendingStartPTS: CMTime = .invalid
     private var runningSamples: Int64 = 0
     private var decoderDrained = false
     private var resamplerFlushed = false
@@ -152,6 +150,9 @@ final class AudioDecoder {
 
     /// Returns the next buffer, decoded or compressed, or nil at end of stream.
     func readNextBuffer() -> CMSampleBuffer? {
+        if !readyBuffers.isEmpty {
+            return readyBuffers.removeFirst()
+        }
         switch passthroughMode {
         case .decode:
             return readDecodedBuffer()
@@ -162,18 +163,22 @@ final class AudioDecoder {
 
     private func readDecodedBuffer() -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
-
         guard let packet = ensurePacket() else { return nil }
 
         while true {
+            if !readyBuffers.isEmpty {
+                return readyBuffers.removeFirst()
+            }
             if reachedEnd {
                 if !decoderDrained {
                     decoderDrained = true
                     _ = avcodec_send_packet(codecContext, nil)
-                    if let buffer = drain(codecContext) { return buffer }
+                    drain(codecContext)
+                    if !readyBuffers.isEmpty { continue }
                 }
                 if !resamplerFlushed {
-                    return flushResampler()
+                    flushResampler()
+                    if !readyBuffers.isEmpty { continue }
                 }
                 return nil
             }
@@ -189,13 +194,10 @@ final class AudioDecoder {
                 continue
             }
 
-            let result = send(packet, to: codecContext)
+            let accepted = send(packet, to: codecContext)
             av_packet_unref(packet)
-            if !result.accepted {
+            if !accepted {
                 continue
-            }
-            if let buffer = result.buffer {
-                return buffer
             }
         }
     }
@@ -205,18 +207,20 @@ final class AudioDecoder {
     private func send(
         _ packet: UnsafePointer<AVPacket>,
         to context: UnsafeMutablePointer<AVCodecContext>
-    ) -> (buffer: CMSampleBuffer?, accepted: Bool) {
+    ) -> Bool {
         let first = avcodec_send_packet(context, packet)
         if first >= 0 {
-            return (drain(context), true)
+            drain(context)
+            return true
         }
 
-        let drained = drain(context)
+        drain(context)
         let second = avcodec_send_packet(context, packet)
         if second < 0 {
-            return (drained, false)
+            return false
         }
-        return (drained ?? drain(context), true)
+        drain(context)
+        return true
     }
 
     private func readCompressedBuffer() -> CMSampleBuffer? {
@@ -262,10 +266,10 @@ final class AudioDecoder {
                     passthroughMode = .passthrough
                 } else {
                     passthroughMode = .decode
-                    let result = send(packet, to: codecContext)
+                    let accepted = send(packet, to: codecContext)
                     av_packet_unref(packet)
-                    if result.accepted, let buffer = result.buffer {
-                        return buffer
+                    if accepted, !readyBuffers.isEmpty {
+                        return readyBuffers.removeFirst()
                     }
                     return readDecodedBuffer()
                 }
@@ -336,7 +340,7 @@ final class AudioDecoder {
         resamplerFlushed = false
         runningSamples = 0
         seekTargetTicks = target
-        resetPending()
+        readyBuffers.removeAll()
     }
 
     func close() {
@@ -347,7 +351,7 @@ final class AudioDecoder {
         if frame != nil {
             av_frame_free(&frame)
         }
-        scratch.removeAll()
+        readyBuffers.removeAll()
         if resampler != nil {
             swr_free(&resampler)
         }
@@ -365,13 +369,10 @@ final class AudioDecoder {
         passthroughMode = .decode
         decoderDrained = false
         resamplerFlushed = false
-        resetPending()
     }
 
-    private func drain(_ context: UnsafeMutablePointer<AVCodecContext>) -> CMSampleBuffer? {
-        guard let frame = ensureFrame() else { return nil }
-
-        resetPending()
+    private func drain(_ context: UnsafeMutablePointer<AVCodecContext>) {
+        guard let frame = ensureFrame() else { return }
 
         while avcodec_receive_frame(context, frame) >= 0 {
             if resampler == nil, !makeResampler(from: frame) {
@@ -379,8 +380,6 @@ final class AudioDecoder {
             }
             append(frame)
         }
-
-        return makeSampleBuffer()
     }
 
     private func makeResampler(from frame: UnsafeMutablePointer<AVFrame>) -> Bool {
@@ -454,11 +453,6 @@ final class AudioDecoder {
         return frame
     }
 
-    private func reserveScratch(_ count: Int) {
-        guard scratch.count < count else { return }
-        scratch = [UInt8](repeating: 0, count: count)
-    }
-
     private func append(_ frame: UnsafeMutablePointer<AVFrame>) {
         if let target = seekTargetTicks, frame.pointee.pts != Int64.min {
             if frame.pointee.pts < target { return }
@@ -473,26 +467,33 @@ final class AudioDecoder {
         guard outputSamples > 0 else { return }
 
         let bytesPerFrame = Int(channels) * 4
-        reserveScratch(outputSamples * bytesPerFrame)
-        let converted: Int32 = scratch.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return 0 }
-            var output: UnsafeMutablePointer<UInt8>? = base.assumingMemoryBound(to: UInt8.self)
-            return withUnsafeMutablePointer(to: &output) { outputPointer in
-                let source = UnsafePointer<UnsafePointer<UInt8>?>(
-                    OpaquePointer(frame.pointee.extended_data)
-                )
-                return swr_convert(
-                    resampler,
-                    outputPointer,
-                    Int32(outputSamples),
-                    source,
-                    samples
-                )
-            }
+        guard let memory = malloc(outputSamples * bytesPerFrame) else {
+            return
         }
-        guard converted > 0 else { return }
+        var output: UnsafeMutablePointer<UInt8>? = memory
+            .assumingMemoryBound(to: UInt8.self)
+        let converted: Int32 = withUnsafeMutablePointer(to: &output) {
+            outputPointer in
+            let source = UnsafePointer<UnsafePointer<UInt8>?>(
+                OpaquePointer(frame.pointee.extended_data)
+            )
+            return swr_convert(
+                resampler,
+                outputPointer,
+                Int32(outputSamples),
+                source,
+                samples
+            )
+        }
+        guard converted > 0 else {
+            free(memory)
+            return
+        }
 
-        processIfNeeded(&scratch, frames: Int(converted))
+        processIfNeeded(
+            memory.assumingMemoryBound(to: UInt8.self),
+            frames: Int(converted)
+        )
 
         let ticks = frame.pointee.pts == Int64.min
             ? runningSamples
@@ -501,145 +502,135 @@ final class AudioDecoder {
                 timeBase,
                 AVRational(num: 1, den: sampleRate)
             )
-        commit(
-            scratch: scratch,
-            converted: Int(converted),
+        runningSamples += Int64(converted)
+
+        if let buffer = makeSampleBuffer(
+            memory: memory,
+            byteCount: Int(converted) * bytesPerFrame,
+            samples: Int(converted),
             startTicks: ticks
-        )
+        ) {
+            readyBuffers.append(buffer)
+        }
     }
 
     /// Pushes whatever resampler tail is still buffered when the decoder hits
     /// EOF. Without this the last few milliseconds of every track are lost.
-    private func flushResampler() -> CMSampleBuffer? {
-        guard let resampler, !resamplerFlushed else { return nil }
+    private func flushResampler() {
+        guard let resampler, !resamplerFlushed else { return }
         resamplerFlushed = true
 
         let outputSamples = Int(swr_get_out_samples(resampler, 0))
-        guard outputSamples > 0 else { return nil }
+        guard outputSamples > 0 else { return }
 
         let bytesPerFrame = Int(channels) * 4
-        reserveScratch(outputSamples * bytesPerFrame)
-        let converted: Int32 = scratch.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return 0 }
-            var output: UnsafeMutablePointer<UInt8>? = base.assumingMemoryBound(to: UInt8.self)
-            return withUnsafeMutablePointer(to: &output) { outputPointer in
-                swr_convert(
-                    resampler,
-                    outputPointer,
-                    Int32(outputSamples),
-                    nil,
-                    0
-                )
-            }
+        guard let memory = malloc(outputSamples * bytesPerFrame) else {
+            return
         }
-        guard converted > 0 else { return nil }
+        var output: UnsafeMutablePointer<UInt8>? = memory
+            .assumingMemoryBound(to: UInt8.self)
+        let converted: Int32 = withUnsafeMutablePointer(to: &output) {
+            outputPointer in
+            swr_convert(
+                resampler,
+                outputPointer,
+                Int32(outputSamples),
+                nil,
+                0
+            )
+        }
+        guard converted > 0 else {
+            free(memory)
+            return
+        }
 
-        processIfNeeded(&scratch, frames: Int(converted))
-        commit(
-            scratch: scratch,
-            converted: Int(converted),
-            startTicks: runningSamples
+        processIfNeeded(
+            memory.assumingMemoryBound(to: UInt8.self),
+            frames: Int(converted)
         )
-        return makeSampleBuffer()
+
+        let ticks = runningSamples
+        runningSamples += Int64(converted)
+
+        if let buffer = makeSampleBuffer(
+            memory: memory,
+            byteCount: Int(converted) * bytesPerFrame,
+            samples: Int(converted),
+            startTicks: ticks
+        ) {
+            readyBuffers.append(buffer)
+        }
     }
 
     private func processIfNeeded(
-        _ scratch: inout [UInt8],
+        _ pointer: UnsafeMutablePointer<UInt8>,
         frames: Int
     ) {
         guard let chain = processingChain else { return }
-        scratch.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            chain.process(
-                interleaved: base.assumingMemoryBound(to: Float.self),
-                frames: frames
-            )
-        }
-    }
-
-    private func commit(scratch: [UInt8], converted: Int, startTicks: Int64) {
-        if pendingSamples == 0 {
-            pendingStartPTS = CMTime(value: startTicks, timescale: sampleRate)
-                + CMTime(seconds: startOffsetSeconds, preferredTimescale: 600)
-        }
-
-        let bytesPerFrame = Int(channels) * 4
-        pendingBytes.append(contentsOf: scratch.prefix(converted * bytesPerFrame))
-        pendingSamples += converted
-        runningSamples += Int64(converted)
-    }
-
-    private func makeSampleBuffer() -> CMSampleBuffer? {
-        guard pendingSamples > 0,
-              let formatDescription,
-              !pendingBytes.isEmpty
-        else { return nil }
-
-        let totalBytes = pendingBytes.count
-        let totalSamples = pendingSamples
-        let startPTS = pendingStartPTS
-
-        var blockBuffer: CMBlockBuffer?
-        var status = CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault,
-            memoryBlock: nil,
-            blockLength: totalBytes,
-            blockAllocator: kCFAllocatorDefault,
-            customBlockSource: nil,
-            offsetToData: 0,
-            dataLength: totalBytes,
-            flags: 0,
-            blockBufferOut: &blockBuffer
+        chain.process(
+            interleaved: pointer.assumingMemoryBound(to: Float.self),
+            frames: frames
         )
-        guard status == kCMBlockBufferNoErr, let block = blockBuffer else {
-            resetPending()
+    }
+
+    /// Hands the freshly converted PCM to CoreMedia without an intermediate
+    /// copy. The block buffer takes ownership and frees it with `free`.
+    /// On every failure path the memory is already released here.
+    private func makeSampleBuffer(
+        memory: UnsafeMutableRawPointer,
+        byteCount: Int,
+        samples: Int,
+        startTicks: Int64
+    ) -> CMSampleBuffer? {
+        guard let formatDescription, byteCount > 0, samples > 0 else {
+            free(memory)
             return nil
         }
 
-        status = pendingBytes.withUnsafeBytes { bytes -> OSStatus in
-            guard let base = bytes.baseAddress else { return -1 }
-            return CMBlockBufferReplaceDataBytes(
-                with: base,
-                blockBuffer: block,
-                offsetIntoDestination: 0,
-                dataLength: totalBytes
-            )
-        }
-        guard status == kCMBlockBufferNoErr else {
-            resetPending()
+        var blockBuffer: CMBlockBuffer?
+        let blockStatus = CMBlockBufferCreateWithMemoryBlock(
+            allocator: kCFAllocatorDefault,
+            memoryBlock: memory,
+            blockLength: byteCount,
+            blockAllocator: kCFAllocatorDefault,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: byteCount,
+            flags: 0,
+            blockBufferOut: &blockBuffer
+        )
+        guard blockStatus == kCMBlockBufferNoErr, let block = blockBuffer else {
+            free(memory)
             return nil
         }
 
         var timing = CMSampleTimingInfo(
             duration: CMTime(value: 1, timescale: sampleRate),
-            presentationTimeStamp: startPTS,
+            presentationTimeStamp: CMTime(value: startTicks, timescale: sampleRate)
+                + CMTime(seconds: startOffsetSeconds, preferredTimescale: 600),
             decodeTimeStamp: .invalid
         )
 
         var sampleBuffer: CMSampleBuffer?
-        status = CMSampleBufferCreate(
+        let status = CMSampleBufferCreate(
             allocator: kCFAllocatorDefault,
             dataBuffer: block,
             dataReady: true,
             makeDataReadyCallback: nil,
             refcon: nil,
             formatDescription: formatDescription,
-            sampleCount: CMItemCount(totalSamples),
+            sampleCount: CMItemCount(samples),
             sampleTimingEntryCount: 1,
             sampleTimingArray: &timing,
             sampleSizeEntryCount: 0,
             sampleSizeArray: nil,
             sampleBufferOut: &sampleBuffer
         )
-        resetPending()
-        guard status == noErr else { return nil }
+        guard status == noErr else {
+            // The block buffer owns and will free the memory.
+            return nil
+        }
         return sampleBuffer
-    }
-
-    private func resetPending() {
-        pendingBytes.removeAll(keepingCapacity: true)
-        pendingSamples = 0
-        pendingStartPTS = .invalid
     }
 
     /// The layout the resampler writes. Everything is FFmpeg's default except
