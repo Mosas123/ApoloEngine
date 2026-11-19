@@ -138,6 +138,31 @@ radio station or the exact CFNetwork parsing behavior on iPhone.
 network handovers, and measured memory/energy. Normal HTTP status and TLS
 validation remain on URLSession; do not ship v6 before these validations.
 
+## Phase 2F — stale-callback fencing and bounded transport stress (draft v7)
+
+A reconnect or station switch must not let a previous FFmpeg decoder's
+pending callbacks rewrite the new playback state.
+
+- Each `LibavcodecAudioHost` load receives the engine's `loadEpoch`. Its
+  state, elapsed-time and queue-advance callbacks carry a session identifier;
+  the engine discards any callback whose epoch or audio route is stale.
+- The callback epoch is stored behind a lock so it can also be read safely
+  from the synchronizer's periodic main-queue time observer.
+- The retry counter resets only after 60 seconds of **confirmed** playing,
+  never merely after a successful HTTP connection; the 1/2/4-second retry
+  schedule and three-attempt cap are unchanged.
+- Unit coverage checks stale epoch rejection (including rollover), the
+  60-second threshold, and a full local FFmpeg load using a tagged callback.
+- Ring-buffer stress sends over 3 MiB of patterned audio in variable chunks
+  through a **4 KiB** buffer, validating ordering and bounded occupancy.
+  This is a deterministic stress fixture, *not* a measured process-memory
+  or battery benchmark.
+
+**Not yet validated:** actual Wi-Fi/cellular transitions, hours-long playback
+in the background, memory allocations under Instruments, AirPods/AirPlay route
+changes, repeated device disconnects, or production station behavior.
+Thrum remains on MPVKit for radio until real-device acceptance is complete.
+
 ## Phase 3 — integration and acceptance
 
 After the engine's transport APIs and on-device validations are ready, make live radio an opt-in route in Thrum, retaining an MPVKit fallback until confidence is high. Acceptance tests:
