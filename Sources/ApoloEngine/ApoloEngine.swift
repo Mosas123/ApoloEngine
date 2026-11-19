@@ -270,8 +270,11 @@ public final class ApoloEngine {
                         url: endpoint,
                         httpHeaders: safeHeaders,
                         metadata: track.metadata,
-                        // Never send a playlist MIME hint to the audio decoder.
-                        sourceMIMEType: nil,
+                        // Strip playlist MIME, but keep an explicit legacy
+                        // ICY transport override after resolving an M3U/PLS.
+                        sourceMIMEType: Self.isLegacyICYHint(
+                            track.sourceMIMEType
+                        ) ? track.sourceMIMEType : nil,
                         streamMode: .live
                     )
                 } catch {
