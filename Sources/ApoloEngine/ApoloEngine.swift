@@ -668,6 +668,9 @@ public final class ApoloEngine {
         guard scheme == "http" || scheme == "https" else { return false }
         let ext = url.pathExtension.lowercased()
         guard !["pls", "m3u", "xspf", "asx"].contains(ext) else { return false }
+        // Explicit compatibility hint only. Normal live MP3/AAC keeps its
+        // established AVFoundation path unless the caller opts into raw ICY.
+        if Self.isLegacyICYHint(hint) { return false }
         return !shouldUseFFmpegForRemote(url, hint: hint)
     }
 
@@ -682,7 +685,16 @@ public final class ApoloEngine {
         guard !["m3u", "m3u8", "pls", "xspf", "asx"].contains(ext) else {
             return false
         }
-        return shouldUseFFmpegForRemote(url, hint: hint)
+        return isLegacyICYHint(hint)
+            || shouldUseFFmpegForRemote(url, hint: hint)
+    }
+
+    /// Force FFmpeg's live transport for a station known to use a non-HTTP
+    /// ICY response line. This is not applied to normal on-demand audio.
+    nonisolated private static func isLegacyICYHint(_ hint: String?) -> Bool {
+        let type = (hint ?? "").lowercased()
+            .split(separator: ";", maxSplits: 1).first.map(String.init) ?? ""
+        return type == "application/x-icy" || type == "audio/x-icy"
     }
 
     /// True when a remote URL must go through FFmpeg. Local files are never
