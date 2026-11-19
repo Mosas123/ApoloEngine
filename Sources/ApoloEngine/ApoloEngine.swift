@@ -35,6 +35,10 @@ public final class ApoloEngine {
     /// overwrite the engine after the user moved on.
     private var loadEpoch: UInt64 = 0
 
+    /// Standalone engines own the system controls; embedded engines can defer
+    /// command and metadata publishing to their host application.
+    private let managesSystemMediaControls: Bool
+    private let managesAudioSession: Bool
     private let host = AVPlayerHost()
     private let session = AudioSessionController()
     private let nowPlaying = NowPlayingController()
@@ -50,7 +54,15 @@ public final class ApoloEngine {
     public var nextTracks: [ApoloTrack] { queue.upcoming }
     public var currentTrack: ApoloTrack? { queue.current }
 
-    public init() {
+    /// Set both ownership flags to false when embedded in an application that
+    /// already owns remote commands, Now Playing and AVAudioSession (Thrum).
+    /// The defaults preserve the standalone ApoloEngine behavior.
+    public init(
+        managesSystemMediaControls: Bool = true,
+        managesAudioSession: Bool = true
+    ) {
+        self.managesSystemMediaControls = managesSystemMediaControls
+        self.managesAudioSession = managesAudioSession
         host.onState = { [weak self] state in
             self?.apply(state)
         }
@@ -66,9 +78,12 @@ public final class ApoloEngine {
         nowPlaying.onSeek = { [weak self] time in
             Task { await self?.seek(to: time) }
         }
-        nowPlaying.activate()
+        if managesSystemMediaControls {
+            nowPlaying.activate()
+        }
 
-        session.onInterruptionBegan = { [weak self] in
+        if managesAudioSession {
+            session.onInterruptionBegan = { [weak self] in
             guard let self else { return }
             self.resumeAfterInterruption = self.state == .playing
             if self.resumeAfterInterruption {
@@ -82,9 +97,10 @@ public final class ApoloEngine {
             self.resumeAfterInterruption = false
             self.play()
         }
-        session.onRouteLost = { [weak self] in
-            self?.resumeAfterInterruption = false
-            self?.pauseInternal()
+            session.onRouteLost = { [weak self] in
+                self?.resumeAfterInterruption = false
+                self?.pauseInternal()
+            }
         }
 
         libavHost = LibavcodecAudioHost(
@@ -158,7 +174,7 @@ public final class ApoloEngine {
         // full codec/container probe.
         if isRemote(track.url) && !isExoticRemote(track.url) {
             guard epoch == loadEpoch else { return }
-            try? session.activateMultichannel()
+            if managesAudioSession { try? session.activateMultichannel() }
             metadataGainDB = nil
             applyProcessing()
             route = .avPlayer
@@ -235,7 +251,7 @@ public final class ApoloEngine {
 
         // A session failure degrades Spatial Audio, it must not strand the
         // engine in `.loading`.
-        try? session.activateMultichannel()
+        if managesAudioSession { try? session.activateMultichannel() }
 
         metadataGainDB = info.trackGainDB
         applyProcessing()
@@ -360,11 +376,13 @@ public final class ApoloEngine {
     }
 
     public func stop() {
+        // Invalidate a suspended probe so it cannot start after Stop.
+        loadEpoch &+= 1
         host.stop()
         libavHost?.stop()
         route = .avPlayer
-        session.deactivate()
-        nowPlaying.clear()
+        if managesAudioSession { session.deactivate() }
+        if managesSystemMediaControls { nowPlaying.clear() }
         media = nil
         elapsed = 0
         state = .idle
@@ -433,7 +451,7 @@ public final class ApoloEngine {
     }
 
     private func refreshNowPlaying() {
-        guard let metadata else { return }
+        guard managesSystemMediaControls, let metadata else { return }
         nowPlaying.update(
             title: metadata.title,
             artist: metadata.artist,
