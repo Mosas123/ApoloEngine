@@ -24,8 +24,15 @@ final class AudioSessionController {
                 object: nil,
                 queue: .main
             ) { [weak self] notification in
+                guard let info = notification.userInfo,
+                      let typeRaw = info[AVAudioSessionInterruptionTypeKey] as? UInt
+                else { return }
+                let optionsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
                 MainActor.assumeIsolated {
-                    self?.handleInterruption(notification)
+                    self?.handleInterruption(
+                        typeRaw: typeRaw,
+                        optionsRaw: optionsRaw
+                    )
                 }
             }
         )
@@ -35,8 +42,11 @@ final class AudioSessionController {
                 object: nil,
                 queue: .main
             ) { [weak self] notification in
+                guard let reasonRaw = notification
+                    .userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+                else { return }
                 MainActor.assumeIsolated {
-                    self?.handleRouteChange(notification)
+                    self?.handleRouteChange(reasonRaw: reasonRaw)
                 }
             }
         )
@@ -52,17 +62,15 @@ final class AudioSessionController {
         try? session.setActive(false, options: [.notifyOthersOnDeactivation])
     }
 
-    private func handleInterruption(_ notification: Notification) {
-        guard let info = notification.userInfo,
-              let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: raw)
-        else { return }
+    private func handleInterruption(typeRaw: UInt, optionsRaw: UInt) {
+        guard let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
+            return
+        }
 
         switch type {
         case .began:
             onInterruptionBegan?()
         case .ended:
-            let optionsRaw = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
             let options = AVAudioSession.InterruptionOptions(rawValue: optionsRaw)
             onInterruptionEnded?(options.contains(.shouldResume))
         @unknown default:
@@ -70,10 +78,8 @@ final class AudioSessionController {
         }
     }
 
-    private func handleRouteChange(_ notification: Notification) {
-        guard let info = notification.userInfo,
-              let raw = info[AVAudioSessionRouteChangeReasonKey] as? UInt,
-              let reason = AVAudioSession.RouteChangeReason(rawValue: raw)
+    private func handleRouteChange(reasonRaw: UInt) {
+        guard let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
         else { return }
 
         if reason == .oldDeviceUnavailable {
