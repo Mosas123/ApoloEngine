@@ -26,5 +26,13 @@ targets:
         TARGETED_DEVICE_FAMILY: "1"
         IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         GENERATE_INFOPLIST_FILE: "NO"
-    scheme:
-      testTargets: []
+
+schemes:
+  RTLMetadataHarness:
+    build:
+      targets:
+        RTLMetadataHarness: all
+    run:
+      config: Debug
+    archive:
+      config: Release
