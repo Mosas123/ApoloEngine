@@ -842,8 +842,10 @@ public final class ApoloEngine {
                 if livePlayingSince == nil { livePlayingSince = Date() }
                 cancelLiveReconnect()
             case .failed:
-                if let since = livePlayingSince,
-                   Date().timeIntervalSince(since) >= LiveRetryPolicy.resetAfterPlaying {
+                if LiveRetryPolicy.shouldResetBudget(
+                    playingSince: livePlayingSince,
+                    now: Date()
+                ) {
                     liveRetryAttempts = 0
                 }
                 livePlayingSince = nil
