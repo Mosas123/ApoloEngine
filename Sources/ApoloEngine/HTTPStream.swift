@@ -185,7 +185,10 @@ final class HTTPStream: @unchecked Sendable {
                 case 206:
                     guard let range = Self.parseContentRange(
                         http.value(forHTTPHeaderField: "Content-Range")
-                    ), range.start == start, !data.isEmpty else {
+                    ), range.start == start,
+                       range.end >= range.start,
+                       Int64(data.count) == range.end - range.start + 1,
+                       (range.total == nil || range.end < range.total!) else {
                         fail(URLError(.badServerResponse))
                         return false
                     }
@@ -292,17 +295,18 @@ final class HTTPStream: @unchecked Sendable {
     /// `"bytes 0-1048575/5000000"` -> (start: 0, total: 5000000).
     static func parseContentRange(
         _ value: String?
-    ) -> (start: Int64, total: Int64?)? {
+    ) -> (start: Int64, end: Int64, total: Int64?)? {
         guard let value else { return nil }
         let parts = value.split(separator: " ")
         guard parts.count == 2 else { return nil }
         let halves = parts[1].split(separator: "/")
         guard halves.count == 2 else { return nil }
         let bounds = halves[0].split(separator: "-")
-        guard bounds.count == 2, let start = Int64(bounds[0]) else {
-            return nil
-        }
-        return (start, Int64(halves[1]))
+        guard bounds.count == 2,
+              let start = Int64(bounds[0]),
+              let end = Int64(bounds[1]),
+              start >= 0, end >= start else { return nil }
+        return (start, end, Int64(halves[1]))
     }
 }
 
