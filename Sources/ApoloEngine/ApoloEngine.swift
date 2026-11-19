@@ -3,9 +3,9 @@ import Observation
 
 /// Music and streaming engine.
 ///
-/// AVFoundation is the playback engine for the codecs it handles. Everything
-/// else goes through FFmpeg into an `AVSampleBufferAudioRenderer`, which keeps
-/// Spatial Audio and Atmos available on the same session.
+/// AVFoundation plays the codecs it handles. Everything else goes through
+/// FFmpeg into an `AVSampleBufferAudioRenderer`, so Spatial Audio and Atmos
+/// stay available on both routes.
 ///
 /// Create one instance and keep it for the app's lifetime.
 @MainActor
@@ -15,8 +15,8 @@ public final class ApoloEngine {
     public private(set) var media: MediaInfo?
     public private(set) var elapsed: TimeInterval = 0
 
-    /// Five-band EQ. Applied on the libavcodec route; the AVPlayer route
-    /// ignores it until the tap lands.
+    /// Five-band EQ. Applied on both routes: the libavcodec chain and the
+    /// AVPlayer `MTAudioProcessingTap`.
     public var equalizer: EqualizerSettings = .flat {
         didSet { applyProcessing() }
     }
