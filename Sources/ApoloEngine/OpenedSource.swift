@@ -55,7 +55,7 @@ final class OpenedSource: @unchecked Sendable {
                     headers: httpHeaders,
                     configuration: sessionConfiguration,
                     onICYTitle: onICYTitle,
-                    onHTTPStatus: { status in
+                    onHTTPStatus: { [weak liveCancellation] status in
                         liveCancellation?.recordHTTPStatus(status)
                     }
                 )
