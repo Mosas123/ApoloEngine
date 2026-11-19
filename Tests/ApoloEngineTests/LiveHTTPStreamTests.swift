@@ -65,6 +65,31 @@ final class LiveHTTPStreamTests: XCTestCase {
         XCTAssertEqual(stream.bufferedBytes, 0)
     }
 
+    func test403MarksCancellationTokenAsTerminal() {
+        MockLiveURLProtocol.payload = [Data()]
+        MockLiveURLProtocol.headers = ["Content-Type": "audio/ogg"]
+        MockLiveURLProtocol.statusCode = 403
+
+        let token = LiveStreamCancellation()
+        let stream = LiveHTTPStream(
+            url: URL(string: "https://radio.mock/restricted")!,
+            headers: [:],
+            capacity: 32,
+            configuration: configuration(),
+            onHTTPStatus: { token.recordHTTPStatus($0) }
+        )
+        token.register(stream)
+        stream.start()
+        defer { token.cancel() }
+
+        var bytes = [UInt8](repeating: 0, count: 8)
+        XCTAssertEqual(bytes.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 8)
+        }, 0)
+        XCTAssertEqual(token.terminalHTTPStatus, 403)
+        XCTAssertTrue(stream.hasError)
+    }
+
     private func configuration() -> URLSessionConfiguration {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockLiveURLProtocol.self]
