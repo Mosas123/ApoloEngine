@@ -124,26 +124,45 @@ public final class ApoloEngine {
         libavHost = LibavcodecAudioHost(
             onState: { [weak self] state, epoch in
                 Task { @MainActor [weak self] in
-                    guard let self, self.route == .libavcodec,
-                          self.loadEpoch == epoch else { return }
+                    guard let self, Self.acceptsDecoderCallback(
+                        callbackEpoch: epoch,
+                        engineEpoch: self.loadEpoch,
+                        route: self.route
+                    ) else { return }
                     self.apply(state)
                 }
             },
             onTime: { [weak self] time, epoch in
                 Task { @MainActor [weak self] in
-                    guard let self, self.route == .libavcodec,
-                          self.loadEpoch == epoch else { return }
+                    guard let self, Self.acceptsDecoderCallback(
+                        callbackEpoch: epoch,
+                        engineEpoch: self.loadEpoch,
+                        route: self.route
+                    ) else { return }
                     self.elapsed = time
                 }
             },
             onTrackChange: { [weak self] track, epoch in
                 Task { @MainActor [weak self] in
-                    guard let self, self.route == .libavcodec,
-                          self.loadEpoch == epoch else { return }
+                    guard let self, Self.acceptsDecoderCallback(
+                        callbackEpoch: epoch,
+                        engineEpoch: self.loadEpoch,
+                        route: self.route
+                    ) else { return }
                     self.advance(to: track)
                 }
             }
         )
+    }
+
+    /// All queued libavcodec callbacks carry the source epoch. This prevents
+    /// a previously cancelled station or song from changing the new state.
+    nonisolated static func acceptsDecoderCallback(
+        callbackEpoch: UInt64,
+        engineEpoch: UInt64,
+        route: AudioRoute
+    ) -> Bool {
+        route == .libavcodec && callbackEpoch == engineEpoch
     }
 
     public var currentTime: TimeInterval {
