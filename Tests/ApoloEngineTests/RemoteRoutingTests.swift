@@ -36,6 +36,40 @@ final class RemoteRoutingTests: XCTestCase {
         )
     }
 
+    func testNativeLiveSupportsHLSAndContinuousAppleAudio() {
+        XCTAssertTrue(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/live.m3u8")!,
+            hint: "application/vnd.apple.mpegurl"
+        ))
+        XCTAssertTrue(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/listen.mp3")!,
+            hint: "audio/mpeg"
+        ))
+        XCTAssertTrue(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/stream")!,
+            hint: "audio/aac"
+        ))
+    }
+
+    func testNativeLiveRejectsUnsupportedOrPlaylistSources() {
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/live.ogg")!,
+            hint: "audio/ogg"
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/playlist.pls")!
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            URL(string: "https://radio.example/listen.m3u")!
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            URL(fileURLWithPath: "/tmp/live.mp3")
+        ))
+        XCTAssertFalse(ApoloEngine.supportsNativeLive(
+            URL(string: "ftp://radio.example/stream.mp3")!
+        ))
+    }
+
     func testOpaqueRemoteURLNeedsAHint() {
         let opaque = URL(string: "https://cdn.example/stream?token=x")!
         XCTAssertFalse(ApoloEngine.shouldUseFFmpegForRemote(opaque))
