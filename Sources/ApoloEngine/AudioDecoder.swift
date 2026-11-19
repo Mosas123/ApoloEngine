@@ -14,7 +14,7 @@ import AetherLibswresample
 /// host guarantees that.
 final class AudioDecoder {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
-    private var transport: HTTPTransport?
+    private var transport: (any AudioTransport)?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
     // Reused across buffers: allocating one packet/frame per read is pure churn.
     private var packet: UnsafeMutablePointer<AVPacket>?
