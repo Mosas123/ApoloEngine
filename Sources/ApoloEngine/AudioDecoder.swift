@@ -15,6 +15,10 @@ final class AudioDecoder {
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var transport: HTTPTransport?
     private var codecContext: UnsafeMutablePointer<AVCodecContext>?
+    // Reused across buffers: allocating one packet/frame per read is pure churn.
+    private var packet: UnsafeMutablePointer<AVPacket>?
+    private var frame: UnsafeMutablePointer<AVFrame>?
+    private var scratch: [UInt8] = []
     private var resampler: OpaquePointer?
     private var streamIndex: Int32 = -1
     private var timeBase = AVRational(num: 1, den: 1)
@@ -159,9 +163,7 @@ final class AudioDecoder {
     private func readDecodedBuffer() -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
 
-        var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
-        defer { av_packet_free(&packet) }
-        guard let packet else { return nil }
+        guard let packet = ensurePacket() else { return nil }
 
         while true {
             if reachedEnd {
@@ -220,9 +222,7 @@ final class AudioDecoder {
     private func readCompressedBuffer() -> CMSampleBuffer? {
         guard let formatContext, let codecContext else { return nil }
 
-        var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
-        defer { av_packet_free(&packet) }
-        guard let packet else { return nil }
+        guard let packet = ensurePacket() else { return nil }
 
         while true {
             if reachedEnd {
@@ -341,6 +341,13 @@ final class AudioDecoder {
 
     func close() {
         seekTargetTicks = nil
+        if packet != nil {
+            av_packet_free(&packet)
+        }
+        if frame != nil {
+            av_frame_free(&frame)
+        }
+        scratch.removeAll()
         if resampler != nil {
             swr_free(&resampler)
         }
@@ -362,9 +369,7 @@ final class AudioDecoder {
     }
 
     private func drain(_ context: UnsafeMutablePointer<AVCodecContext>) -> CMSampleBuffer? {
-        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
-        defer { av_frame_free(&frame) }
-        guard let frame else { return nil }
+        guard let frame = ensureFrame() else { return nil }
 
         resetPending()
 
@@ -434,6 +439,26 @@ final class AudioDecoder {
         return true
     }
 
+    private func ensurePacket() -> UnsafeMutablePointer<AVPacket>? {
+        if let packet {
+            av_packet_unref(packet)
+            return packet
+        }
+        packet = av_packet_alloc()
+        return packet
+    }
+
+    private func ensureFrame() -> UnsafeMutablePointer<AVFrame>? {
+        if let frame { return frame }
+        frame = av_frame_alloc()
+        return frame
+    }
+
+    private func reserveScratch(_ count: Int) {
+        guard scratch.count < count else { return }
+        scratch = [UInt8](repeating: 0, count: count)
+    }
+
     private func append(_ frame: UnsafeMutablePointer<AVFrame>) {
         if let target = seekTargetTicks, frame.pointee.pts != Int64.min {
             if frame.pointee.pts < target { return }
@@ -448,7 +473,7 @@ final class AudioDecoder {
         guard outputSamples > 0 else { return }
 
         let bytesPerFrame = Int(channels) * 4
-        var scratch = [UInt8](repeating: 0, count: outputSamples * bytesPerFrame)
+        reserveScratch(outputSamples * bytesPerFrame)
         let converted: Int32 = scratch.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress else { return 0 }
             var output: UnsafeMutablePointer<UInt8>? = base.assumingMemoryBound(to: UInt8.self)
@@ -493,7 +518,7 @@ final class AudioDecoder {
         guard outputSamples > 0 else { return nil }
 
         let bytesPerFrame = Int(channels) * 4
-        var scratch = [UInt8](repeating: 0, count: outputSamples * bytesPerFrame)
+        reserveScratch(outputSamples * bytesPerFrame)
         let converted: Int32 = scratch.withUnsafeMutableBytes { raw in
             guard let base = raw.baseAddress else { return 0 }
             var output: UnsafeMutablePointer<UInt8>? = base.assumingMemoryBound(to: UInt8.self)
