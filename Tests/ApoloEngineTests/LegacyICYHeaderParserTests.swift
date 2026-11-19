@@ -7,7 +7,12 @@ final class LegacyICYHeaderParserTests: XCTestCase {
         let response = Data(
             "ICY 200 OK\r\nicy-name: Test FM\r\nicy-metaint: 4\r\nContent-Type: audio/ogg\r\n\r\nABCD".utf8
         )
-        for position in 1..<response.count {
+        // Every split while the ICY header is still incomplete must stay
+        // silent; body-only splits are a separate streaming concern.
+        let headerEnd = try XCTUnwrap(
+            response.range(of: Data([13, 10, 13, 10]))
+        ).upperBound
+        for position in 1..<headerEnd {
             var parser = LegacyICYHeaderParser()
             XCTAssertNil(try parser.consume(Data(response.prefix(position))))
             let result = try XCTUnwrap(
