@@ -61,6 +61,9 @@ public struct ApoloTrack: Sendable, Equatable {
     /// MIME from the resolver. It lets opaque signed URLs (no extension and no
     /// `mime` query) pick the right route.
     public let sourceMIMEType: String?
+    /// True for Dolby Atmos/E-AC3 streams. AVPlayer must keep them compressed,
+    /// so the processing tap is skipped.
+    public let isAtmos: Bool
 
     // Filled by the engine when the track is queued. They are playback
     // details, not identity, so equality ignores them.
@@ -72,12 +75,14 @@ public struct ApoloTrack: Sendable, Equatable {
         url: URL,
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
-        sourceMIMEType: String? = nil
+        sourceMIMEType: String? = nil,
+        isAtmos: Bool = false
     ) {
         self.url = url
         self.httpHeaders = httpHeaders
         self.metadata = metadata
         self.sourceMIMEType = sourceMIMEType
+        self.isAtmos = isAtmos
     }
 
     public static func == (lhs: ApoloTrack, rhs: ApoloTrack) -> Bool {

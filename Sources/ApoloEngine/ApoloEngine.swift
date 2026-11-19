@@ -164,13 +164,15 @@ public final class ApoloEngine {
         url: URL,
         httpHeaders: [String: String] = [:],
         metadata: NowPlayingMetadata? = nil,
-        sourceMIMEType: String? = nil
+        sourceMIMEType: String? = nil,
+        isAtmos: Bool = false
     ) async throws {
         let track = ApoloTrack(
             url: url,
             httpHeaders: httpHeaders,
             metadata: metadata,
-            sourceMIMEType: sourceMIMEType
+            sourceMIMEType: sourceMIMEType,
+            isAtmos: isAtmos
         )
         queue.start(track)
         loadEpoch &+= 1
