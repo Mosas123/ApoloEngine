@@ -67,7 +67,7 @@ final class AudioSessionController {
         try? session.setActive(false, options: [.notifyOthersOnDeactivation])
     }
 
-    private func handleInterruption(typeRaw: UInt, optionsRaw: UInt) {
+    func handleInterruption(typeRaw: UInt, optionsRaw: UInt) {
         guard let type = AVAudioSession.InterruptionType(rawValue: typeRaw) else {
             return
         }
@@ -83,7 +83,7 @@ final class AudioSessionController {
         }
     }
 
-    private func handleRouteChange(reasonRaw: UInt) {
+    func handleRouteChange(reasonRaw: UInt) {
         guard let reason = AVAudioSession.RouteChangeReason(rawValue: reasonRaw)
         else { return }
 

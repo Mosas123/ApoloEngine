@@ -104,11 +104,7 @@ public final class ApoloEngine {
             guard let self else { return }
             self.resumeAfterInterruption = self.state == .playing
             if self.resumeAfterInterruption {
-                if self.queue.current?.streamMode == .live {
-                    self.liveShouldPlay = false
-                    self.cancelLiveReconnect()
-                }
-                self.pauseInternal()
+                self.pauseForSystemEvent()
             }
         }
         session.onInterruptionEnded = { [weak self] shouldResume in
@@ -119,7 +115,10 @@ public final class ApoloEngine {
             self.play()
         }
         session.onRouteLost = { [weak self] in
-            self?.pause()
+            guard let self else { return }
+            if self.state == .playing || self.queue.current?.streamMode == .live {
+                self.pauseForSystemEvent()
+            }
         }
 
         libavHost = LibavcodecAudioHost(
@@ -528,6 +527,26 @@ public final class ApoloEngine {
 
     public func pause() {
         resumeAfterInterruption = false
+        if queue.current?.streamMode == .live {
+            liveShouldPlay = false
+            cancelLiveReconnect()
+            if livePlaylistResolverTask != nil {
+                livePlaylistResolverTask?.cancel()
+                livePlaylistResolverTask = nil
+                livePlaylistPausedInFlight = true
+                loadEpoch &+= 1
+            }
+            if case .loading = state {
+                liveCancellation?.cancel()
+            }
+        }
+        pauseInternal()
+    }
+
+    private func pauseForSystemEvent() {
+        // Interruption and route loss must stop live retries as well as the
+        // current renderer. Do not touch resumeAfterInterruption here: the
+        // interruption callback owns that decision.
         if queue.current?.streamMode == .live {
             liveShouldPlay = false
             cancelLiveReconnect()
