@@ -173,7 +173,9 @@ final class RTLMetadataModel: ObservableObject {
         let override = urlOverride.trimmingCharacters(in: .whitespacesAndNewlines)
         if !override.isEmpty {
             guard let url = URL(string: override) else { throw URLError(.badURL) }
-            event("STREAM_SOURCE userOverride=true urlRedacted=true")
+            let parts = url.pathComponents
+            let folder = parts.count >= 2 ? parts[parts.count - 2] : "-"
+            event("STREAM_SOURCE userOverride=true host=\(url.host ?? "-") source=\(folder)/\(url.lastPathComponent)")
             return url
         }
 
