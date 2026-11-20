@@ -31,6 +31,53 @@ Choose one variable at a time:
 
 The first unsafe observer mode must only be run after the user explicitly acknowledges the crash risk.
 
+## Malformed ID3 in the live RTL stream (Nov 19, 2026)
+
+Byte inspection of 11 consecutive RTL TS segments found the same **malformed
+ID3v2.4 tag** in every one:
+
+- `WXXX` frame size 138, but its URL is corrupted: `ht` + four stray bytes
+  (`47 03 e8 11`) + `tps://.../graf`.
+- The final `.jpg` sits **outside** the frame.
+- The next four bytes (`.jpg`) are then read as a frame id with a bogus size
+  of 183,905,368, overrunning the 422-byte tag.
+- Valid frames before it: `TIT2`, `TPE1`, `TRSN`, `TRSO`, `WORS`.
+
+This is metadata corruption from the broadcaster/encoder path, not Thrum or
+Apolo. It is a strong candidate for the AVFCore trigger; the isolated app is
+the only place to prove it.
+
+## Fixture A/B (same audio, different ID3)
+
+`Fixtures/` contains three single-segment HLS playlists built from the same TS
+packets:
+
+| Playlist | Metadata |
+|---|---|
+| `stripped.m3u8` | ID3 tag zeroed (no metadata) |
+| `fixed.m3u8` | `WXXX` rebuilt as a valid URL, padding zeroed |
+| `original.m3u8` | tag exactly as received (malformed `WXXX`) |
+
+Serve them on a LAN reachable by the iPhone:
+
+    python3 Experiments/RTLMetadataHarness/Fixtures/serve_fixtures.py
+
+Run **one item per cold launch** with metadata output ON:
+
+1. `http://<mac-lan-ip>:8765/stripped.m3u8`
+2. `http://<mac-lan-ip>:8765/fixed.m3u8`
+3. `http://<mac-lan-ip>:8765/original.m3u8`
+
+Do not re-run `original` in the same process after a crash. Capture one `.ips`
+per run. Interpret:
+
+- stripped OK + fixed OK + original crash → malformed `WXXX` is the trigger.
+- stripped OK + fixed crash → look at `PRIV`/timed groups/iOS, not the URL.
+- stripped crash → the output itself is unsafe regardless of payload.
+
+The harness bundle allows local HTTP for this fixture test only. A successful
+fixture run does not enable metadata in ApoloEngine or Thrum.
+
 ## Procedure
 
 1. Install as a **separate app** and start with metadata **OFF**, AVQueuePlayer, One load. Play RTL for 180 seconds, export event log.

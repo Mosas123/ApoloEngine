@@ -20,6 +20,10 @@ targets:
         UIBackgroundModes:
           - audio
         UILaunchScreen: {}
+        # Experiment only: the fixture server runs over plain HTTP on the LAN.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.cl0udly.RTLMetadataHarness
