@@ -93,6 +93,32 @@ per run. Interpret:
 The harness bundle allows local HTTP for this fixture test only. A successful
 fixture run does not enable metadata in ApoloEngine or Thrum.
 
+## Controlled ID3 fuzzing (crash characterization, not exploitation)
+
+`Fixtures/make_fuzz_corpus.py` derives one-field mutations from the original
+segment. Serve the output and run one playlist per cold launch:
+
+| Variant | Mutation | Purpose |
+|---|---|---|
+| `original` | none | known crash |
+| `fixed` | valid WXXX | negative control |
+| `wxxx_size_minus4` / `_plus4` | frame size ±4 | bounds vs payload |
+| `wxxx_size_huge` / `_zero` | absurd size | allocation/overrun path |
+| `tag_size_before_wxxx` | tag ends before WXXX | frame visibility |
+| `tag_size_600` | tag crosses audio | overread |
+| `wxxx_id_lower` / `_unknown` | frame id changed | parser dispatch |
+| `url_nul` | NUL in URL | string parsing |
+| `stray_zeroed` | stray bytes removed | payload vs length |
+
+After a crash, summarize the report with:
+
+    python3 analyze_crash_ips.py path/to/RTLMetadataHarness-*.ips
+
+Record `far`, `x2`, `x16`, the top frames and whether the address changes with
+the mutation. That tells Apple whether the corrupted pointer is data-shaped.
+Do not turn these fixtures into exploit payloads; the goal is a minimal,
+reproducible DoS/memory-safety report.
+
 ## Procedure
 
 1. Install as a **separate app** and start with metadata **OFF**, AVQueuePlayer, One load. Play RTL for 180 seconds, export event log.
