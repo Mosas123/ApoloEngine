@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 struct RTLMetadataView: View {
@@ -85,5 +86,18 @@ struct RTLMetadataView: View {
             .navigationTitle("RTL HLS Repro")
             .navigationBarTitleDisplayMode(.inline)
         }
+        .task { await autoStartIfRequested() }
+    }
+
+    @MainActor
+    private func autoStartIfRequested() async {
+        let args = ProcessInfo.processInfo.arguments
+        guard args.contains("-autoStart") else { return }
+        if let i = args.firstIndex(of: "-probeURL"), i + 1 < args.count {
+            model.urlOverride = args[i + 1]
+        }
+        metadataMode = .titleID3Only
+        acceptCrashRisk = true
+        await model.start(metadataMode: metadataMode, playerKind: playerKind, reloadMode: reloadMode)
     }
 }
