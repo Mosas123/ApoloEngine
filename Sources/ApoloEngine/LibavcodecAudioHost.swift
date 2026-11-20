@@ -28,6 +28,11 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var decoder: AudioDecoder?
     private var timeObserver: Any?
     private var automaticFlushObserver: NSObjectProtocol?
+    // A route flush can leave the timebase playing without any enqueued PCM.
+    // If headphones were removed, wait for a deliberate Play before using
+    // the built-in speaker rather than defeating Trop's privacy pause.
+    private var lastPCMRouteWasExternal = false
+    private var awaitingManualRouteRecovery = false
     private var requesting = false
     private var started = false
     private var isLive = false
@@ -70,6 +75,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         ) { [weak self] notification in
             let seconds = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey]
                 as? NSValue)?.timeValue.seconds
+            let observedEpoch = self?.currentPlaybackEpoch
             self?.queue.async { [weak self] in
                 guard let self else { return }
                 let timestamp = seconds.map { String(format: "%.3f", $0) } ?? "unknown"
@@ -78,6 +84,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                         + "flushAt=\(timestamp) "
                         + "started=\(self.started) wantsPlay=\(self.wantsToPlay)"
                 )
+                if let observedEpoch {
+                    self.handleAutomaticFlush(observedEpoch: observedEpoch)
+                }
             }
         }
         timeObserver = synchronizer.addPeriodicTimeObserver(
@@ -95,6 +104,84 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     deinit {
         if let automaticFlushObserver {
             NotificationCenter.default.removeObserver(automaticFlushObserver)
+        }
+    }
+
+
+    /// AVFoundation may discard the queued audio during a hardware route
+    /// change while leaving the synchronizer's clock running. Serialized on
+    /// the same queue as enqueues, rewind the decoder to the CURRENT clock,
+    /// flush stranded buffers, and ask for fresh PCM. Do not restart at zero.
+    private func handleAutomaticFlush(observedEpoch: UInt64) {
+        guard observedEpoch == currentPlaybackEpoch,
+              !isLive, decoder != nil, started else { return }
+
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        let nowBuiltIn = outputs.isEmpty || outputs.allSatisfy {
+            $0.portType == .builtInSpeaker || $0.portType == .builtInReceiver
+        }
+        if RendererRouteRecoveryPolicy.requiresManualPlay(
+            previouslyExternal: lastPCMRouteWasExternal,
+            nowBuiltIn: nowBuiltIn
+        ) {
+            // Headphone removal must NOT silently start the phone speaker.
+            // Stop the clock and retain the position for the user's next Play.
+            synchronizer.setRate(0, time: synchronizer.currentTime())
+            renderer.stopRequestingMediaData()
+            requesting = false
+            renderer.flush()
+            started = false
+            finishToken &+= 1
+            awaitingManualRouteRecovery = true
+            diagnostics.emit(
+                "renderer.routeRecovery deferred=manualPlay output=builtIn "
+                    + "epoch=\(currentPlaybackEpoch)"
+            )
+            return
+        }
+        _ = reprimeAtCurrentClock(reason: "automaticFlush")
+    }
+
+    @discardableResult
+    private func reprimeAtCurrentClock(reason: String) -> Bool {
+        guard !isLive, let decoder,
+              let relative = RendererRouteRecoveryPolicy.recoveryPosition(
+                  clock: synchronizer.currentTime().seconds,
+                  trackStart: currentTrackStart
+              ) else { return false }
+        let absolute = currentTrackStart + relative
+        synchronizer.setRate(0, time: synchronizer.currentTime())
+        renderer.stopRequestingMediaData()
+        requesting = false
+        do {
+            try decoder.seek(to: relative)
+            // Apple recommends an explicit flush on the enqueue queue after
+            // an automatic flush to discard any stranded future samples.
+            renderer.flush()
+            started = false
+            timelineEnd = absolute
+            finishToken &+= 1
+            synchronizer.setRate(
+                0, time: CMTime(seconds: absolute, preferredTimescale: 600)
+            )
+            awaitingManualRouteRecovery = false
+            diagnostics.emit(
+                "renderer.routeRecovery restart=\(String(format: "%.3f", relative)) "
+                    + "reason=\(reason) wantsPlay=\(wantsToPlay) "
+                    + "epoch=\(currentPlaybackEpoch)"
+            )
+            // First newly enqueued PCM will re-arm the existing preroll gate,
+            // choosing rate 0 if Trop has paused in the meantime.
+            startRequesting()
+            return true
+        } catch {
+            awaitingManualRouteRecovery = false
+            diagnostics.emit(
+                "renderer.routeRecovery failed reason=\(reason) "
+                    + "epoch=\(currentPlaybackEpoch)"
+            )
+            publish(.failed("Audio output recovery failed"))
+            return false
         }
     }
 
@@ -187,7 +274,11 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self else { return }
             self.wantsToPlay = true
-            if self.started {
+            if self.awaitingManualRouteRecovery {
+                guard self.reprimeAtCurrentClock(reason: "manualPlay") else {
+                    return
+                }
+            } else if self.started {
                 self.synchronizer.setRate(1, time: self.synchronizer.currentTime())
             }
             self.publish(.playing)
@@ -213,6 +304,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 let relativeTarget = max(0, seconds)
                 let target = self.currentTrackStart + relativeTarget
                 try decoder.seek(to: relativeTarget)
+                self.awaitingManualRouteRecovery = false
                 // Never run the synchronizer across an empty flushed renderer:
                 // the old code resumed rate=1 here, before the first new PCM.
                 // First PCM now re-arms playback with the preroll gate.
@@ -377,6 +469,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private func enqueueDecoded(_ buffer: CMSampleBuffer) {
         if !started {
             started = true
+            // Snapshot only when a new renderer timeline starts; avoid
+            // querying AVAudioSession on every high-frequency PCM refill.
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            lastPCMRouteWasExternal = !outputs.isEmpty && outputs.contains {
+                $0.portType != .builtInSpeaker && $0.portType != .builtInReceiver
+            }
             let start = CMSampleBufferGetPresentationTimeStamp(buffer)
             if !isLive {
                 diagnostics.emit(
@@ -457,6 +555,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         decoder = nil
         started = false
         wantsToPlay = false
+        lastPCMRouteWasExternal = false
+        awaitingManualRouteRecovery = false
         nextTrack = nil
         timelineEnd = 0
         setTrackStart(0)
