@@ -58,15 +58,22 @@ packets:
 | `fixed.m3u8` | `WXXX` rebuilt as a valid URL, padding zeroed |
 | `original.m3u8` | tag exactly as received (malformed `WXXX`) |
 
-Serve them on a LAN reachable by the iPhone:
+Serve them from **any LAN host** reachable by the iPhone — a Mac is not
+required. From the Android phone that runs OpenCode, either run the helper:
 
     python3 Experiments/RTLMetadataHarness/Fixtures/serve_fixtures.py
 
-Run **one item per cold launch** with metadata output ON:
+or plain Python from the fixtures folder:
 
-1. `http://<mac-lan-ip>:8765/stripped.m3u8`
-2. `http://<mac-lan-ip>:8765/fixed.m3u8`
-3. `http://<mac-lan-ip>:8765/original.m3u8`
+    cd Experiments/RTLMetadataHarness/Fixtures
+    python3 -m http.server 8765 --bind 0.0.0.0
+
+The helper prints the LAN IP. Keep the phone awake and on the same Wi-Fi as
+the iPhone. Run **one item per cold launch** with metadata output ON:
+
+1. `http://<lan-ip>:8765/stripped.m3u8`
+2. `http://<lan-ip>:8765/fixed.m3u8`
+3. `http://<lan-ip>:8765/original.m3u8`
 
 Do not re-run `original` in the same process after a crash. Capture one `.ips`
 per run. Interpret:
