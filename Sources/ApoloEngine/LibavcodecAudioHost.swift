@@ -469,6 +469,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private func enqueueDecoded(_ buffer: CMSampleBuffer) {
         if !started {
             started = true
+            // Snapshot only when a new renderer timeline starts; avoid
+            // querying AVAudioSession on every high-frequency PCM refill.
+            let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+            lastPCMRouteWasExternal = !outputs.isEmpty && outputs.contains {
+                $0.portType != .builtInSpeaker && $0.portType != .builtInReceiver
+            }
             let start = CMSampleBufferGetPresentationTimeStamp(buffer)
             if !isLive {
                 diagnostics.emit(
@@ -486,10 +492,6 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         }
         timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
         renderer.enqueue(buffer)
-        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
-        lastPCMRouteWasExternal = !outputs.isEmpty && outputs.contains {
-            $0.portType != .builtInSpeaker && $0.portType != .builtInReceiver
-        }
     }
 
     func enqueueNext(_ track: ApoloTrack) {
