@@ -69,7 +69,10 @@ or plain Python from the fixtures folder:
     python3 -m http.server 8765 --bind 0.0.0.0
 
 The helper prints the LAN IP. Keep the phone awake and on the same Wi-Fi as
-the iPhone. Run **one item per cold launch** with metadata output ON:
+the iPhone. The override URL is saved when you press Start, so it survives the
+next cold launch. Verify the log says `STREAM_SOURCE userOverride=true`; if it
+says `radioBrowserUUID`, the override was empty and you are testing live RTL.
+Run **one item per cold launch** with metadata output ON:
 
 1. `http://<lan-ip>:8765/stripped.m3u8`
 2. `http://<lan-ip>:8765/fixed.m3u8`

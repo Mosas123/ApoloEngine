@@ -81,7 +81,7 @@ final class RTLMetadataModel: ObservableObject {
     @Published private(set) var messages: [String] = []
     @Published private(set) var isRunning = false
     @Published private(set) var phase = "Idle"
-    @Published var urlOverride = ""
+    @Published var urlOverride = UserDefaults.standard.string(forKey: "rtlHarness.urlOverride") ?? ""
 
     private var player: AVPlayer?
     private var item: AVPlayerItem?
@@ -100,7 +100,7 @@ final class RTLMetadataModel: ObservableObject {
 
     init() {
         // Old run data intentionally survives a crash and app restart.
-        event("APP_LAUNCHED metadataDefault=OFF")
+        event("APP_LAUNCHED metadataDefault=OFF overridePresent=\(!urlOverride.isEmpty)")
     }
 
     func start(
@@ -109,8 +109,10 @@ final class RTLMetadataModel: ObservableObject {
         reloadMode: ProbeReloadMode
     ) async {
         stop()
+        let trimmedOverride = urlOverride.trimmingCharacters(in: .whitespacesAndNewlines)
+        UserDefaults.standard.set(trimmedOverride, forKey: "rtlHarness.urlOverride")
         let currentRun = runID
-        event("RUN_PREPARE mode=\(metadataMode.rawValue) player=\(playerKind.rawValue) repeat=\(reloadMode.rawValue)")
+        event("RUN_PREPARE mode=\(metadataMode.rawValue) player=\(playerKind.rawValue) repeat=\(reloadMode.rawValue) override=\(!trimmedOverride.isEmpty)")
         phase = "Resolving RTL via Radio Browser"
 
         do {
