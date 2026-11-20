@@ -90,6 +90,13 @@ per run. Interpret:
 - stripped OK + fixed crash → look at `PRIV`/timed groups/iOS, not the URL.
 - stripped crash → the output itself is unsafe regardless of payload.
 
+**MIME types matter.** Python's default `http.server` sends `.ts` as
+`text/vnd.trolltech.linguist`; AVFoundation then plays the audio but never
+delivers the ID3 timed metadata, so the crash does not reproduce. Always serve
+with `serve_fixtures.py` (or map `.ts` to `video/mp2t` and `.m3u8` to
+`application/vnd.apple.mpegurl`), then confirm the harness logs
+`METADATA_CALLBACK`.
+
 The harness bundle allows local HTTP for this fixture test only. A successful
 fixture run does not enable metadata in ApoloEngine or Thrum.
 

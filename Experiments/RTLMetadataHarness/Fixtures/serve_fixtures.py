@@ -9,6 +9,15 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        ".m3u8": "application/vnd.apple.mpegurl",
+        ".ts": "video/mp2t",
+        ".m4s": "video/iso.segment",
+        ".aac": "audio/aac",
+        ".m4a": "audio/mp4",
+    }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=ROOT, **kwargs)
 
