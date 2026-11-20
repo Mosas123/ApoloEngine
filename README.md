@@ -19,10 +19,15 @@ route
 
 shared
  └─ AVAudioSession (multichannel / Spatial), Now Playing, interruptions
+
+live source ──► HLS/HTTP/ICY route
+ ├─ native AVPlayer (HLS and compatible HTTP streams)
+ └─ FFmpeg + LiveHTTPStream (ICY, raw HTTP and exotic live containers)
 ```
 
 FFmpeg's build has no network protocols, so remote FFmpeg sources are read by a
-custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
+custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows. Live
+streams use the bounded `LiveHTTPStream` ring and the dedicated ICY path instead.
 
 ## Features
 
@@ -39,9 +44,22 @@ custom `AVIOContext` backed by `URLSession` with 1 MB `Range` windows.
 - **Gapless**: AVQueuePlayer with one tap per item on the Apple route; the
   libavcodec route opens the next source on the running synchronizer with a PTS
   offset. `PlayQueue` handles skip/previous.
+- **Live radio**: HLS/HTTP/ICY routing, bounded M3U/PLS playlist resolution,
+  reconnect budgets, stale-callback fences, duplicate-request suppression and a
+  stall watchdog.
 - **System integration**: Now Playing with artwork and `MediaType = audio`,
   remote commands, interruptions and headphone unplug.
-- **Swift 6** throughout, 30 tests on the iOS Simulator.
+- **Swift 6** throughout, with simulator and live-radio regression checks.
+
+## Live radio
+
+Use the radio entry points instead of `load(url:)` for continuous streams. The
+engine resolves bounded M3U/PLS playlists, chooses HLS versus ICY/HTTP, applies
+the reconnect policy and exposes station metadata through the existing Now
+Playing callbacks.
+
+Live titles and artwork are supplied by the host app through ICY or broadcaster
+APIs.
 
 ## Requirements
 
@@ -103,9 +121,11 @@ computes a per-track gain when the container has no ReplayGain tag.
 | Local, exotic codec | libavcodec → `AVSampleBufferAudioRenderer` | APE/TTA/WavPack/Tak/MPC/DSD-ish |
 | Remote, standard | AVPlayer | AAC/ALAC/MP3/FLAC/E-AC-3, native Spatial/Atmos |
 | Remote, exotic | FFmpeg HTTP AVIO | `ape/tta/wv/tak/mpc/dsf/aiff/wma/mka`, `webm/ogg/opus` and **FLAC** (extension, URL `mime` or resolver hint); finite files |
+| Remote live | AVPlayer or FFmpeg `LiveHTTPStream` | HLS, HTTP and ICY; bounded M3U/PLS resolution, reconnect and watchdog |
 
-Live or segmented streams are not handled by the FFmpeg HTTP path; standard
-remote music goes through AVPlayer.
+Finite remote music uses AVPlayer for standard codecs and FFmpeg HTTP AVIO for
+exotic codecs. Continuous streams use the live route, never the finite-file
+`Range` path.
 
 ## Status
 
@@ -119,6 +139,8 @@ remote music goes through AVPlayer.
 | Gapless, queue, skip/previous | working |
 | Now Playing artwork, interruptions, route loss | working |
 | HTTP AVIO for exotic remote sources | working |
+| Live HLS/HTTP/ICY, playlists and reconnect | working |
+| Live-radio watchdog and stale-callback fences | working |
 | APAC (AirPlay / HomePod Atmos) | not implemented |
 | Video / subtitles | out of scope |
 
@@ -143,6 +165,8 @@ xcodebuild test \
   the resolver MIME hint (`sourceMIMEType`).
 - The AVPlayer tap is attached as soon as the audio track loads, so a remote
   asset can play a few unprocessed frames before the tap is in place.
+- Live radio is intentionally opt-in in the host app; finite-file behavior is
+  unchanged when the live entry points are not used.
 
 ## Licence
 
