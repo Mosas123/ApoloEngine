@@ -16,14 +16,19 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         qos: .userInitiated
     )
 
-    private let onState: @Sendable (PlaybackState) -> Void
-    private let onTime: @Sendable (TimeInterval) -> Void
-    private let onTrackChange: @Sendable (ApoloTrack) -> Void
+    // Session identifiers are captured with every async callback. An old
+    // decoder's queued state/time event must never overwrite a new station.
+    private let onState: @Sendable (PlaybackState, UInt64) -> Void
+    private let onTime: @Sendable (TimeInterval, UInt64) -> Void
+    private let onTrackChange: @Sendable (ApoloTrack, UInt64) -> Void
+    private let epochLock = NSLock()
+    private var playbackEpoch: UInt64 = 0
 
     private var decoder: AudioDecoder?
     private var timeObserver: Any?
     private var requesting = false
     private var started = false
+    private var isLive = false
     private var wantsToPlay = false
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
@@ -37,9 +42,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private var finishToken: UInt64 = 0
 
     init(
-        onState: @escaping @Sendable (PlaybackState) -> Void,
-        onTime: @escaping @Sendable (TimeInterval) -> Void,
-        onTrackChange: @escaping @Sendable (ApoloTrack) -> Void
+        onState: @escaping @Sendable (PlaybackState, UInt64) -> Void,
+        onTime: @escaping @Sendable (TimeInterval, UInt64) -> Void,
+        onTrackChange: @escaping @Sendable (ApoloTrack, UInt64) -> Void
     ) {
         self.onState = onState
         self.onTime = onTime
@@ -50,8 +55,23 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             queue: .main
         ) { [weak self] time in
             guard let self, time.isNumeric else { return }
-            self.onTime(max(0, time.seconds - self.currentTrackStart))
+            self.onTime(
+                max(0, time.seconds - self.currentTrackStart),
+                self.currentPlaybackEpoch
+            )
         }
+    }
+
+    private var currentPlaybackEpoch: UInt64 {
+        epochLock.lock()
+        defer { epochLock.unlock() }
+        return playbackEpoch
+    }
+
+    private func setPlaybackEpoch(_ epoch: UInt64) {
+        epochLock.lock()
+        playbackEpoch = epoch
+        epochLock.unlock()
     }
 
     var currentTime: TimeInterval {
@@ -77,9 +97,10 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         set { renderer.volume = newValue }
     }
 
-    func load(url: URL, httpHeaders: [String: String]) {
+    func load(url: URL, httpHeaders: [String: String], epoch: UInt64 = 0) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.setPlaybackEpoch(epoch)
             self.reset()
             do {
                 let decoder = AudioDecoder()
@@ -98,10 +119,16 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     /// Adopts a source the engine already opened and probed.
-    func load(source: OpenedSource) {
+    func load(
+        source: OpenedSource,
+        isLive: Bool = false,
+        epoch: UInt64 = 0
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
+            self.setPlaybackEpoch(epoch)
             self.reset()
+            self.isLive = isLive
             do {
                 let decoder = AudioDecoder()
                 decoder.processingSettings = self.equalizer
@@ -225,6 +252,16 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             return
         }
 
+        if isLive {
+            // Indefinite stations must not complete the track or auto-advance
+            // a song queue when a decoder reports EOF.
+            requesting = false
+            renderer.stopRequestingMediaData()
+            synchronizer.setRate(0, time: synchronizer.currentTime())
+            publish(.failed("Live stream ended"))
+            return
+        }
+
         if let next = nextTrack, start(next: next) {
             nextTrack = nil
             if let newDecoder = self.decoder,
@@ -257,6 +294,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             started = true
             let start = CMSampleBufferGetPresentationTimeStamp(buffer)
             synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
+            if isLive && wantsToPlay {
+                publish(.playing)
+            }
         }
         timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))
         renderer.enqueue(buffer)
@@ -264,7 +304,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     func enqueueNext(_ track: ApoloTrack) {
         queue.async { [weak self] in
-            guard let self else { return }
+            guard let self, !self.isLive else { return }
             self.nextTrack = track
             self.finishToken &+= 1
             // The host may have already reached `.finished`; restart the
@@ -302,7 +342,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             self.decoder = decoder
             self.setTrackStart(decoder.startOffsetSeconds)
             self.finishToken &+= 1
-            onTrackChange(track)
+            onTrackChange(track, currentPlaybackEpoch)
             return true
         } catch {
             return false
@@ -310,6 +350,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     private func reset() {
+        isLive = false
         requesting = false
         renderer.stopRequestingMediaData()
         renderer.flush()
@@ -345,7 +386,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     }
 
     private func publish(_ state: PlaybackState) {
-        onState(state)
+        onState(state, currentPlaybackEpoch)
     }
 
     private static func describe(_ error: Error) -> String {

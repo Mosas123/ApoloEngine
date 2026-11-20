@@ -7,9 +7,19 @@ import AVFoundation
 @MainActor
 final class AVPlayerHost {
     private let player = AVQueuePlayer()
+    // Device crash mitigation: iOS 27.0.1 can EXC_BAD_ACCESS within
+    // AVFCore's _pushTimedMetadataGroups while releasing an internal
+    // metadata dictionary. Avoid installing AVPlayerItemMetadataOutput on
+    // untrusted live HLS until a separately validated collector is ready.
+    // ICY metadata on the FFmpeg live route remains fully supported.
+    nonisolated static let nativeHLSTimedMetadataEnabled = false
     private var timeObserver: Any?
     private var wantsToPlay = false
     private var finished = false
+    private var isLiveStream = false
+    private var liveMetadataOutput: AVPlayerItemMetadataOutput?
+    private var liveMetadataHandler: LiveTimedMetadataHandler?
+    private var lastLiveTitle: String?
     private(set) var loadGeneration: UInt64 = 0
     private var lastState: PlaybackState = .idle
     private var tapProcessors: [AudioTapProcessor] = []
@@ -21,6 +31,7 @@ final class AVPlayerHost {
     var onState: (@MainActor (PlaybackState) -> Void)?
     var onTime: (@MainActor (TimeInterval) -> Void)?
     var onTrackChange: (@MainActor () -> Void)?
+    var onLiveTitle: (@MainActor (String) -> Void)?
 
     init() {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -79,6 +90,7 @@ final class AVPlayerHost {
         let generation = loadGeneration
         resetItems()
         finished = false
+        isLiveStream = false
         wantsToPlay = true
         publish(.loading)
 
@@ -103,6 +115,48 @@ final class AVPlayerHost {
         player.play()
     }
 
+    /// Native live streams have no finite audio track table or meaningful
+    /// end time. Attach the player immediately instead of awaiting
+    /// loadTracks(), which may stall on an endless HTTP response.
+    func loadLive(track: ApoloTrack) async {
+        loadGeneration &+= 1
+        resetItems()
+        finished = false
+        isLiveStream = true
+        wantsToPlay = true
+        publish(.loading)
+
+        let item = AVPlayerItem(asset: makeAsset(track))
+        // Avoid AVPlayerItemMetadataOutput on iOS 27.0.1 live streams:
+        // one physical-device crash occurred inside the AVFoundation
+        // timed-metadata callback, after audio had started successfully.
+        // The parser is retained for future investigation, but the native
+        // output is explicitly disabled for the device beta.
+        if Self.nativeHLSTimedMetadataEnabled {
+            let generation = loadGeneration
+            let output = AVPlayerItemMetadataOutput(identifiers: nil)
+            let handler = LiveTimedMetadataHandler { [weak self] title in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isLiveStream,
+                          self.loadGeneration == generation,
+                          self.lastLiveTitle != title else { return }
+                    self.lastLiveTitle = title
+                    self.onLiveTitle?(title)
+                }
+            }
+            output.setDelegate(handler, queue: .main)
+            item.add(output)
+            liveMetadataOutput = output
+            liveMetadataHandler = handler
+        }
+        observeEnd(of: item)
+        observeFailure(of: item)
+        // Do not attach MTAudioProcessingTap to live transport yet: native
+        // HLS and indefinite audio may not expose a stable asset track.
+        player.insert(item, after: nil)
+        player.play()
+    }
+
     func clearUpcoming() {
         let items = player.items()
         guard items.count > 1 else { return }
@@ -112,6 +166,7 @@ final class AVPlayerHost {
     }
 
     func enqueueNext(_ track: ApoloTrack) async {
+        guard !isLiveStream else { return }
         let generation = loadGeneration
         let asset = makeAsset(track)
         let item = AVPlayerItem(asset: asset)
@@ -156,6 +211,7 @@ final class AVPlayerHost {
     }
 
     func seek(to seconds: TimeInterval) async {
+        guard !isLiveStream else { return }
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         _ = await player.seek(
             to: time,
@@ -220,13 +276,23 @@ final class AVPlayerHost {
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.publish(.failed("Playback failed"))
+                guard let self else { return }
+                if self.isLiveStream { self.finished = true }
+                self.publish(.failed("Playback failed"))
             }
         }
         endObservers.append(token)
     }
 
     private func handleEnd(of ended: AVPlayerItem) {
+        if isLiveStream {
+            // A live station going silent is not the end of a song or queue.
+            // Keep the failure stable; the periodic tick must not turn it
+            // back into "loading" before a reconnection is attempted.
+            finished = true
+            publish(.failed("Live stream ended"))
+            return
+        }
         guard let last = player.items().last else {
             finished = true
             publish(.finished)
@@ -243,17 +309,29 @@ final class AVPlayerHost {
     }
 
     private func resetItems() {
+        // AVPlayerItemMetadataOutput retains no delegate. Remove it before
+        // releasing the handler, so obsolete station events stop arriving.
+        if let output = liveMetadataOutput {
+            output.setDelegate(nil, queue: nil)
+            for item in player.items() {
+                item.remove(output)
+            }
+        }
+        liveMetadataOutput = nil
+        liveMetadataHandler = nil
+        lastLiveTitle = nil
         for observer in endObservers {
             NotificationCenter.default.removeObserver(observer)
         }
         endObservers.removeAll()
+        isLiveStream = false
         tapProcessors.removeAll()
         player.removeAllItems()
     }
 
     private func tick(_ time: CMTime) {
         if time.isNumeric {
-            onTime?(time.seconds)
+            onTime?(isLiveStream ? 0 : time.seconds)
         }
         refreshState()
     }

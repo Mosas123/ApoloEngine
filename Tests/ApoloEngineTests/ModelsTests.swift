@@ -18,6 +18,16 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(diagnostics.state, .playing)
     }
 
+    func testStreamModeIsExplicitRatherThanInferredFromDuration() {
+        let url = URL(string: "https://radio.example/live.m3u8")!
+        let ordinary = ApoloTrack(url: url)
+        let live = ApoloTrack(url: url, streamMode: .live)
+
+        XCTAssertEqual(ordinary.streamMode, .onDemand)
+        XCTAssertEqual(live.streamMode, .live)
+        XCTAssertNotEqual(ordinary, live)
+    }
+
     func testErrorsHaveMessages() {
         for error: ApoloError in [
             .openFailed(code: -1),
