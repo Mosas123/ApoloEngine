@@ -156,8 +156,10 @@ final class RTLMetadataModel: ObservableObject {
                 event("WARN playlist extension not visible; verify actual transport before drawing HLS conclusions")
             }
 
+            #if !os(macOS)
             try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
             try AVAudioSession.sharedInstance().setActive(true)
+            #endif
             event("AUDIO_SESSION active")
 
             load(stream: stream, metadataMode: metadataMode, playerKind: playerKind)

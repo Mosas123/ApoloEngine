@@ -31,6 +31,25 @@ targets:
         IPHONEOS_DEPLOYMENT_TARGET: "18.0"
         GENERATE_INFOPLIST_FILE: "NO"
 
+  RTLMetadataHarnessMac:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/RTLMetadataModel.swift
+      - path: SourcesMac
+    info:
+      path: InfoMac.plist
+      properties:
+        CFBundleDisplayName: RTL HLS Repro Mac
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cl0udly.RTLMetadataHarnessMac
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        GENERATE_INFOPLIST_FILE: "NO"
+
   RTLMetadataHarnessTV:
     type: application
     platform: tvOS
@@ -56,6 +75,14 @@ schemes:
     build:
       targets:
         RTLMetadataHarness: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+  RTLMetadataHarnessMac:
+    build:
+      targets:
+        RTLMetadataHarnessMac: all
     run:
       config: Debug
     archive:
