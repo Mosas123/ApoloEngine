@@ -7,6 +7,8 @@ struct PlayQueue {
     private(set) var upcoming: [ApoloTrack] = []
     private(set) var history: [ApoloTrack] = []
 
+    var next: ApoloTrack? { upcoming.first }
+
     mutating func start(_ track: ApoloTrack) {
         current = track
     }

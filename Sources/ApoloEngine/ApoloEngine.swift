@@ -16,6 +16,10 @@ public final class ApoloEngine {
     public private(set) var elapsed: TimeInterval = 0
     /// ICY track title for a direct live radio source, when available.
     public private(set) var liveTitle: String?
+    /// Called after the engine advances to a queued track on its own. The host
+    /// app uses this to keep its queue/UI in sync; manual skips are handled by
+    /// the caller.
+    public var onTrackChange: ((ApoloTrack) -> Void)?
 
     /// Five-band EQ. Applied on both routes: the libavcodec chain and the
     /// AVPlayer `MTAudioProcessingTap`.
@@ -243,6 +247,7 @@ public final class ApoloEngine {
         liveRetryOpening = false
         livePlayingSince = nil
         liveShouldPlay = true
+        queue.clear()
         queue.start(track)
         loadEpoch &+= 1
         try await startPlayback(track, epoch: loadEpoch)
@@ -644,26 +649,43 @@ public final class ApoloEngine {
         libavHost?.clearNext()
     }
 
+    /// True when the current route has a successor ready to advance without
+    /// re-probing or re-opening a source.
+    public var hasPreparedNext: Bool {
+        route == .avPlayer && queue.current?.streamMode != .live
+            && host.hasPreparedNext
+    }
+
+    /// Identity of the prepared successor, when the host app supplied one.
+    public var preparedNextExternalID: String? {
+        hasPreparedNext ? queue.next?.externalID : nil
+    }
+
+    /// Advances to the prepared native item. No fallback load: the caller must
+    /// handle `false` with its normal resolve/load path.
+    @discardableResult
+    public func skipToPreparedNext() -> Bool {
+        guard hasPreparedNext, queue.next != nil else { return false }
+        guard host.skipToPreparedNext() else { return false }
+        guard let next = queue.advance() else { return false }
+        applyAdvanced(next)
+        return true
+    }
+
     /// Manual skip. Native playback advances the prepared AVQueuePlayer item;
     /// otherwise reload through the normal route decision, so a codec change
     /// between tracks is handled.
     public func skipToNext() async throws {
+        if skipToPreparedNext() {
+            AudioDiagnostics.record(.playback, "skip.next prepared=true route=avPlayer")
+            return
+        }
         guard let next = queue.advance() else { return }
         let probe = AudioProbe()
         cancelLiveReconnect()
         liveRetryAttempts = 0
         livePlayingSince = nil
         liveShouldPlay = true
-
-        // Keep the native path gapless: if AVQueuePlayer already has the
-        // successor prepared, advance in place and update the card now.
-        if route == .avPlayer, host.skipToPreparedNext() {
-            applyAdvanced(next)
-            AudioDiagnostics.record(.playback,
-                "skip.next prepared=true route=avPlayer elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
-            )
-            return
-        }
 
         loadEpoch &+= 1
         try await startPlayback(next, epoch: loadEpoch)
@@ -713,8 +735,9 @@ public final class ApoloEngine {
         guard let next = queue.advance() else { return }
         let probe = AudioProbe()
         applyAdvanced(next)
+        onTrackChange?(next)
         AudioDiagnostics.record(.playback,
-            "track.auto route=\(String(describing: route)) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
+            "track.auto route=\(String(describing: route)) id=\(next.externalID ?? "nil") elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
         )
     }
 
@@ -724,8 +747,9 @@ public final class ApoloEngine {
             queue.start(track)
         }
         applyAdvanced(track)
+        onTrackChange?(track)
         AudioDiagnostics.record(.playback,
-            "track.auto route=\(String(describing: route)) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
+            "track.auto route=\(String(describing: route)) id=\(track.externalID ?? "nil") elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
         )
     }
 

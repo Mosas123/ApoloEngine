@@ -70,6 +70,9 @@ public struct ApoloTrack: Sendable, Equatable {
     public let sourceMIMEType: String?
     public let isAtmos: Bool
     public let streamMode: StreamMode
+    /// Host-app identity (for example a YouTube video id). Optional: the
+    /// engine never interprets it; it is echoed on automatic track changes.
+    public let externalID: String?
 
     // Filled by the engine when the track is queued. They are playback
     // details, not identity, so equality ignores them.
@@ -83,7 +86,8 @@ public struct ApoloTrack: Sendable, Equatable {
         metadata: NowPlayingMetadata? = nil,
         sourceMIMEType: String? = nil,
         isAtmos: Bool = false,
-        streamMode: StreamMode = .onDemand
+        streamMode: StreamMode = .onDemand,
+        externalID: String? = nil
     ) {
         self.url = url
         self.httpHeaders = httpHeaders
@@ -91,6 +95,7 @@ public struct ApoloTrack: Sendable, Equatable {
         self.sourceMIMEType = sourceMIMEType
         self.isAtmos = isAtmos
         self.streamMode = streamMode
+        self.externalID = externalID
     }
 
     public static func == (lhs: ApoloTrack, rhs: ApoloTrack) -> Bool {
@@ -98,6 +103,7 @@ public struct ApoloTrack: Sendable, Equatable {
             && lhs.httpHeaders == rhs.httpHeaders
             && lhs.metadata == rhs.metadata
             && lhs.streamMode == rhs.streamMode
+            && lhs.externalID == rhs.externalID
     }
 }
 
