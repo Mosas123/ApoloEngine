@@ -29,7 +29,7 @@ enum MetadataProbeMode: String, CaseIterable, Identifiable {
         case .titleCommonOnly:
             return [AVMetadataIdentifier.commonIdentifierTitle.rawValue]
         case .artistOnly:
-            return [AVMetadataIdentifier.id3MetadataArtist.rawValue]
+            return [AVMetadataIdentifier.commonIdentifierArtist.rawValue]
         case .allMain:
             return nil
         }
