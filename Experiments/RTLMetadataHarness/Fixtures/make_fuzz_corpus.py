@@ -12,7 +12,6 @@ import argparse
 import os
 import shutil
 
-COPIES = 6
 
 
 def syncsafe(value: int) -> bytes:
@@ -89,15 +88,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--segment", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--copies", type=int, default=6)
     args = ap.parse_args()
     raw = bytearray(open(args.segment, "rb").read())
     shutil.rmtree(args.out, ignore_errors=True)
     os.makedirs(args.out)
     for name, data in variants(raw):
-        for copy in range(1, COPIES + 1):
+        for copy in range(1, args.copies + 1):
             open(os.path.join(args.out, f"{name}_r{copy:02d}.ts"), "wb").write(data)
         lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:6", "#EXT-X-MEDIA-SEQUENCE:1"]
-        for copy in range(1, COPIES + 1):
+        for copy in range(1, args.copies + 1):
             lines += ["#EXTINF:5.760,", f"{name}_r{copy:02d}.ts"]
         lines.append("#EXT-X-ENDLIST")
         open(os.path.join(args.out, f"{name}.m3u8"), "w").write("\n".join(lines) + "\n")
