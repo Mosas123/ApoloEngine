@@ -103,6 +103,9 @@ public final class ApoloEngine {
         session.onInterruptionBegan = { [weak self] in
             guard let self else { return }
             self.resumeAfterInterruption = self.state == .playing
+            AudioDiagnostics.session.notice(
+                "interruption.began wasPlaying=\(self.resumeAfterInterruption, privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            )
             if self.resumeAfterInterruption {
                 self.pauseForSystemEvent()
             }
@@ -111,11 +114,17 @@ public final class ApoloEngine {
             guard let self else { return }
             let wasPlaying = self.resumeAfterInterruption
             self.resumeAfterInterruption = false
+            AudioDiagnostics.session.notice(
+                "interruption.ended shouldResume=\(shouldResume, privacy: .public) wasPlaying=\(wasPlaying, privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            )
             guard shouldResume, wasPlaying else { return }
             self.play()
         }
         session.onRouteLost = { [weak self] in
             guard let self else { return }
+            AudioDiagnostics.session.notice(
+                "route.lost reason=oldDeviceUnavailable live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            )
             if self.state == .playing || self.queue.current?.streamMode == .live {
                 self.pauseForSystemEvent()
             }
@@ -640,6 +649,7 @@ public final class ApoloEngine {
     /// between tracks is handled.
     public func skipToNext() async throws {
         guard let next = queue.advance() else { return }
+        let probe = AudioProbe()
         cancelLiveReconnect()
         liveRetryAttempts = 0
         livePlayingSince = nil
@@ -649,11 +659,17 @@ public final class ApoloEngine {
         // successor prepared, advance in place and update the card now.
         if route == .avPlayer, host.skipToPreparedNext() {
             applyAdvanced(next)
+            AudioDiagnostics.playback.notice(
+                "skip.next prepared=true route=avPlayer elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+            )
             return
         }
 
         loadEpoch &+= 1
         try await startPlayback(next, epoch: loadEpoch)
+        AudioDiagnostics.playback.notice(
+            "skip.next prepared=false route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        )
     }
 
     public func skipToPrevious() async throws {
@@ -695,14 +711,22 @@ public final class ApoloEngine {
 
     private func advanceFromQueue() {
         guard let next = queue.advance() else { return }
+        let probe = AudioProbe()
         applyAdvanced(next)
+        AudioDiagnostics.playback.notice(
+            "track.auto route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        )
     }
 
     private func advance(to track: ApoloTrack) {
+        let probe = AudioProbe()
         if !queue.consume(track) {
             queue.start(track)
         }
         applyAdvanced(track)
+        AudioDiagnostics.playback.notice(
+            "track.auto route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        )
     }
 
     private func applyAdvanced(_ track: ApoloTrack) {
@@ -887,6 +911,9 @@ public final class ApoloEngine {
     }
 
     private func apply(_ newState: PlaybackState) {
+        AudioDiagnostics.playback.debug(
+            "state=\(String(describing: newState), privacy: .public) route=\(String(describing: route), privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public)"
+        )
         state = newState
         if queue.current?.streamMode == .live {
             switch newState {
