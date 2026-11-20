@@ -103,8 +103,8 @@ public final class ApoloEngine {
         session.onInterruptionBegan = { [weak self] in
             guard let self else { return }
             self.resumeAfterInterruption = self.state == .playing
-            AudioDiagnostics.session.notice(
-                "interruption.began wasPlaying=\(self.resumeAfterInterruption, privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            AudioDiagnostics.record(.session,
+                "interruption.began wasPlaying=\(self.resumeAfterInterruption) live=\(self.queue.current?.streamMode == .live) state=\(String(describing: self.state))"
             )
             if self.resumeAfterInterruption {
                 self.pauseForSystemEvent()
@@ -114,16 +114,16 @@ public final class ApoloEngine {
             guard let self else { return }
             let wasPlaying = self.resumeAfterInterruption
             self.resumeAfterInterruption = false
-            AudioDiagnostics.session.notice(
-                "interruption.ended shouldResume=\(shouldResume, privacy: .public) wasPlaying=\(wasPlaying, privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            AudioDiagnostics.record(.session,
+                "interruption.ended shouldResume=\(shouldResume) wasPlaying=\(wasPlaying) live=\(self.queue.current?.streamMode == .live) state=\(String(describing: self.state))"
             )
             guard shouldResume, wasPlaying else { return }
             self.play()
         }
         session.onRouteLost = { [weak self] in
             guard let self else { return }
-            AudioDiagnostics.session.notice(
-                "route.lost reason=oldDeviceUnavailable live=\(self.queue.current?.streamMode == .live, privacy: .public) state=\(String(describing: self.state), privacy: .public)"
+            AudioDiagnostics.record(.session,
+                "route.lost reason=oldDeviceUnavailable live=\(self.queue.current?.streamMode == .live) state=\(String(describing: self.state))"
             )
             if self.state == .playing || self.queue.current?.streamMode == .live {
                 self.pauseForSystemEvent()
@@ -659,16 +659,16 @@ public final class ApoloEngine {
         // successor prepared, advance in place and update the card now.
         if route == .avPlayer, host.skipToPreparedNext() {
             applyAdvanced(next)
-            AudioDiagnostics.playback.notice(
-                "skip.next prepared=true route=avPlayer elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+            AudioDiagnostics.record(.playback,
+                "skip.next prepared=true route=avPlayer elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
             )
             return
         }
 
         loadEpoch &+= 1
         try await startPlayback(next, epoch: loadEpoch)
-        AudioDiagnostics.playback.notice(
-            "skip.next prepared=false route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        AudioDiagnostics.record(.playback,
+            "skip.next prepared=false route=\(String(describing: route)) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
         )
     }
 
@@ -713,8 +713,8 @@ public final class ApoloEngine {
         guard let next = queue.advance() else { return }
         let probe = AudioProbe()
         applyAdvanced(next)
-        AudioDiagnostics.playback.notice(
-            "track.auto route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        AudioDiagnostics.record(.playback,
+            "track.auto route=\(String(describing: route)) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
         )
     }
 
@@ -724,8 +724,8 @@ public final class ApoloEngine {
             queue.start(track)
         }
         applyAdvanced(track)
-        AudioDiagnostics.playback.notice(
-            "track.auto route=\(String(describing: route), privacy: .public) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds), privacy: .public)"
+        AudioDiagnostics.record(.playback,
+            "track.auto route=\(String(describing: route)) elapsed_ms=\(AudioDiagnostics.milliseconds(probe.milliseconds))"
         )
     }
 
@@ -911,8 +911,10 @@ public final class ApoloEngine {
     }
 
     private func apply(_ newState: PlaybackState) {
-        AudioDiagnostics.playback.debug(
-            "state=\(String(describing: newState), privacy: .public) route=\(String(describing: route), privacy: .public) live=\(self.queue.current?.streamMode == .live, privacy: .public)"
+        AudioDiagnostics.record(
+            .playback,
+            "state=\(String(describing: newState)) route=\(String(describing: route)) live=\(self.queue.current?.streamMode == .live)",
+            level: .debug
         )
         state = newState
         if queue.current?.streamMode == .live {
