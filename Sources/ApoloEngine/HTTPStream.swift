@@ -12,6 +12,7 @@ final class HTTPStream: @unchecked Sendable {
     private let url: URL
     private let headers: [String: String]
     private let session: URLSession
+    private let diagnostics: AudioDiagnostics?
     private let chunkSize = 1 << 20
     private let lock = NSLock()
 
@@ -25,10 +26,12 @@ final class HTTPStream: @unchecked Sendable {
     init(
         url: URL,
         headers: [String: String],
-        configuration: URLSessionConfiguration = .default
+        configuration: URLSessionConfiguration = .default,
+        diagnostics: AudioDiagnostics? = nil
     ) {
         self.url = url
         self.headers = headers
+        self.diagnostics = diagnostics
         configuration.timeoutIntervalForRequest = 30
         configuration.timeoutIntervalForResource = 600
         session = URLSession(configuration: configuration)
@@ -171,8 +174,14 @@ final class HTTPStream: @unchecked Sendable {
                 Thread.sleep(forTimeInterval: Double(attempt) * 0.15)
             }
 
+            let requestStarted = DispatchTime.now().uptimeNanoseconds
             switch requestRange(from: start) {
             case .failure(let error):
+                diagnostics?.emit(
+                    "http.range start=\(start) status=networkError "
+                        + "errorCode=\((error as NSError).code) bytes=0 "
+                        + "attempt=\(attempt + 1) ms=\(AudioDiagnostics.elapsedMs(since: requestStarted))"
+                )
                 if attempt < Self.maxTransientRetries,
                    Self.isTransientNetworkError(error) {
                     continue
@@ -181,6 +190,11 @@ final class HTTPStream: @unchecked Sendable {
                 return false
 
             case .success(let (http, data)):
+                diagnostics?.emit(
+                    "http.range start=\(start) status=\(http.statusCode) "
+                        + "bytes=\(data.count) attempt=\(attempt + 1) "
+                        + "ms=\(AudioDiagnostics.elapsedMs(since: requestStarted))"
+                )
                 switch http.statusCode {
                 case 206:
                     guard let range = Self.parseContentRange(
