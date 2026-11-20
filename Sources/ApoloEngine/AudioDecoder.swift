@@ -51,6 +51,10 @@ final class AudioDecoder {
     private var runningSamples: Int64 = 0
     private var decoderDrained = false
     private var resamplerFlushed = false
+    /// Only a discontinuous user seek gets a short 3 ms PCM de-click ramp.
+    /// Normal track startup and gapless transitions retain their first sample.
+    private var seekRampFrames = 0
+    private var seekRampConsumedFrames = 0
 
     deinit {
         close()
@@ -349,12 +353,21 @@ final class AudioDecoder {
         // Drop packets the demuxer queued before the seek point.
         avformat_flush(formatContext)
         avcodec_flush_buffers(codecContext)
+        // The codec flush alone does NOT discard delayed PCM held by SWR or
+        // the biquad/limiter's previous-signal history. Recreate both with the
+        // next decoded frame to prevent old audio leaking across the seek.
+        if resampler != nil {
+            swr_free(&resampler)
+        }
+        processingChain = nil
         reachedEnd = false
         decoderDrained = false
         resamplerFlushed = false
         runningSamples = 0
         seekTargetTicks = target
         readyBuffers.removeAll()
+        seekRampFrames = SeekTransientRamp.frameCount(sampleRate: sampleRate)
+        seekRampConsumedFrames = 0
     }
 
     func close() {
@@ -380,6 +393,8 @@ final class AudioDecoder {
         formatDescription = nil
         passthroughFormat = nil
         processingChain = nil
+        seekRampFrames = 0
+        seekRampConsumedFrames = 0
         passthroughMode = .decode
         decoderDrained = false
         resamplerFlushed = false
@@ -505,6 +520,15 @@ final class AudioDecoder {
         }
 
         processIfNeeded(memory, frames: Int(converted))
+        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {
+            SeekTransientRamp.apply(
+                interleaved: memory.assumingMemoryBound(to: Float.self),
+                frames: Int(converted),
+                channels: Int(channels),
+                fadeFrames: seekRampFrames,
+                consumedFrames: &seekRampConsumedFrames
+            )
+        }
 
         let ticks = frame.pointee.pts == Int64.min
             ? runningSamples
@@ -705,5 +729,37 @@ final class AudioDecoder {
         case 8: return kAudioChannelLayoutTag_MPEG_7_1_C
         default: return kAudioChannelLayoutTag_DiscreteInOrder | UInt32(channels)
         }
+    }
+}
+
+
+/// Suppresses an abrupt discontinuity at the new PCM boundary after a seek,
+/// without dropping samples, inserting silence, or changing the timebase.
+/// Only the first ~3ms of *seeked* output are modified; the original beginning
+/// of a newly selected song is never faded.
+enum SeekTransientRamp {
+    static func frameCount(sampleRate: Int32) -> Int {
+        guard sampleRate > 0 else { return 0 }
+        return max(1, Int((Double(sampleRate) * 0.003).rounded()))
+    }
+
+    static func apply(
+        interleaved: UnsafeMutablePointer<Float>,
+        frames: Int,
+        channels: Int,
+        fadeFrames: Int,
+        consumedFrames: inout Int
+    ) {
+        guard frames > 0, channels > 0, fadeFrames > 0,
+              consumedFrames < fadeFrames else { return }
+        let count = min(frames, fadeFrames - consumedFrames)
+        for frame in 0..<count {
+            let gain = Float(consumedFrames + frame + 1) / Float(fadeFrames)
+            let index = frame * channels
+            for channel in 0..<channels {
+                interleaved[index + channel] *= gain
+            }
+        }
+        consumedFrames += count
     }
 }
