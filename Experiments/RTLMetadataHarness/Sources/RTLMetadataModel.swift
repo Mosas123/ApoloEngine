@@ -8,6 +8,8 @@ enum MetadataProbeMode: String, CaseIterable, Identifiable {
     case titleSerial = "Title IDs · serial queue"
     case titleID3Only = "ID3 title only · main queue"
     case titleCommonOnly = "Common title only · main queue"
+    case titleCountOnly = "Count only · no item inspect · main queue"
+    case titleRetain = "Retain groups · main queue"
     case artistOnly = "Artist only · main queue"
     case allMain = "All IDs · main queue"
 
@@ -28,6 +30,11 @@ enum MetadataProbeMode: String, CaseIterable, Identifiable {
             return [AVMetadataIdentifier.id3MetadataTitleDescription.rawValue]
         case .titleCommonOnly:
             return [AVMetadataIdentifier.commonIdentifierTitle.rawValue]
+        case .titleCountOnly, .titleRetain:
+            return [
+                AVMetadataIdentifier.id3MetadataTitleDescription.rawValue,
+                AVMetadataIdentifier.commonIdentifierTitle.rawValue
+            ]
         case .artistOnly:
             return [AVMetadataIdentifier.commonIdentifierArtist.rawValue]
         case .allMain:
@@ -52,9 +59,13 @@ enum ProbeReloadMode: String, CaseIterable, Identifiable {
 /// AVFoundation metadata delegate is weak: the model strongly retains this sink.
 private final class TimedMetadataSink: NSObject,
     AVPlayerItemMetadataOutputPushDelegate, @unchecked Sendable {
+    enum Behavior { case inspect, countOnly, retain }
     private let report: @Sendable (Int, Bool) -> Void
+    private let behavior: Behavior
+    private var retainedGroups: [AVTimedMetadataGroup] = []
 
-    init(report: @escaping @Sendable (Int, Bool) -> Void) {
+    init(behavior: Behavior, report: @escaping @Sendable (Int, Bool) -> Void) {
+        self.behavior = behavior
         self.report = report
     }
 
@@ -63,6 +74,13 @@ private final class TimedMetadataSink: NSObject,
         didOutputTimedMetadataGroups groups: sending [AVTimedMetadataGroup],
         from track: AVPlayerItemTrack?
     ) {
+        if behavior == .retain {
+            retainedGroups.append(contentsOf: groups)
+        }
+        if behavior == .countOnly {
+            report(groups.count, false)
+            return
+        }
         // Match ApoloEngine's title-filter traversal without retaining AV objects.
         let hasTitle = groups.contains { group in
             group.items.reversed().contains { item in
@@ -225,7 +243,13 @@ final class RTLMetadataModel: ObservableObject {
         let nextItem = AVPlayerItem(asset: AVURLAsset(url: stream))
         if metadataMode.installsOutput {
             let nextOutput = AVPlayerItemMetadataOutput(identifiers: metadataMode.identifiers)
-            let nextSink = TimedMetadataSink { [weak self] count, titlePresent in
+            let behavior: TimedMetadataSink.Behavior
+            switch metadataMode {
+            case .titleCountOnly: behavior = .countOnly
+            case .titleRetain: behavior = .retain
+            default: behavior = .inspect
+            }
+            let nextSink = TimedMetadataSink(behavior: behavior) { [weak self] count, titlePresent in
                 NSLog("RTL_HLS_REPRO callback gen=\(generation) groups=\(count) hasTitle=\(titlePresent)")
                 Task { @MainActor [weak self] in
                     guard let self else { return }
