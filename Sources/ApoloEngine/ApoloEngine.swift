@@ -608,6 +608,10 @@ public final class ApoloEngine {
     /// libavcodec route and no audible one on AVQueuePlayer.
     public func enqueueNext(_ track: ApoloTrack) async {
         guard queue.current?.streamMode != .live else { return }
+        AudioDiagnostics.record(
+            .playback,
+            "queue.enqueue id=\(track.externalID ?? "nil") route=\(String(describing: route))"
+        )
         queue.enqueue(track)
 
         var prepared = track
