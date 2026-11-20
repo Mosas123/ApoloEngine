@@ -21,6 +21,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     private let onState: @Sendable (PlaybackState, UInt64) -> Void
     private let onTime: @Sendable (TimeInterval, UInt64) -> Void
     private let onTrackChange: @Sendable (ApoloTrack, UInt64) -> Void
+    private let diagnostics: AudioDiagnostics
     private let epochLock = NSLock()
     private var playbackEpoch: UInt64 = 0
 
@@ -44,11 +45,13 @@ final class LibavcodecAudioHost: @unchecked Sendable {
     init(
         onState: @escaping @Sendable (PlaybackState, UInt64) -> Void,
         onTime: @escaping @Sendable (TimeInterval, UInt64) -> Void,
-        onTrackChange: @escaping @Sendable (ApoloTrack, UInt64) -> Void
+        onTrackChange: @escaping @Sendable (ApoloTrack, UInt64) -> Void,
+        diagnostics: AudioDiagnostics = AudioDiagnostics()
     ) {
         self.onState = onState
         self.onTime = onTime
         self.onTrackChange = onTrackChange
+        self.diagnostics = diagnostics
         synchronizer.addRenderer(renderer)
         timeObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
@@ -107,7 +110,9 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 decoder.processingSettings = self.equalizer
                 decoder.limiterEnabled = self.limiterEnabled
                 decoder.trackGainDB = self.trackGainDB
-                try decoder.open(url: url, httpHeaders: httpHeaders)
+                try decoder.open(
+                    url: url, httpHeaders: httpHeaders, diagnostics: self.diagnostics
+                )
                 self.decoder = decoder
                 self.wantsToPlay = true
                 self.publish(.loading)
@@ -237,9 +242,18 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         }
 
         let buffer: CMSampleBuffer?
+        let readStarted = DispatchTime.now().uptimeNanoseconds
+        let beforeClock = synchronizer.currentTime().seconds
+        let beforeAhead = max(0, timelineEnd - beforeClock)
         do {
             buffer = try decoder.readNextBuffer()
         } catch {
+            diagnostics.emit(
+                "renderer.decodeFailure epoch=\(currentPlaybackEpoch) "
+                    + "readMs=\(AudioDiagnostics.elapsedMs(since: readStarted)) "
+                    + "clock=\(String(format: "%.3f", beforeClock)) "
+                    + "ahead=\(String(format: "%.3f", beforeAhead))"
+            )
             requesting = false
             renderer.stopRequestingMediaData()
             synchronizer.setRate(0, time: synchronizer.currentTime())
@@ -247,6 +261,16 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             return
         }
 
+        let readMs = AudioDiagnostics.elapsedMs(since: readStarted)
+        if readMs >= 120, !isLive {
+            let afterClock = synchronizer.currentTime().seconds
+            diagnostics.emit(
+                "renderer.slowDecode epoch=\(currentPlaybackEpoch) ms=\(readMs) "
+                    + "aheadBefore=\(String(format: "%.3f", beforeAhead)) "
+                    + "aheadAfter=\(String(format: "%.3f", max(0, timelineEnd - afterClock))) "
+                    + "sample=\(buffer == nil ? "eof" : "pcm")"
+            )
+        }
         if let buffer {
             enqueueDecoded(buffer)
             return
@@ -271,6 +295,13 @@ final class LibavcodecAudioHost: @unchecked Sendable {
             return
         }
 
+        diagnostics.emit(
+            "renderer.decoderEOF epoch=\(currentPlaybackEpoch) "
+                + "clock=\(String(format: "%.3f", synchronizer.currentTime().seconds)) "
+                + "timelineEnd=\(String(format: "%.3f", timelineEnd)) "
+                + "remaining=\(String(format: "%.3f", max(0, timelineEnd - synchronizer.currentTime().seconds))) "
+                + "wantsPlay=\(wantsToPlay)"
+        )
         requesting = false
         renderer.stopRequestingMediaData()
         // The renderer still holds enqueued audio. Do not stop the clock now
@@ -282,8 +313,19 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         )
         finishToken &+= 1
         let token = finishToken
+        diagnostics.emit(
+            "renderer.finishScheduled epoch=\(currentPlaybackEpoch) "
+                + "remaining=\(String(format: "%.3f", remaining)) token=\(token)"
+        )
         queue.asyncAfter(deadline: .now() + remaining + 0.3) { [weak self] in
             guard let self, self.finishToken == token else { return }
+            self.diagnostics.emit(
+                "renderer.finishFired epoch=\(self.currentPlaybackEpoch) "
+                    + "clock=\(String(format: "%.3f", self.synchronizer.currentTime().seconds)) "
+                    + "timelineEnd=\(String(format: "%.3f", self.timelineEnd)) "
+                    + "ahead=\(String(format: "%.3f", max(0, self.timelineEnd - self.synchronizer.currentTime().seconds))) "
+                    + "wantsPlay=\(self.wantsToPlay)"
+            )
             self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
             self.publish(.finished)
         }
@@ -293,6 +335,14 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         if !started {
             started = true
             let start = CMSampleBufferGetPresentationTimeStamp(buffer)
+            if !isLive {
+                diagnostics.emit(
+                    "renderer.firstPCM epoch=\(currentPlaybackEpoch) "
+                        + "pts=\(String(format: "%.3f", start.seconds)) "
+                        + "clockBefore=\(String(format: "%.3f", synchronizer.currentTime().seconds)) "
+                        + "wantsPlay=\(wantsToPlay)"
+                )
+            }
             synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
             if isLive && wantsToPlay {
                 publish(.playing)
@@ -337,7 +387,11 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 timelineEnd,
                 synchronizer.currentTime().seconds
             )
-            try decoder.open(url: track.url, httpHeaders: track.httpHeaders)
+            try decoder.open(
+                url: track.url,
+                httpHeaders: track.httpHeaders,
+                diagnostics: diagnostics
+            )
             self.decoder?.close()
             self.decoder = decoder
             self.setTrackStart(decoder.startOffsetSeconds)
