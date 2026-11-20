@@ -6,6 +6,9 @@ enum MetadataProbeMode: String, CaseIterable, Identifiable {
     case disabled = "OFF · audio-only baseline"
     case titleMain = "Title IDs · main queue"
     case titleSerial = "Title IDs · serial queue"
+    case titleID3Only = "ID3 title only · main queue"
+    case titleCommonOnly = "Common title only · main queue"
+    case artistOnly = "Artist only · main queue"
     case allMain = "All IDs · main queue"
 
     var id: String { rawValue }
@@ -21,6 +24,12 @@ enum MetadataProbeMode: String, CaseIterable, Identifiable {
                 AVMetadataIdentifier.id3MetadataTitleDescription.rawValue,
                 AVMetadataIdentifier.commonIdentifierTitle.rawValue
             ]
+        case .titleID3Only:
+            return [AVMetadataIdentifier.id3MetadataTitleDescription.rawValue]
+        case .titleCommonOnly:
+            return [AVMetadataIdentifier.commonIdentifierTitle.rawValue]
+        case .artistOnly:
+            return [AVMetadataIdentifier.id3MetadataArtist.rawValue]
         case .allMain:
             return nil
         }
