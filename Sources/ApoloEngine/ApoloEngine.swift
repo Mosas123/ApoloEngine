@@ -88,6 +88,7 @@ public final class ApoloEngine {
                 return
             }
             self.liveTitle = title
+            self.refreshNowPlaying()
         }
         nowPlaying.onPlay = { [weak self] in self?.play() }
         nowPlaying.onPause = { [weak self] in self?.pause() }
@@ -111,10 +112,10 @@ public final class ApoloEngine {
             }
         }
         session.onInterruptionEnded = { [weak self] shouldResume in
-            guard let self, shouldResume, self.resumeAfterInterruption else {
-                return
-            }
+            guard let self else { return }
+            let wasPlaying = self.resumeAfterInterruption
             self.resumeAfterInterruption = false
+            guard shouldResume, wasPlaying else { return }
             self.play()
         }
         session.onRouteLost = { [weak self] in
@@ -882,13 +883,19 @@ public final class ApoloEngine {
 
     private func refreshNowPlaying() {
         guard managesSystemMediaControls, let metadata else { return }
+        let isLive = queue.current?.streamMode == .live
+        let live = liveTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasLiveTitle = isLive && !(live?.isEmpty ?? true)
+        let cardTitle = hasLiveTitle ? (live ?? metadata.title) : metadata.title
+        let cardArtist = hasLiveTitle ? metadata.title : metadata.artist
         nowPlaying.update(
-            title: metadata.title,
-            artist: metadata.artist,
+            title: cardTitle,
+            artist: cardArtist,
             album: metadata.album,
             duration: duration,
             elapsed: elapsed,
             isPlaying: state == .playing,
+            isLive: isLive,
             artworkData: metadata.artworkData
         )
     }

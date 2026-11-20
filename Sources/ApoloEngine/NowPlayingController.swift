@@ -48,18 +48,21 @@ final class NowPlayingController {
         duration: TimeInterval,
         elapsed: TimeInterval,
         isPlaying: Bool,
+        isLive: Bool = false,
         artworkData: Data?
     ) {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: title,
             MPMediaItemPropertyArtist: artist,
-            MPMediaItemPropertyPlaybackDuration: duration,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: elapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
-            MPNowPlayingInfoPropertyIsLiveStream: false,
+            MPNowPlayingInfoPropertyIsLiveStream: isLive,
         ]
+        if !isLive {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+            info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = elapsed
+        }
         if let album {
             info[MPMediaItemPropertyAlbumTitle] = album
         }
@@ -67,6 +70,7 @@ final class NowPlayingController {
             info[MPMediaItemPropertyArtwork] = artwork
         }
         infoCenter.nowPlayingInfo = info
+        commands.changePlaybackPositionCommand.isEnabled = !isLive
     }
 
     func clear() {
