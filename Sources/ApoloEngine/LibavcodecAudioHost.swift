@@ -46,7 +46,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         onState: @escaping @Sendable (PlaybackState, UInt64) -> Void,
         onTime: @escaping @Sendable (TimeInterval, UInt64) -> Void,
         onTrackChange: @escaping @Sendable (ApoloTrack, UInt64) -> Void,
-        diagnostics: AudioDiagnostics
+        diagnostics: AudioDiagnostics = AudioDiagnostics()
     ) {
         self.onState = onState
         self.onTime = onTime
