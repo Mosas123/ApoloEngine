@@ -157,6 +157,23 @@ final class AVPlayerHost {
         player.play()
     }
 
+    /// True when AVQueuePlayer already holds the current item plus a prepared
+    /// successor. Native next can then advance without re-probing or reloading.
+    var hasPreparedNext: Bool {
+        !isLiveStream && player.items().count > 1
+    }
+
+    @discardableResult
+    func skipToPreparedNext() -> Bool {
+        guard hasPreparedNext else { return false }
+        finished = false
+        wantsToPlay = true
+        player.advanceToNextItem()
+        player.play()
+        refreshState()
+        return true
+    }
+
     func clearUpcoming() {
         let items = player.items()
         guard items.count > 1 else { return }

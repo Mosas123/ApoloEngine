@@ -615,14 +615,23 @@ public final class ApoloEngine {
         libavHost?.clearNext()
     }
 
-    /// Manual skip. Reloads the source through the normal route decision, so a
-    /// codec change between tracks is handled.
+    /// Manual skip. Native playback advances the prepared AVQueuePlayer item;
+    /// otherwise reload through the normal route decision, so a codec change
+    /// between tracks is handled.
     public func skipToNext() async throws {
         guard let next = queue.advance() else { return }
         cancelLiveReconnect()
         liveRetryAttempts = 0
         livePlayingSince = nil
         liveShouldPlay = true
+
+        // Keep the native path gapless: if AVQueuePlayer already has the
+        // successor prepared, advance in place and update the card now.
+        if route == .avPlayer, host.skipToPreparedNext() {
+            applyAdvanced(next)
+            return
+        }
+
         loadEpoch &+= 1
         try await startPlayback(next, epoch: loadEpoch)
     }
