@@ -27,6 +27,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     private var decoder: AudioDecoder?
     private var timeObserver: Any?
+    private var automaticFlushObserver: NSObjectProtocol?
     private var requesting = false
     private var started = false
     private var isLive = false
@@ -53,6 +54,32 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         self.onTrackChange = onTrackChange
         self.diagnostics = diagnostics
         synchronizer.addRenderer(renderer)
+        // Delay the initial rate change until AVFoundation has buffered enough
+        // audio for a reliable start. Without this, the media clock can run
+        // ahead of the very first PCM and make the intro sound clipped.
+        // This applies to resumed/seeking playback too, without adding
+        // synthetic silence or changing sample timestamps.
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
+        // Apple can automatically flush queued samples during rate changes.
+        // Observe without changing playback yet; the iPhone A/B logs can show
+        // whether a flush is correlated with the clipped initial transient.
+        automaticFlushObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer,
+            queue: nil
+        ) { [weak self] notification in
+            let seconds = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey]
+                as? NSValue)?.timeValue.seconds
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                let timestamp = seconds.map { String(format: "%.3f", $0) } ?? "unknown"
+                self.diagnostics.emit(
+                    "renderer.autoFlush epoch=\(self.currentPlaybackEpoch) "
+                        + "flushAt=\(timestamp) "
+                        + "started=\(self.started) wantsPlay=\(self.wantsToPlay)"
+                )
+            }
+        }
         timeObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
@@ -62,6 +89,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 max(0, time.seconds - self.currentTrackStart),
                 self.currentPlaybackEpoch
             )
+        }
+    }
+
+    deinit {
+        if let automaticFlushObserver {
+            NotificationCenter.default.removeObserver(automaticFlushObserver)
         }
     }
 
@@ -340,7 +373,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                     "renderer.firstPCM epoch=\(currentPlaybackEpoch) "
                         + "pts=\(String(format: "%.3f", start.seconds)) "
                         + "clockBefore=\(String(format: "%.3f", synchronizer.currentTime().seconds)) "
-                        + "wantsPlay=\(wantsToPlay)"
+                        + "wantsPlay=\(wantsToPlay) "
+                        + "prerollGate=\(synchronizer.delaysRateChangeUntilHasSufficientMediaData)"
                 )
             }
             synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
