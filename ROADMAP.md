@@ -5,6 +5,11 @@ never depends on a chat.
 
 ## Working today
 
+- Live radio (opt-in): HLS/HTTP/ICY routing, bounded M3U/PLS resolution,
+  reconnect budget, stall watchdog, stale-callback fences and duplicate-request
+  suppression.
+- Live metadata: ICY title callback (`liveTitle`); station artwork and richer
+  metadata come from the host app's broadcaster APIs.
 - FFmpeg probe: container, duration, audio codecs, E-AC-3 JOC flag.
 - AVPlayer audio path (Apple-playable codecs).
 - libavcodec -> `AVSampleBufferAudioRenderer` path.
@@ -47,7 +52,22 @@ never depends on a chat.
 - libavcodec positions are track-relative across gapless switches, so UI seek
   and Now Playing stay correct after the first automatic advance.
 
-## In flight
+## Experimental / in flight
+
+### Live radio device hardening
+
+The live path is functional but still opt-in. Remaining work is on-device polish,
+not core routing:
+
+- 30–60 minute background runs per protocol (HLS, MP3, AAC, Ogg/Opus, ICY).
+- Now Playing and interruption edge cases: lock screen, route changes,
+  AirPlay/AirPods, pause/resume after calls and Siri.
+- Wi-Fi/cellular switching, redirects, expired URLs and station-side 403s.
+- Playlist resolver limits and error surfaces in the host UI.
+
+Native HLS timed-metadata observation is not part of the supported live path.
+Do not enable it in production; the host app supplies metadata through ICY or
+broadcaster APIs.
 
 ### FFmpeg union build
 
@@ -141,9 +161,9 @@ Open:
 
 1. ~~FFmpeg over HTTP~~ Done: `HTTPStream`/`HTTPTransport` (custom AVIO over
    `URLSession`) read with 1 MB `Range` windows and fall back to a full body
-   when the server ignores `Range`; `read_packet` returns `AVERROR_EOF`. Live
-   or segmented streams are still out of scope. Covered by an end-to-end test
-   with a mocked `URLProtocol`.
+   when the server ignores `Range`; `read_packet` returns `AVERROR_EOF`. Finite
+   files stay on this path; continuous streams use the live route below.
+   Covered by an end-to-end test with a mocked `URLProtocol`.
 2. ~~Separate the control queue from the render queue.~~ The refill now
    enqueues one buffer per `requestMediaDataWhenReady` callback, so pause/seek
    queued on the same serial queue run between steps. No second queue needed.
@@ -178,6 +198,8 @@ Do not "fix" it to the buffer total.
 ## Known constraints
 
 - iOS 18+; Spatial Audio / object audio effectively wants iOS 26.
+- Live radio is opt-in and still being validated on device; it is not a
+  replacement for the finite-file player.
 - Taps only process Float32 buffers; other AVPlayer processing formats play
   without processing instead of failing.
 - JOC passthrough relies on the system Atmos decoder; no bundled primer yet.

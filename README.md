@@ -113,6 +113,26 @@ await engine.enqueueNext(
 so a codec change between tracks is handled. `LoudnessAnalyzer.gain(toTarget:)`
 computes a per-track gain when the container has no ReplayGain tag.
 
+### Live radio
+
+Use `loadLive` for continuous streams. It resolves bounded M3U/PLS playlists,
+selects HLS versus ICY/HTTP, applies the reconnect policy and keeps the Now
+Playing card updated:
+
+```swift
+try await engine.loadLive(
+    url: URL(string: "https://radio.example/live.m3u8")!,
+    metadata: NowPlayingMetadata(title: "Live", artist: "Station"),
+    sourceMIMEType: "application/vnd.apple.mpegurl"
+)
+
+// Updated by ICY when the station sends it.
+print(engine.liveTitle ?? "")
+```
+
+The host app remains responsible for station artwork, favourite actions and
+fallback metadata. Live playback is opt-in; finite music playback is unchanged.
+
 ## Routes
 
 | Source | Route | Notes |
