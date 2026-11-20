@@ -201,6 +201,32 @@ final class HTTPStreamTests: XCTestCase {
         XCTAssertEqual(MockURLProtocol.requests(at: 0), 3)
     }
 
+    func testRangeTelemetryIsNumericAndNeverLeaksSignedURLsOrHeaders() {
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data([1, 2, 3, 4])
+        let captured = DiagnosticEvents()
+        let diagnostics = AudioDiagnostics()
+        diagnostics.setHandler { [captured] message in
+            captured.append(message)
+        }
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/track?token=PRIVATE_TOKEN")!,
+            headers: ["Authorization": "Bearer PRIVATE_AUTH"],
+            configuration: makeConfiguration(),
+            diagnostics: diagnostics
+        )
+        var bytes = [UInt8](repeating: 0, count: 4)
+        XCTAssertEqual(bytes.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 4)
+        }, 4)
+        XCTAssertEqual(bytes, [1, 2, 3, 4])
+        let logged = captured.snapshot().joined(separator: "\n")
+        XCTAssertTrue(logged.contains("http.range start=0 status=206 bytes=4"))
+        XCTAssertFalse(logged.contains("PRIVATE_TOKEN"))
+        XCTAssertFalse(logged.contains("PRIVATE_AUTH"))
+        XCTAssertFalse(logged.contains("mock.local"))
+    }
+
     private func makeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -245,6 +271,23 @@ final class HTTPStreamTests: XCTestCase {
             data.append(Data(bytes: &sample, count: 2))
         }
         return data
+    }
+}
+
+private final class DiagnosticEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [String] = []
+
+    func append(_ event: String) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func snapshot() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
     }
 }
 
