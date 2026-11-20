@@ -49,8 +49,13 @@ the only place to prove it.
 
 ## Fixture A/B (same audio, different ID3)
 
-`Fixtures/` contains three single-segment HLS playlists built from the same TS
-packets:
+`Fixtures/` contains three **single-segment** playlists; they stop after ~5.7 s.
+For a >2 minute A/B use the generator with the downloaded TS segments:
+
+    python3 Experiments/RTLMetadataHarness/Fixtures/make_long_fixtures.py \
+      --segments /path/to/ts --out /path/to/long --count 30
+
+and serve the output directory. The three variants are:
 
 | Playlist | Metadata |
 |---|---|
