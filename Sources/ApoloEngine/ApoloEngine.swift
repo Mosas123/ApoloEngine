@@ -37,7 +37,7 @@ public final class ApoloEngine {
     /// overwrite the engine after the user moved on.
     private(set) var loadEpoch: UInt64 = 0
 
-    @ObservationIgnored private let diagnostics = AudioDiagnostics()
+    @ObservationIgnored private let diagnosticEvents = AudioDiagnostics()
     private let host = AVPlayerHost()
     private let session: AudioSessionController
     private let nowPlaying = NowPlayingController()
@@ -153,7 +153,7 @@ public final class ApoloEngine {
                     self.advance(to: track)
                 }
             },
-            diagnostics: diagnostics
+            diagnostics: diagnosticEvents
         )
     }
 
@@ -161,7 +161,7 @@ public final class ApoloEngine {
     /// run on a worker queue; it must be thread-safe and non-blocking.
     /// No source URL, cookies, authorization headers or track identifiers.
     public func setDiagnosticHandler(_ handler: (@Sendable (String) -> Void)?) {
-        diagnostics.setHandler(handler)
+        diagnosticEvents.setHandler(handler)
     }
 
     /// All queued libavcodec callbacks carry the source epoch. This prevents
@@ -425,7 +425,7 @@ public final class ApoloEngine {
         }
 
         let source: OpenedSource
-        let diagnosticSink = diagnostics
+        let diagnosticSink = diagnosticEvents
         do {
             source = try await Task.detached(priority: .userInitiated) {
                 try OpenedSource.open(
