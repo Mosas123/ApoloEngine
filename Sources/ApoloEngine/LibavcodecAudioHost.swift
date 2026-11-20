@@ -210,19 +210,29 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         queue.async { [weak self] in
             guard let self, let decoder = self.decoder else { return }
             do {
-                let target = self.currentTrackStart + max(0, seconds)
-                try decoder.seek(to: max(0, seconds))
+                let relativeTarget = max(0, seconds)
+                let target = self.currentTrackStart + relativeTarget
+                try decoder.seek(to: relativeTarget)
+                // Never run the synchronizer across an empty flushed renderer:
+                // the old code resumed rate=1 here, before the first new PCM.
+                // First PCM now re-arms playback with the preroll gate.
+                self.synchronizer.setRate(0, time: self.synchronizer.currentTime())
                 self.renderer.flush()
-                self.synchronizer.setRate(
-                    self.wantsToPlay ? 1 : 0,
-                    time: CMTime(seconds: target, preferredTimescale: 600)
-                )
                 self.started = false
                 self.timelineEnd = target
                 self.finishToken &+= 1
-                if self.wantsToPlay {
-                    self.startRequesting()
-                }
+                self.synchronizer.setRate(
+                    0,
+                    time: CMTime(seconds: target, preferredTimescale: 600)
+                )
+                self.diagnostics.emit(
+                    "renderer.seek epoch=\(self.currentPlaybackEpoch) "
+                        + "target=\(String(format: "%.3f", relativeTarget)) "
+                        + "wantsPlay=\(self.wantsToPlay) awaitingFirstPCM=true"
+                )
+                // Prepare the first sample even if the user seeks while
+                // paused; setRate(0) keeps it silent until Play.
+                self.startRequesting()
             } catch {
                 self.publish(.failed("Seek failed"))
             }
