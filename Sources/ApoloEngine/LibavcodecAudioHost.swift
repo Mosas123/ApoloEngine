@@ -27,6 +27,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
 
     private var decoder: AudioDecoder?
     private var timeObserver: Any?
+    private var automaticFlushObserver: NSObjectProtocol?
     private var requesting = false
     private var started = false
     private var isLive = false
@@ -59,6 +60,26 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         // This applies to resumed/seeking playback too, without adding
         // synthetic silence or changing sample timestamps.
         synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
+        // Apple can automatically flush queued samples during rate changes.
+        // Observe without changing playback yet; the iPhone A/B logs can show
+        // whether a flush is correlated with the clipped initial transient.
+        automaticFlushObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer,
+            queue: nil
+        ) { [weak self] notification in
+            let seconds = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey]
+                as? NSValue)?.timeValue.seconds
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                let timestamp = seconds.map { String(format: "%.3f", $0) } ?? "unknown"
+                self.diagnostics.emit(
+                    "renderer.autoFlush epoch=\(self.currentPlaybackEpoch) "
+                        + "flushAt=\(timestamp) "
+                        + "started=\(self.started) wantsPlay=\(self.wantsToPlay)"
+                )
+            }
+        }
         timeObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
@@ -68,6 +89,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 max(0, time.seconds - self.currentTrackStart),
                 self.currentPlaybackEpoch
             )
+        }
+    }
+
+    deinit {
+        if let automaticFlushObserver {
+            NotificationCenter.default.removeObserver(automaticFlushObserver)
         }
     }
 
