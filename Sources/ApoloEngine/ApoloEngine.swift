@@ -425,12 +425,13 @@ public final class ApoloEngine {
         }
 
         let source: OpenedSource
+        let diagnosticSink = diagnostics
         do {
             source = try await Task.detached(priority: .userInitiated) {
                 try OpenedSource.open(
                     url: track.url,
                     httpHeaders: track.httpHeaders,
-                    diagnostics: diagnostics
+                    diagnostics: diagnosticSink
                 )
             }.value
         } catch {
