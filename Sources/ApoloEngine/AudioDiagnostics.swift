@@ -87,6 +87,7 @@ private final class FileSink: @unchecked Sendable {
             if let handle = self.handle {
                 _ = try? handle.seekToEnd()
                 try? handle.write(contentsOf: data)
+                try? handle.synchronize()
                 self.size += data.count
             } else {
                 try? data.write(to: url, options: .atomic)
