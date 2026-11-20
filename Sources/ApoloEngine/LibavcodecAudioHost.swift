@@ -53,6 +53,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         self.onTrackChange = onTrackChange
         self.diagnostics = diagnostics
         synchronizer.addRenderer(renderer)
+        // Delay the initial rate change until AVFoundation has buffered enough
+        // audio for a reliable start. Without this, the media clock can run
+        // ahead of the very first PCM and make the intro sound clipped.
+        // This applies to resumed/seeking playback too, without adding
+        // synthetic silence or changing sample timestamps.
+        synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
         timeObserver = synchronizer.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
@@ -340,7 +346,8 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                     "renderer.firstPCM epoch=\(currentPlaybackEpoch) "
                         + "pts=\(String(format: "%.3f", start.seconds)) "
                         + "clockBefore=\(String(format: "%.3f", synchronizer.currentTime().seconds)) "
-                        + "wantsPlay=\(wantsToPlay)"
+                        + "wantsPlay=\(wantsToPlay) "
+                        + "prerollGate=\(synchronizer.delaysRateChangeUntilHasSufficientMediaData)"
                 )
             }
             synchronizer.setRate(wantsToPlay ? 1 : 0, time: start)
