@@ -33,6 +33,7 @@ final class OpenedSource: @unchecked Sendable {
         isLive: Bool = false,
         onICYTitle: (@Sendable (String) -> Void)? = nil,
         liveCancellation: LiveStreamCancellation? = nil,
+        finiteCancellation: FiniteStreamCancellation? = nil,
         diagnostics: AudioDiagnostics? = nil
     ) throws -> OpenedSource {
         var options: OpaquePointer?
@@ -75,6 +76,9 @@ final class OpenedSource: @unchecked Sendable {
                     configuration: sessionConfiguration,
                     diagnostics: diagnostics
                 )
+                // Register before the blocking open/probe starts. A Stop/Next
+                // may already have cancelled this obsolete generation.
+                finiteCancellation?.register(fileStream)
                 guard let file = HTTPTransport(stream: fileStream) else {
                     av_dict_free(&options)
                     throw ApoloError.openFailed(code: -1)

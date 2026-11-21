@@ -63,11 +63,13 @@ final class AudioDecoder {
     func open(
         url: URL,
         httpHeaders: [String: String],
+        finiteCancellation: FiniteStreamCancellation? = nil,
         diagnostics: AudioDiagnostics? = nil
     ) throws {
         let source = try OpenedSource.open(
             url: url,
             httpHeaders: httpHeaders,
+            finiteCancellation: finiteCancellation,
             diagnostics: diagnostics
         )
         try adopt(source)

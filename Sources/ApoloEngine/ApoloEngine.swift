@@ -47,6 +47,9 @@ public final class ApoloEngine {
     private var metadata: NowPlayingMetadata?
     private var resumeAfterInterruption = false
     private var liveCancellation: LiveStreamCancellation?
+    // A finite HTTP probe/decoder must be abortable before its serial worker
+    // can process Stop or the next song.
+    private var finiteCancellation: FiniteStreamCancellation?
     private var livePlaylistResolverTask: Task<URL, Error>?
     private var livePlaylistPausedInFlight = false
     private var liveReconnectTask: Task<Void, Never>?
@@ -275,6 +278,8 @@ public final class ApoloEngine {
         livePlaylistPausedInFlight = false
         liveCancellation?.cancel()
         liveCancellation = nil
+        finiteCancellation?.cancel()
+        finiteCancellation = nil
         state = .loading
         elapsed = 0
         media = nil
@@ -410,6 +415,10 @@ public final class ApoloEngine {
             return
         }
 
+        let cancellation: FiniteStreamCancellation? = isRemote(track.url)
+            ? FiniteStreamCancellation() : nil
+        finiteCancellation = cancellation
+
         if let cached = MediaProbe.cachedInfo(
             url: track.url,
             httpHeaders: track.httpHeaders
@@ -431,6 +440,7 @@ public final class ApoloEngine {
                 try OpenedSource.open(
                     url: track.url,
                     httpHeaders: track.httpHeaders,
+                    finiteCancellation: cancellation,
                     diagnostics: diagnosticSink
                 )
             }.value
@@ -505,7 +515,8 @@ public final class ApoloEngine {
                 libavHost?.load(
                     url: track.url,
                     httpHeaders: track.httpHeaders,
-                    epoch: epoch
+                    epoch: epoch,
+                    finiteCancellation: finiteCancellation
                 )
             }
         }
@@ -660,6 +671,8 @@ public final class ApoloEngine {
         loadEpoch &+= 1
         liveCancellation?.cancel()
         liveCancellation = nil
+        finiteCancellation?.cancel()
+        finiteCancellation = nil
         host.stop()
         libavHost?.stop()
         route = .avPlayer
