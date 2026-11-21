@@ -82,6 +82,49 @@ final class AudioDecoderTests: XCTestCase {
         XCTAssertGreaterThan(samples, 0)
     }
 
+    /// Regression for Trop downloads/imports in the iOS Documents/Downloads
+    /// folder. Foundation percent-encodes spaces, brackets and unicode in
+    /// absoluteString, while FFmpeg's file protocol expects a real path.
+    func testDecodesDownloadedFLACWithSpecialFilename() throws {
+        let fixture = try XCTUnwrap(
+            Bundle.module.url(
+                forResource: "tone",
+                withExtension: "flac",
+                subdirectory: "Fixtures"
+            )
+        )
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Apolo Download QA \(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: folder, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let names = [
+            "Bad Bunny - BAILE INoLVIDABLE [a1Femq4NPxs].flac",
+            "Björk - Jóga #100% [imported].flac",
+            "Soda Stereo - Un Millón De Años Luz [abc123].flac"
+        ]
+        for name in names {
+            let localURL = folder.appendingPathComponent(name)
+            try FileManager.default.copyItem(at: fixture, to: localURL)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: localURL.path))
+            XCTAssertTrue(localURL.absoluteString.contains("%20"))
+
+            do {
+                let source = try OpenedSource.open(url: localURL)
+                XCTAssertEqual(source.info.audioTracks.first?.codec, "flac")
+
+                let decoder = AudioDecoder()
+                try decoder.adopt(source)
+                defer { decoder.close() }
+
+                let pcm = try XCTUnwrap(try decoder.readNextBuffer())
+                XCTAssertGreaterThan(CMSampleBufferGetNumSamples(pcm), 0)
+            }
+        }
+    }
+
     func testDecodesAPE() throws {
         let url = try XCTUnwrap(
             Bundle.module.url(
