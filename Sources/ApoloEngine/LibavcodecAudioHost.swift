@@ -220,7 +220,12 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         set { renderer.volume = newValue }
     }
 
-    func load(url: URL, httpHeaders: [String: String], epoch: UInt64 = 0) {
+    func load(
+        url: URL,
+        httpHeaders: [String: String],
+        epoch: UInt64 = 0,
+        finiteCancellation: FiniteStreamCancellation? = nil
+    ) {
         queue.async { [weak self] in
             guard let self else { return }
             self.setPlaybackEpoch(epoch)
@@ -231,7 +236,10 @@ final class LibavcodecAudioHost: @unchecked Sendable {
                 decoder.limiterEnabled = self.limiterEnabled
                 decoder.trackGainDB = self.trackGainDB
                 try decoder.open(
-                    url: url, httpHeaders: httpHeaders, diagnostics: self.diagnostics
+                    url: url,
+                    httpHeaders: httpHeaders,
+                    finiteCancellation: finiteCancellation,
+                    diagnostics: self.diagnostics
                 )
                 self.decoder = decoder
                 self.wantsToPlay = true
