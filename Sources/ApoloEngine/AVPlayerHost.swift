@@ -112,7 +112,15 @@ final class AVPlayerHost {
             attachTap(to: item, track: audioTrack)
         }
         player.insert(item, after: nil)
-        player.play()
+        // loadTracks suspends the main actor. An explicit Pause can happen
+        // while the audio track is loading; never undo it with unconditional
+        // autoplay when the asset eventually becomes ready.
+        if wantsToPlay {
+            player.play()
+        } else {
+            player.pause()
+        }
+        refreshState()
     }
 
     /// Native live streams have no finite audio track table or meaningful
@@ -183,8 +191,14 @@ final class AVPlayerHost {
         player.insert(item, after: player.items().last)
         if finished {
             finished = false
-            wantsToPlay = true
-            player.play()
+            // The successor may arrive after the listener pressed Pause
+            // during an ended/loading transition. Honor that latest intent.
+            if wantsToPlay {
+                player.play()
+            } else {
+                player.pause()
+            }
+            refreshState()
         }
     }
 
