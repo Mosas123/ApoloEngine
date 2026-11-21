@@ -37,6 +37,7 @@ public final class ApoloEngine {
     /// overwrite the engine after the user moved on.
     private(set) var loadEpoch: UInt64 = 0
 
+    @ObservationIgnored private let diagnosticEvents = AudioDiagnostics()
     private let host = AVPlayerHost()
     private let session: AudioSessionController
     private let nowPlaying = NowPlayingController()
@@ -151,8 +152,16 @@ public final class ApoloEngine {
                     ) else { return }
                     self.advance(to: track)
                 }
-            }
+            },
+            diagnostics: diagnosticEvents
         )
+    }
+
+    /// Optional sanitized network/decoder/renderer telemetry. The callback may
+    /// run on a worker queue; it must be thread-safe and non-blocking.
+    /// No source URL, cookies, authorization headers or track identifiers.
+    public func setDiagnosticHandler(_ handler: (@Sendable (String) -> Void)?) {
+        diagnosticEvents.setHandler(handler)
     }
 
     /// All queued libavcodec callbacks carry the source epoch. This prevents
@@ -416,11 +425,13 @@ public final class ApoloEngine {
         }
 
         let source: OpenedSource
+        let diagnosticSink = diagnosticEvents
         do {
             source = try await Task.detached(priority: .userInitiated) {
                 try OpenedSource.open(
                     url: track.url,
-                    httpHeaders: track.httpHeaders
+                    httpHeaders: track.httpHeaders,
+                    diagnostics: diagnosticSink
                 )
             }.value
         } catch {
@@ -891,5 +902,30 @@ public final class ApoloEngine {
             isPlaying: state == .playing,
             artworkData: metadata.artworkData
         )
+    }
+}
+
+
+/// A lock-protected bridge for telemetry originating on FFmpeg/URLSession
+/// workers. The host application owns storage, rate limiting and privacy.
+final class AudioDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable (String) -> Void)?
+
+    func setHandler(_ newHandler: (@Sendable (String) -> Void)?) {
+        lock.lock()
+        handler = newHandler
+        lock.unlock()
+    }
+
+    func emit(_ event: String) {
+        lock.lock()
+        let callback = handler
+        lock.unlock()
+        callback?(event)
+    }
+
+    static func elapsedMs(since start: UInt64) -> Int {
+        Int((DispatchTime.now().uptimeNanoseconds - start) / 1_000_000)
     }
 }

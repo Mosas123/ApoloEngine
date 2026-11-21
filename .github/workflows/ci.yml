@@ -3,8 +3,9 @@ name: CI
 on:
   push:
     branches: [main]
+  # Run CI for stacked feature PRs too (e.g. diagnostics -> preroll -> seek).
+  # They exercise decoder APIs long before their eventual merge into main.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 concurrency:
