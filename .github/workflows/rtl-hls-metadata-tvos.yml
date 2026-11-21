@@ -1,0 +1,50 @@
+name: RTL HLS Metadata tvOS Harness
+
+on:
+  pull_request:
+    paths:
+      - "Experiments/RTLMetadataHarness/**"
+      - ".github/workflows/rtl-hls-metadata-tvos.yml"
+  workflow_dispatch:
+
+jobs:
+  build-tvos:
+    name: Build unsigned tvOS harness
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+      - name: Build tvOS app
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild \
+            -project RTLMetadataHarness.xcodeproj \
+            -scheme RTLMetadataHarnessTV \
+            -configuration Release \
+            -sdk appletvos \
+            -destination 'generic/platform=tvOS' \
+            -derivedDataPath "$RUNNER_TEMP/tvos-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Package unsigned tvOS IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/tvos-derived/Build/Products/Release-appletvos/RTLMetadataHarnessTV.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/tvos-package/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/tvos-package/Payload/"
+          cd "$RUNNER_TEMP/tvos-package"
+          zip -qry "$RUNNER_TEMP/RTLMetadataHarnessTV-unsigned.ipa" Payload
+          unzip -t "$RUNNER_TEMP/RTLMetadataHarnessTV-unsigned.ipa" >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RTL-HLS-MetadataHarness-tvOS-unsigned
+          path: ${{ runner.temp }}/RTLMetadataHarnessTV-unsigned.ipa
+          retention-days: 14

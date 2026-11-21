@@ -1,0 +1,83 @@
+name: RTL HLS Metadata ASan Simulator
+
+on:
+  pull_request:
+    paths:
+      - "Experiments/RTLMetadataHarness/**"
+      - ".github/workflows/rtl-hls-metadata-asan.yml"
+  workflow_dispatch:
+
+jobs:
+  asan-simulator:
+    name: ASan diagnostic in iOS Simulator
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+      - name: Generate Xcode project
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+      - name: Build with AddressSanitizer
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project RTLMetadataHarness.xcodeproj \
+            -scheme RTLMetadataHarness \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/asan-derived" \
+            -enableAddressSanitizer YES \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Boot simulator and serve fixture
+        run: |
+          set -euo pipefail
+          python3 Experiments/RTLMetadataHarness/Fixtures/serve_fixtures.py > "$RUNNER_TEMP/fixture-server.log" 2>&1 &
+          sleep 2
+          UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print(next(x["udid"] for k,v in d.items() if "iOS" in k for x in v if "iPhone" in x["name"]))')
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+          APP="$RUNNER_TEMP/asan-derived/Build/Products/Debug-iphonesimulator/RTLMetadataHarness.app"
+          test -d "$APP"
+          xcrun simctl install "$UDID" "$APP"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+      - name: Run auto-start probe with ASan
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, subprocess, sys
+          cmd = [
+              "xcrun", "simctl", "launch", "--console", "--terminate-running-process",
+              os.environ["UDID"], "com.cl0udly.RTLMetadataHarness",
+              "-probeURL", "http://127.0.0.1:8765/asan/priv_only.m3u8",
+              "-autoStart",
+          ]
+          try:
+              r = subprocess.run(cmd, text=True, capture_output=True, timeout=120)
+              print("EXIT", r.returncode)
+              print("STDOUT\n" + r.stdout)
+              print("STDERR\n" + r.stderr)
+          except subprocess.TimeoutExpired as e:
+              print("TIMEOUT (no crash within 120s)")
+              print((e.stdout or "").decode(errors="replace"))
+              print((e.stderr or "").decode(errors="replace"))
+          PY
+          cat "$RUNNER_TEMP/fixture-server.log" || true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: RTL-HLS-ASan-logs
+          path: |
+            ${{ runner.temp }}/fixture-server.log
+          retention-days: 14

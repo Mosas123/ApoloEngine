@@ -1,0 +1,47 @@
+name: RTL HLS Metadata macOS Harness
+
+on:
+  pull_request:
+    paths:
+      - "Experiments/RTLMetadataHarness/**"
+      - ".github/workflows/rtl-hls-metadata-macos.yml"
+  workflow_dispatch:
+
+jobs:
+  build-macos:
+    name: Build unsigned macOS harness
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+      - name: Build macOS app
+        working-directory: Experiments/RTLMetadataHarness
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project.yml
+          xcodebuild \
+            -project RTLMetadataHarness.xcodeproj \
+            -scheme RTLMetadataHarnessMac \
+            -configuration Release \
+            -sdk macosx \
+            -destination 'generic/platform=macOS' \
+            -derivedDataPath "$RUNNER_TEMP/macos-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+      - name: Package macOS app
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/macos-derived/Build/Products/Release/RTLMetadataHarnessMac.app"
+          test -d "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$RUNNER_TEMP/RTLMetadataHarnessMac-unsigned.zip"
+          unzip -t "$RUNNER_TEMP/RTLMetadataHarnessMac-unsigned.zip" >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RTL-HLS-MetadataHarness-macOS-unsigned
+          path: ${{ runner.temp }}/RTLMetadataHarnessMac-unsigned.zip
+          retention-days: 14
