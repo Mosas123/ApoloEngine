@@ -32,7 +32,8 @@ final class OpenedSource: @unchecked Sendable {
         sessionConfiguration: URLSessionConfiguration = .default,
         isLive: Bool = false,
         onICYTitle: (@Sendable (String) -> Void)? = nil,
-        liveCancellation: LiveStreamCancellation? = nil
+        liveCancellation: LiveStreamCancellation? = nil,
+        diagnostics: AudioDiagnostics? = nil
     ) throws -> OpenedSource {
         var options: OpaquePointer?
         // Music headers resolve well within this; the defaults (5 MB / 5 s)
@@ -71,7 +72,8 @@ final class OpenedSource: @unchecked Sendable {
                 let fileStream = HTTPStream(
                     url: url,
                     headers: httpHeaders,
-                    configuration: sessionConfiguration
+                    configuration: sessionConfiguration,
+                    diagnostics: diagnostics
                 )
                 guard let file = HTTPTransport(stream: fileStream) else {
                     av_dict_free(&options)
@@ -87,7 +89,11 @@ final class OpenedSource: @unchecked Sendable {
             allocated.pointee.pb = transport.context
 
             var context: UnsafeMutablePointer<AVFormatContext>? = allocated
+            let openStarted = DispatchTime.now().uptimeNanoseconds
             let openCode = avformat_open_input(&context, nil, nil, &options)
+            diagnostics?.emit(
+                "probe.open ms=\(AudioDiagnostics.elapsedMs(since: openStarted)) code=\(openCode)"
+            )
             av_dict_free(&options)
             guard openCode == 0, let context else {
                 if context != nil {
@@ -98,7 +104,13 @@ final class OpenedSource: @unchecked Sendable {
             }
 
             do {
+                let probeStarted = DispatchTime.now().uptimeNanoseconds
                 let info = try buildInfo(context)
+                diagnostics?.emit(
+                    "probe.streamInfo ms=\(AudioDiagnostics.elapsedMs(since: probeStarted)) "
+                        + "container=\(info.container) codec=\(info.audioTracks.first?.codec ?? "unknown") "
+                        + "duration=\(String(format: "%.3f", info.duration))"
+                )
                 return OpenedSource(
                     info: info,
                     formatContext: context,
