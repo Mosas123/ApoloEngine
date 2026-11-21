@@ -22,6 +22,25 @@ final class HTTPStream: @unchecked Sendable {
     private var fullData: Data?
     private var loadError: Error?
     private var position: Int64 = 0
+    private var cancelled = false
+    private var activeTask: URLSessionDataTask?
+
+    /// Called independently of the serial FFmpeg worker. Never releases AVIO
+    /// memory: only the decoder worker may dispose of its format context.
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        if loadError == nil { loadError = URLError(.cancelled) }
+        let task = activeTask
+        lock.unlock()
+        task?.cancel()
+    }
+
+    private var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
 
     init(
         url: URL,
@@ -38,6 +57,7 @@ final class HTTPStream: @unchecked Sendable {
     }
 
     deinit {
+        cancel()
         session.invalidateAndCancel()
     }
 
@@ -169,10 +189,15 @@ final class HTTPStream: @unchecked Sendable {
 
     private func fetch(from start: Int64) -> Bool {
         for attempt in 0...Self.maxTransientRetries {
+            guard !isCancelled else { return false }
             if attempt > 0 {
-                // This is FFmpeg's synchronous AVIO worker, not the main actor.
-                Thread.sleep(forTimeInterval: Double(attempt) * 0.15)
+                // Bounded retry delay must also yield promptly to Stop/Next.
+                for _ in 0..<(attempt * 3) {
+                    guard !isCancelled else { return false }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
             }
+            guard !isCancelled else { return false }
 
             let requestStarted = DispatchTime.now().uptimeNanoseconds
             switch requestRange(from: start) {
@@ -207,6 +232,10 @@ final class HTTPStream: @unchecked Sendable {
                         return false
                     }
                     lock.lock()
+                    if cancelled {
+                        lock.unlock()
+                        return false
+                    }
                     if let oldSize = totalSize,
                        let newSize = range.total,
                        oldSize != newSize {
@@ -224,6 +253,10 @@ final class HTTPStream: @unchecked Sendable {
                     // Some small files ignore Range. Preserve the existing
                     // compatibility path; these responses contain the full file.
                     lock.lock()
+                    if cancelled {
+                        lock.unlock()
+                        return false
+                    }
                     fullData = data
                     totalSize = Int64(data.count)
                     cacheStart = 0
@@ -280,12 +313,35 @@ final class HTTPStream: @unchecked Sendable {
             result.set(data: data, response: response, error: error)
             semaphore.signal()
         }
+        lock.lock()
+        let wasCancelled = cancelled
+        if !wasCancelled { activeTask = task }
+        lock.unlock()
+        guard !wasCancelled else {
+            task.cancel()
+            return .failure(URLError(.cancelled))
+        }
+        defer {
+            lock.lock()
+            if activeTask === task { activeTask = nil }
+            lock.unlock()
+        }
         task.resume()
 
-        if semaphore.wait(timeout: .now() + 60) == .timedOut {
-            task.cancel()
-            return .failure(URLError(.timedOut))
+        // URLSession cancellation alone does not unblock our synchronous
+        // AVIO semaphore; poll the cancellation flag without busy-spinning.
+        let deadline = DispatchTime.now() + .seconds(60)
+        while semaphore.wait(timeout: .now() + .milliseconds(50)) == .timedOut {
+            if isCancelled {
+                task.cancel()
+                return .failure(URLError(.cancelled))
+            }
+            if DispatchTime.now() >= deadline {
+                task.cancel()
+                return .failure(URLError(.timedOut))
+            }
         }
+        guard !isCancelled else { return .failure(URLError(.cancelled)) }
 
         let fetched = result.value()
         if let error = fetched.error {
