@@ -125,10 +125,22 @@ final class OpenedSource: @unchecked Sendable {
         }
 
         var context: UnsafeMutablePointer<AVFormatContext>?
-        let openCode = url.absoluteString.withCString {
+        // FFmpeg's file protocol does not percent-decode a Foundation file URL.
+        // Trop downloads are named "Artist - Title [id].flac", so passing
+        // absoluteString asks FFmpeg for a literal "%20" filename (ENOENT).
+        // Use the filesystem path for local media; preserve URL semantics for
+        // any non-file protocol.
+        let input = url.isFileURL ? url.path : url.absoluteString
+        let openCode = input.withCString {
             avformat_open_input(&context, $0, nil, &options)
         }
         av_dict_free(&options)
+        if url.isFileURL {
+            // Safe on-device diagnostics: never expose the user's file path.
+            diagnostics?.emit(
+                "probe.localOpen exists=\(FileManager.default.fileExists(atPath: url.path)) code=\(openCode)"
+            )
+        }
         guard openCode == 0, let context else {
             throw ApoloError.openFailed(code: openCode)
         }
