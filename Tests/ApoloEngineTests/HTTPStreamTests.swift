@@ -227,6 +227,62 @@ final class HTTPStreamTests: XCTestCase {
         XCTAssertFalse(logged.contains("mock.local"))
     }
 
+    func testFiniteCancellationAbortsBlockedRangeWithoutWaitingForTimeout() {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HangingRangeURLProtocol.self]
+        let stream = HTTPStream(
+            url: URL(string: "https://hang.local/slow.flac")!,
+            headers: [:],
+            configuration: configuration
+        )
+        let cancellation = FiniteStreamCancellation()
+        cancellation.register(stream)
+        let finished = expectation(description: "read exits after Stop/Next")
+        let result = LockedReadCount()
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let count = bytes.withUnsafeMutableBufferPointer {
+                stream.read(into: $0.baseAddress!, count: 32)
+            }
+            result.store(count)
+            finished.fulfill()
+        }
+        XCTAssertEqual(
+            HangingRangeURLProtocol.started.wait(
+                timeout: .now() + .seconds(3)
+            ), .success, "HTTP request should actually start and hang"
+        )
+        let cancelStarted = Date()
+        cancellation.cancel()
+        wait(for: [finished], timeout: 2)
+        XCTAssertLessThan(
+            Date().timeIntervalSince(cancelStarted), 1.0,
+            "Stop/Next cancellation must not wait for the 60-second Range deadline"
+        )
+        XCTAssertEqual(result.value, 0)
+        XCTAssertTrue(stream.hasError)
+    }
+
+    func testCancellationBeforeProbeDoesNotStartAnObsoleteRequest() {
+        MockURLProtocol.supportsRange = true
+        MockURLProtocol.payload = Data([1, 2, 3, 4])
+        let stream = HTTPStream(
+            url: URL(string: "https://mock.local/obsolete.flac")!,
+            headers: [:],
+            configuration: makeConfiguration()
+        )
+        let cancellation = FiniteStreamCancellation()
+        cancellation.cancel()
+        cancellation.register(stream)
+        var bytes = [UInt8](repeating: 0, count: 4)
+        XCTAssertEqual(bytes.withUnsafeMutableBufferPointer {
+            stream.read(into: $0.baseAddress!, count: 4)
+        }, 0)
+        XCTAssertTrue(stream.hasError)
+        XCTAssertEqual(MockURLProtocol.requests(at: 0), 0)
+    }
+
     private func makeConfiguration() -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -420,4 +476,41 @@ private final class MockURLProtocol: URLProtocol {
         let upper = max(lower, min(end + 1, total))
         return lower..<upper
     }
+}
+
+private final class LockedReadCount: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored = -1
+
+    func store(_ count: Int) {
+        lock.lock()
+        stored = count
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
+/// Deliberately never supplies a response. Tests that a cancelled obsolete
+/// AVIO read exits while URLSession would otherwise remain pending.
+private final class HangingRangeURLProtocol: URLProtocol {
+    static let started = DispatchSemaphore(value: 0)
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "hang.local"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        Self.started.signal()
+    }
+
+    override func stopLoading() {}
 }
