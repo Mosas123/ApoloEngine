@@ -27,6 +27,7 @@ final class AVPlayerHost {
     private var lastObservedItem: AVPlayerItem?
     private var lastObservedTime: TimeInterval?
     private var lastObservedDuration: TimeInterval?
+    private var clockAudit = NativeClockAudit()
     private(set) var nativeEndEvidence: NativeEndedItemEvidence?
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
@@ -37,6 +38,8 @@ final class AVPlayerHost {
     var onTrackChange: (@MainActor () -> Void)?
     var onLiveTitle: (@MainActor (String) -> Void)?
     var onNativeEndEvidence: (@MainActor (NativeEndedItemEvidence) -> Void)?
+    var onNativeClockTrace: (@MainActor (NativeClockTrace) -> Void)?
+    var onNativeAccessSummary: (@MainActor (TimeInterval?, Int) -> Void)?
 
     init() {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -241,6 +244,7 @@ final class AVPlayerHost {
         // A seek may invalidate the previously observed time of this SAME
         // item. Never use its pre-seek clock to diagnose a later EOF.
         lastObservedTime = nil
+        clockAudit.invalidateBaseline()
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         _ = await player.seek(
             to: time,
@@ -339,6 +343,22 @@ final class AVPlayerHost {
         )
         nativeEndEvidence = evidence
         onNativeEndEvidence?(evidence)
+        if let position = evidence.position,
+           let finalClock = clockAudit.finish(
+               position: position,
+               uptime: ProcessInfo.processInfo.systemUptime,
+               playerRate: Double(player.rate),
+               motion: nativeClockMotion
+           ) {
+            onNativeClockTrace?(finalClock)
+        }
+        if let lastAccess = ended.accessLog()?.events.last {
+            let watched = lastAccess.durationWatched
+            onNativeAccessSummary?(
+                watched.isFinite && watched >= 0 ? watched : nil,
+                lastAccess.numberOfStalls
+            )
+        }
 
         guard let last = player.items().last else {
             finished = true
@@ -375,6 +395,7 @@ final class AVPlayerHost {
         lastObservedItem = nil
         lastObservedTime = nil
         lastObservedDuration = nil
+        clockAudit.reset()
         isLiveStream = false
         tapProcessors.removeAll()
         player.removeAllItems()
@@ -386,10 +407,19 @@ final class AVPlayerHost {
                 lastObservedTime = nil
                 lastObservedDuration = nil
                 lastObservedItem = item
+                clockAudit.reset()
             }
             let position = item.currentTime()
             if position.isNumeric && position.seconds.isFinite && position.seconds >= 0 {
                 lastObservedTime = position.seconds
+                if let trace = clockAudit.observe(
+                    position: position.seconds,
+                    uptime: ProcessInfo.processInfo.systemUptime,
+                    playerRate: Double(player.rate),
+                    motion: nativeClockMotion
+                ) {
+                    onNativeClockTrace?(trace)
+                }
             }
             let length = item.duration
             if length.isNumeric && length.seconds.isFinite && length.seconds > 0 {
@@ -400,6 +430,15 @@ final class AVPlayerHost {
             onTime?(isLiveStream ? 0 : time.seconds)
         }
         refreshState()
+    }
+
+    private var nativeClockMotion: NativeClockMotion {
+        switch player.timeControlStatus {
+        case .playing: return .playing
+        case .paused: return .paused
+        case .waitingToPlayAtSpecifiedRate: return .waiting
+        @unknown default: return .waiting
+        }
     }
 
     private func refreshState() {
