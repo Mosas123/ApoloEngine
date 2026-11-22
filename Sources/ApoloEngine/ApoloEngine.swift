@@ -87,7 +87,7 @@ public final class ApoloEngine {
             let position = evidence.position.map { String(format: "%.3f", $0) } ?? "unknown"
             let duration = evidence.duration.map { String(format: "%.3f", $0) } ?? "unknown"
             self.diagnosticEvents.emit(
-                "renderer.nativeEOF position=\\(position) duration=\\(duration) origin=\\(evidence.origin.rawValue)"
+                "renderer.nativeEOF position=\(position) duration=\(duration) origin=\(evidence.origin.rawValue)"
             )
         }
         host.onTrackChange = { [weak self] in
