@@ -238,6 +238,9 @@ final class AVPlayerHost {
 
     func seek(to seconds: TimeInterval) async {
         guard !isLiveStream else { return }
+        // A seek may invalidate the previously observed time of this SAME
+        // item. Never use its pre-seek clock to diagnose a later EOF.
+        lastObservedTime = nil
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         _ = await player.seek(
             to: time,
