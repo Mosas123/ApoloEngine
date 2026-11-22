@@ -81,6 +81,15 @@ public final class ApoloEngine {
         host.onTime = { [weak self] time in
             self?.elapsed = time
         }
+        host.onNativeEndEvidence = { [weak self] evidence in
+            guard let self, self.route == .avPlayer else { return }
+            // No URLs, tokens, track IDs or metadata: numeric-only QA data.
+            let position = evidence.position.map { String(format: "%.3f", $0) } ?? "unknown"
+            let duration = evidence.duration.map { String(format: "%.3f", $0) } ?? "unknown"
+            self.diagnosticEvents.emit(
+                "renderer.nativeEOF position=\\(position) duration=\\(duration) origin=\\(evidence.origin.rawValue)"
+            )
+        }
         host.onTrackChange = { [weak self] in
             self?.advanceFromQueue()
         }
