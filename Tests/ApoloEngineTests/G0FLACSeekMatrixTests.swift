@@ -141,6 +141,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         var firstOverlapping: String = "none"
         var firstRetainedPTS: String = "none"
         var lastFrame: String = "none"
+        var effectiveTargetSample: Int64?
+        var requestedSampleNearest: Int64?
+        var droppedTargetTailSamples: Int64?
+        var firstWouldRetainSample: Int64?
         var readEndCode: Int32 = 0
         var sendError: Int32 = 0
 
@@ -155,6 +159,32 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                     * Double(timeBase.num) / Double(timeBase.den)
                 let count = Int(frame.pointee.nb_samples)
                 let end = start + Double(count) / Double(rate)
+                // Compute on the exact sample grid of the decoded frame.
+                // The engine quantizes a requested second to Int64 stream
+                // ticks before seeking; capture BOTH requested and effective.
+                let sampleTimebase = AVRational(num: 1, den: rate)
+                let startSample = av_rescale_q(
+                    frame.pointee.pts, timeBase, sampleTimebase
+                )
+                let targetSample = av_rescale_q(
+                    targetTicks, timeBase, sampleTimebase
+                )
+                let endSample = startSample + Int64(count)
+                effectiveTargetSample = targetSample
+                requestedSampleNearest = Int64(
+                    (seconds * Double(rate)).rounded()
+                )
+                if startSample < targetSample && endSample > targetSample
+                    && droppedTargetTailSamples == nil {
+                    // These are decoded PCM samples that would survive a
+                    // sample-granular trim but are dropped by the current
+                    // whole-frame rule. Not measured audible lost samples.
+                    droppedTargetTailSamples = endSample - targetSample
+                }
+                if startSample >= targetSample
+                    && firstWouldRetainSample == nil {
+                    firstWouldRetainSample = startSample
+                }
                 lastFrame = String(
                     format: "start=%.9f end=%.9f samples=%d", start, end, count
                 )
@@ -193,6 +223,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             + "droppedTargetCovering=\(wouldDropCovering) "
             + "targetFrame={\(firstOverlapping)} "
             + "firstWouldRetainPTS=\(firstRetainedPTS) "
+            + "effectiveTargetSample=\(effectiveTargetSample.map(String.init) ?? "none") "
+            + "requestedSampleNearest=\(requestedSampleNearest.map(String.init) ?? "none") "
+            + "droppedTargetTailSamples=\(droppedTargetTailSamples.map(String.init) ?? "none") "
+            + "firstWouldRetainSample=\(firstWouldRetainSample.map(String.init) ?? "none") "
             + "lastFrame={\(lastFrame)} readEnd=\(readEndCode) "
             + "sendError=\(sendError)"
     }
