@@ -4,6 +4,7 @@ import AetherLibavutil
 import AetherLibswresample
 import CoreMedia
 import Darwin
+import Dispatch
 import Foundation
 import XCTest
 @testable import ApoloEngine
@@ -1375,6 +1376,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     /// before the Swift whole-frame discard. No production flags changed.
     private func nativePCMSequenceR9(
         url: URL, targetTick: Int64?,
+        onPacket: ((Int) -> Void)? = nil,
+        onSeek: ((Int32, UInt64) -> Void)? = nil,
         onFrame: ((UnsafeMutablePointer<AVFrame>) throws -> Void)? = nil
     ) throws -> (code: Int32, pcm: NativePCMSequenceR9) {
         let source = try OpenedSource.open(url: url)
@@ -1436,10 +1439,12 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 if primed.firstTick != nil { break }
             }
             guard primed.firstTick != nil else { throw MatrixError.missingPCM }
+            let seekStarted = DispatchTime.now().uptimeNanoseconds
             let code = avformat_seek_file(
                 context, 0, Int64.min, targetTick, Int64.max,
                 AVSEEK_FLAG_BACKWARD
             )
+            onSeek?(code, DispatchTime.now().uptimeNanoseconds - seekStarted)
             if code < 0 { return (code, NativePCMSequenceR9()) }
             avformat_flush(context)
             avcodec_flush_buffers(allocated)
@@ -1459,6 +1464,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             guard read >= 0 else { throw MatrixError.invalidFixture }
             defer { av_packet_unref(packet) }
             guard packet.pointee.stream_index == 0 else { continue }
+            onPacket?(Int(packet.pointee.size))
             guard avcodec_send_packet(allocated, packet) >= 0
             else { throw MatrixError.invalidFixture }
             _ = try drain(into: &output, streaming: true)
@@ -1820,6 +1826,155 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         )
         XCTAssertEqual(attempted, 32)
         XCTAssertEqual(setupErrors, 0, "R10 observation incomplete")
+        XCTAssertEqual(rejected + exact + incomplete, attempted)
+    }
+
+    /// R11 compares independent, bounded earlier seek anchors with the
+    /// direct request. No FAST_SEEK, oracle packet offsets or production
+    /// fallback. All candidates decode only real packets and compare
+    /// retained PCM to a linear native reference at the ORIGINAL target.
+    /// Packet payload byte counts exclude probing, priming, internal AVIO
+    /// reads and container overhead; timings are observations, not a
+    /// controlled performance benchmark.
+    func testG0B03BoundedSeekRecoveryObservation() throws {
+        let inputs: [(tag: String, samples: Int64, targets: [Int64])] = [
+            ("025", 11025, [2756]),
+            ("050", 22050, [11025]),
+            ("200", 88200, [79380, 78336, 80640, 44100]),
+            ("1000", 441000, [428544, 430848, 396900])
+        ]
+        // Fixed sample-grid offsets, independent of packet geometry.
+        let strategies: [(name: String, backoff: Int64)] = [
+            ("direct", 0), ("back125ms", 5512), ("back500ms", 22050)
+        ]
+        var attempted = 0
+        var rejected = 0
+        var exact = 0
+        var incomplete = 0
+        var setupErrors = 0
+        for item in inputs {
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                let linear = try nativePCMSequenceR9(url: url, targetTick: nil)
+                let reference = linear.pcm
+                guard linear.code == 0, reference.firstTick == 0,
+                      reference.endTick == item.samples, reference.stride > 0,
+                      reference.data.count == Int(item.samples) * reference.stride
+                else { throw MatrixError.invalidFixture }
+                for target in item.targets {
+                    for strategy in strategies {
+                        attempted += 1
+                        let anchor = max(Int64(0), target - strategy.backoff)
+                        let label = "durationTag=\(item.tag) table=\(table) "
+                            + "targetTick=\(target) strategy=\(strategy.name) anchorTick=\(anchor)"
+                        var firstRaw: Int64?
+                        var rawEnd: Int64?
+                        var firstKept: Int64?
+                        var keptEnd: Int64?
+                        var decodedFrames = 0
+                        var decodedSamples = 0
+                        var discardedSamples = 0
+                        var payloadBytes = 0
+                        var packets = 0
+                        var firstKeptPackets: Int?
+                        var firstKeptBytes: Int?
+                        var firstKeptNS: UInt64?
+                        var seekNS: UInt64?
+                        var comparedBytes = 0
+                        var mismatchedFrames = 0
+                        let started = DispatchTime.now().uptimeNanoseconds
+                        do {
+                            let result = try nativePCMSequenceR9(
+                                url: url, targetTick: anchor,
+                                onPacket: { size in
+                                    packets += 1
+                                    payloadBytes += size
+                                },
+                                onSeek: { _, elapsed in seekNS = elapsed }
+                            ) { frame in
+                                var one = NativePCMSequenceR9()
+                                try one.append(frame)
+                                guard let start = one.firstTick,
+                                      let end = one.endTick,
+                                      end <= item.samples,
+                                      rawEnd == nil || rawEnd == start,
+                                      one.stride == reference.stride,
+                                      one.sampleFormat == reference.sampleFormat
+                                else { throw MatrixError.invalidFixture }
+                                if firstRaw == nil { firstRaw = start }
+                                rawEnd = end
+                                decodedFrames += 1
+                                decodedSamples += Int(end - start)
+                                if end <= target {
+                                    discardedSamples += Int(end - start)
+                                    return
+                                }
+                                let kept = max(start, target)
+                                discardedSamples += Int(kept - start)
+                                guard keptEnd == nil || keptEnd == kept
+                                else { throw MatrixError.invalidTimestamp }
+                                if firstKept == nil {
+                                    firstKept = kept
+                                    firstKeptPackets = packets
+                                    firstKeptBytes = payloadBytes
+                                    firstKeptNS = DispatchTime.now().uptimeNanoseconds - started
+                                }
+                                keptEnd = end
+                                let bytes = one.data.dropFirst(Int(kept - start) * one.stride)
+                                let a = Int(kept) * reference.stride
+                                let b = Int(end) * reference.stride
+                                comparedBytes += bytes.count
+                                if !bytes.elementsEqual(reference.data[a..<b]) {
+                                    mismatchedFrames += 1
+                                }
+                            }
+                            let totalNS = DispatchTime.now().uptimeNanoseconds - started
+                            if result.code < 0 {
+                                rejected += 1
+                                print("G0_B03_R11_CASE \(label) seekCode=\(result.code)")
+                            } else {
+                                let complete = firstKept == target && keptEnd == item.samples
+                                    && mismatchedFrames == 0
+                                    && comparedBytes == Int(item.samples - target) * reference.stride
+                                if complete { exact += 1 } else { incomplete += 1 }
+                                print(
+                                    "G0_B03_R11_CASE \(label) seekCode=0 "
+                                        + "rawFirst=\(firstRaw.map(String.init) ?? "none") "
+                                        + "rawEnd=\(rawEnd.map(String.init) ?? "none") "
+                                        + "firstKept=\(firstKept.map(String.init) ?? "none") "
+                                        + "keptEnd=\(keptEnd.map(String.init) ?? "none") "
+                                        + "decodedFrames=\(decodedFrames) decodedSamples=\(decodedSamples) "
+                                        + "discardedSamples=\(discardedSamples) packets=\(packets) "
+                                        + "payloadBytes=\(payloadBytes) "
+                                        + "firstKeptPackets=\(firstKeptPackets.map(String.init) ?? "none") "
+                                        + "firstKeptBytes=\(firstKeptBytes.map(String.init) ?? "none") "
+                                        + "comparedBytes=\(comparedBytes) mismatchedFrames=\(mismatchedFrames) "
+                                        + "complete=\(complete)"
+                                )
+                            }
+                            // Separate volatile timings from deterministic
+                            // observation records for baseline/A1 comparison.
+                            print(
+                                "G0_B03_R11_TIMING \(label) "
+                                    + "seekNS=\(seekNS.map(String.init) ?? "none") "
+                                    + "firstKeptNS=\(firstKeptNS.map(String.init) ?? "none") totalNS=\(totalNS)"
+                            )
+                        } catch {
+                            setupErrors += 1
+                            print("G0_B03_R11_CASE \(label) setupError=\(error)")
+                        }
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R11_SUMMARY attempted=\(attempted) rejected=\(rejected) "
+                + "exact=\(exact) incomplete=\(incomplete) setupErrors=\(setupErrors)"
+        )
+        // Nine targets x two fixture variants x three independent anchors.
+        // Clamped anchors may coincide intentionally in the shortest file.
+        XCTAssertEqual(attempted, 54)
+        XCTAssertEqual(setupErrors, 0, "R11 observation incomplete")
         XCTAssertEqual(rejected + exact + incomplete, attempted)
     }
 
