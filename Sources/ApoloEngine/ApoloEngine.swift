@@ -245,6 +245,7 @@ public final class ApoloEngine {
         liveShouldPlay = true
         queue.start(track)
         loadEpoch &+= 1
+        traceIntent("load")
         try await startPlayback(track, epoch: loadEpoch)
     }
 
@@ -514,6 +515,7 @@ public final class ApoloEngine {
     }
 
     public func play() {
+        traceIntent("play")
         resumeAfterInterruption = false
         if queue.current?.streamMode == .live {
             liveShouldPlay = true
@@ -537,6 +539,7 @@ public final class ApoloEngine {
     }
 
     public func pause() {
+        traceIntent("pause")
         resumeAfterInterruption = false
         if queue.current?.streamMode == .live {
             liveShouldPlay = false
@@ -571,6 +574,7 @@ public final class ApoloEngine {
 
     public func seek(to seconds: TimeInterval) async {
         guard queue.current?.streamMode != .live else { return }
+        traceIntent("seek")
         switch route {
         case .avPlayer:
             await host.seek(to: seconds)
@@ -635,6 +639,7 @@ public final class ApoloEngine {
         livePlayingSince = nil
         liveShouldPlay = true
         loadEpoch &+= 1
+        traceIntent("next")
         try await startPlayback(next, epoch: loadEpoch)
     }
 
@@ -645,6 +650,7 @@ public final class ApoloEngine {
         livePlayingSince = nil
         liveShouldPlay = true
         loadEpoch &+= 1
+        traceIntent("previous")
         try await startPlayback(previous, epoch: loadEpoch)
     }
 
@@ -658,6 +664,7 @@ public final class ApoloEngine {
         liveRetryOpening = false
         livePlayingSince = nil
         loadEpoch &+= 1
+        traceIntent("stop")
         liveCancellation?.cancel()
         liveCancellation = nil
         host.stop()
@@ -870,6 +877,16 @@ public final class ApoloEngine {
 
     private func apply(_ newState: PlaybackState) {
         state = newState
+        let stateName: String
+        switch newState {
+        case .idle: stateName = "idle"
+        case .loading: stateName = "loading"
+        case .playing: stateName = "playing"
+        case .paused: stateName = "paused"
+        case .finished: stateName = "finished"
+        case .failed: stateName = "failed"
+        }
+        traceIntent("state.\(stateName)")
         if queue.current?.streamMode == .live {
             switch newState {
             case .playing:
@@ -889,6 +906,18 @@ public final class ApoloEngine {
             }
         }
         refreshNowPlaying()
+    }
+
+    /// Stable numeric generation and monotonic time let Trop correlate state,
+    /// HTTP latency and decode latency without recording track identity.
+    private func traceIntent(_ action: String) {
+        let routeName = route == .avPlayer ? "apple" : "ffmpeg"
+        let live = queue.current?.streamMode == .live
+        let uptimeMs = Int(ProcessInfo.processInfo.systemUptime * 1_000)
+        diagnosticEvents.emit(
+            "lifecycle v=1 action=\(action) epoch=\(loadEpoch) "
+                + "route=\(routeName) live=\(live) uptimeMs=\(uptimeMs)"
+        )
     }
 
     private func refreshNowPlaying() {
