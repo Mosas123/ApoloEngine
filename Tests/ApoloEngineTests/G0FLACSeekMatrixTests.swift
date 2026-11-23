@@ -1115,6 +1115,197 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(accepted + rejected, attempted)
     }
 
+    /// R8 copies the actual interleaved Float32 PCM delivered to CoreMedia.
+    /// No render device or timing estimate is substituted for sample data.
+    private struct PCMSequenceR8 {
+        var firstTick: Int64?
+        var nextTick: Int64?
+        var channels = 0
+        var buffers = 0
+        var samples: [Float] = []
+
+        var frameCount: Int { channels > 0 ? samples.count / channels : 0 }
+
+        mutating func append(_ buffer: CMSampleBuffer) throws {
+            let count = CMSampleBufferGetNumSamples(buffer)
+            let seconds = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
+            guard count > 0, seconds.isFinite, seconds >= 0,
+                  let block = CMSampleBufferGetDataBuffer(buffer)
+            else { throw MatrixError.invalidTimestamp }
+            let tick = Int64((seconds * 44100).rounded())
+            guard abs(seconds * 44100 - Double(tick)) < 0.001,
+                  nextTick == nil || nextTick == tick
+            else { throw MatrixError.invalidTimestamp }
+
+            let bytes = CMBlockBufferGetDataLength(block)
+            let stride = MemoryLayout<Float>.stride
+            guard bytes > 0, bytes % (count * stride) == 0
+            else { throw MatrixError.invalidFixture }
+            let channelCount = bytes / (count * stride)
+            guard channelCount > 0,
+                  channels == 0 || channels == channelCount
+            else { throw MatrixError.invalidFixture }
+
+            var floats = [Float](repeating: 0, count: bytes / stride)
+            let status = floats.withUnsafeMutableBytes { raw in
+                CMBlockBufferCopyDataBytes(
+                    block, atOffset: 0, dataLength: bytes,
+                    destination: raw.baseAddress!
+                )
+            }
+            guard status == 0, floats.allSatisfy({ $0.isFinite })
+            else { throw MatrixError.invalidFixture }
+            if firstTick == nil { firstTick = tick }
+            nextTick = tick + Int64(count)
+            channels = channelCount
+            samples.append(contentsOf: floats)
+            buffers += 1
+        }
+    }
+
+    private func collectPCMSequenceR8(
+        decoder: AudioDecoder
+    ) throws -> PCMSequenceR8 {
+        var output = PCMSequenceR8()
+        for _ in 0..<2048 {
+            guard let buffer = try decoder.readNextBuffer() else {
+                return output
+            }
+            try output.append(buffer)
+        }
+        throw MatrixError.invalidFixture
+    }
+
+    /// Linear decode is the reference for the same fixture and linked
+    /// library. Disable optional DSP in BOTH routes only within this test;
+    /// the built-in seek de-click ramp remains active. Compare actual PCM
+    /// at its reported absolute sample coordinates, excluding that ramp
+    /// from the content comparison, not from sample-count measurements.
+    func testG0B03PCMSampleAccuracyObservation() throws {
+        let inputs: [(tag: String, seconds: Double, samples: Int64)] = [
+            ("025", 0.25, 11025), ("050", 0.50, 22050),
+            ("200", 2.0, 88200), ("1000", 10.0, 441000)
+        ]
+        let fractions: [(name: String, value: Double)] = [
+            ("start", 0), ("quarter", 0.25),
+            ("middle", 0.50), ("near-end", 0.90)
+        ]
+        var attempted = 0
+        var setupErrors = 0
+        var rawRejected = 0
+        var missingPCM = 0
+        var delivered = 0
+        for item in inputs {
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                let linear = AudioDecoder()
+                linear.limiterEnabled = false
+                try linear.adopt(OpenedSource.open(url: url))
+                let reference: PCMSequenceR8
+                do {
+                    defer { linear.close() }
+                    reference = try collectPCMSequenceR8(decoder: linear)
+                }
+                guard reference.firstTick == 0,
+                      reference.nextTick == item.samples,
+                      Int64(reference.frameCount) == item.samples
+                else { throw MatrixError.invalidFixture }
+                print(
+                    "G0_B03_R8_REFERENCE durationTag=\(item.tag) table=\(table) "
+                        + "frames=\(reference.frameCount) channels=\(reference.channels) "
+                        + "buffers=\(reference.buffers)"
+                )
+
+                for position in fractions {
+                    attempted += 1
+                    let seconds = item.seconds * position.value
+                    let target = Int64(seconds / (1.0 / 44100.0))
+                    let label = "durationTag=\(item.tag) table=\(table) "
+                        + "position=\(position.name) targetTick=\(target) "
+                        + "requestedNearest=\(Int64((seconds * 44100).rounded())) "
+                        + "expectedFrames=\(item.samples - target)"
+                    do {
+                        let raw = try rawSeek(
+                            url: url, seconds: seconds, useAvSeekFrame: false
+                        )
+                        let decoder = AudioDecoder()
+                        decoder.limiterEnabled = false
+                        try decoder.adopt(OpenedSource.open(url: url))
+                        defer { decoder.close() }
+                        guard try decoder.readNextBuffer() != nil else {
+                            throw MatrixError.missingPCM
+                        }
+                        do {
+                            try decoder.seek(to: seconds)
+                        } catch {
+                            if raw.code < 0 {
+                                rawRejected += 1
+                                print(
+                                    "G0_B03_R8_CASE \(label) "
+                                        + "rawCode=\(raw.code) seekError=\(error)"
+                                )
+                                continue
+                            }
+                            throw error
+                        }
+                        guard raw.code >= 0 else {
+                            throw MatrixError.invalidFixture
+                        }
+                        let actual = try collectPCMSequenceR8(decoder: decoder)
+                        guard let first = actual.firstTick,
+                              let end = actual.nextTick
+                        else {
+                            missingPCM += 1
+                            print(
+                                "G0_B03_R8_CASE \(label) rawCode=\(raw.code) "
+                                    + "actualFrames=0 missingAllPCM=true "
+                                    + "missingFrames=\(item.samples - target)"
+                            )
+                            continue
+                        }
+                        guard actual.channels == reference.channels,
+                              first >= 0, end <= item.samples,
+                              Int64(actual.frameCount) == end - first
+                        else { throw MatrixError.invalidFixture }
+                        delivered += 1
+
+                        let ramp = SeekTransientRamp.frameCount(sampleRate: 44100)
+                        let skip = min(ramp, actual.frameCount) * actual.channels
+                        let offset = Int(first) * actual.channels
+                        var maxError: Float = 0
+                        var differing = 0
+                        for i in skip..<actual.samples.count {
+                            let error = abs(actual.samples[i] - reference.samples[offset + i])
+                            maxError = max(maxError, error)
+                            if error > 0.000001 { differing += 1 }
+                        }
+                        print(
+                            "G0_B03_R8_CASE \(label) rawCode=\(raw.code) "
+                                + "firstTick=\(first) endTick=\(end) "
+                                + "actualFrames=\(actual.frameCount) "
+                                + "leadingGap=\(first - target) "
+                                + "tailGap=\(item.samples - end) "
+                                + "rampExcludedFrames=\(skip / actual.channels) "
+                                + "comparedValues=\(actual.samples.count - skip) "
+                                + "differentValues=\(differing) maxAbsError=\(maxError)"
+                        )
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R8_CASE \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R8_SUMMARY attempted=\(attempted) rawRejected=\(rawRejected) "
+                + "missingPCM=\(missingPCM) delivered=\(delivered) "
+                + "setupErrors=\(setupErrors)"
+        )
+        XCTAssertEqual(attempted, 32)
+        XCTAssertEqual(setupErrors, 0, "R8 observation incomplete")
+        XCTAssertEqual(rawRejected + missingPCM + delivered, attempted)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
