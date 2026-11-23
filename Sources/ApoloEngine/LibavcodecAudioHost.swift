@@ -383,6 +383,10 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         do {
             buffer = try decoder.readNextBuffer()
         } catch {
+            diagnostics.record(
+                .decoderRead,
+                milliseconds: AudioDiagnostics.elapsedMs(since: readStarted)
+            )
             diagnostics.emit(
                 "renderer.decodeFailure epoch=\(currentPlaybackEpoch) "
                     + "readMs=\(AudioDiagnostics.elapsedMs(since: readStarted)) "
@@ -397,6 +401,7 @@ final class LibavcodecAudioHost: @unchecked Sendable {
         }
 
         let readMs = AudioDiagnostics.elapsedMs(since: readStarted)
+        diagnostics.record(.decoderRead, milliseconds: readMs)
         if readMs >= 120, !isLive {
             let afterClock = synchronizer.currentTime().seconds
             diagnostics.emit(
