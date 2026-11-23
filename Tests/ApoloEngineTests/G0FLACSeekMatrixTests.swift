@@ -91,6 +91,112 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         return (code, pts)
     }
 
+    /// Independently decodes raw AVFrames after the exact avformat_seek_file
+    /// call. This is diagnosis, not a competing player or proposed fix.
+    /// Track frames that straddle the target but which the production
+    /// AudioDecoder append() rule would discard in their entirety.
+    private func traceDecodedFrames(url: URL, seconds: Double) throws -> String {
+        let source = try OpenedSource.open(url: url)
+        var ownedFormat = source.takeFormatContext()
+        defer { avformat_close_input(&ownedFormat) }
+        guard let context = ownedFormat,
+              let index = source.info.audioTracks.first?.index,
+              index >= 0,
+              let stream = context.pointee.streams[index],
+              let codecParameters = stream.pointee.codecpar,
+              stream.pointee.time_base.num > 0,
+              stream.pointee.time_base.den > 0
+        else { throw MatrixError.missingStream }
+
+        guard let decoder = avcodec_find_decoder(codecParameters.pointee.codec_id),
+              let allocated = avcodec_alloc_context3(decoder)
+        else { return "codecSetup=unavailable" }
+        var ownedDecoder: UnsafeMutablePointer<AVCodecContext>? = allocated
+        defer { avcodec_free_context(&ownedDecoder) }
+        let copied = avcodec_parameters_to_context(allocated, codecParameters)
+        guard copied >= 0 else { return "codecSetup=parametersError(\(copied))" }
+        let opened = avcodec_open2(allocated, decoder, nil)
+        guard opened >= 0 else { return "codecSetup=openError(\(opened))" }
+
+        let timeBase = stream.pointee.time_base
+        let targetTicks = Int64(seconds / (Double(timeBase.num) / Double(timeBase.den)))
+        let seekCode = avformat_seek_file(
+            context, Int32(index), Int64.min, targetTicks, Int64.max,
+            AVSEEK_FLAG_BACKWARD
+        )
+        guard seekCode >= 0 else { return "seekCode=\(seekCode) frames=notAttempted" }
+
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        var ownedFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer {
+            av_packet_free(&ownedPacket)
+            av_frame_free(&ownedFrame)
+        }
+        guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+        guard let frame = ownedFrame else { return "frameAlloc=failed" }
+
+        var decodedCount = 0
+        var discardedWholeFrames = 0
+        var wouldDropCovering = 0
+        var firstOverlapping: String = "none"
+        var firstRetainedPTS: String = "none"
+        var lastFrame: String = "none"
+        var readEndCode: Int32 = 0
+        var sendError: Int32 = 0
+
+        func consumeReadyFrames() {
+            while avcodec_receive_frame(allocated, frame) >= 0 {
+                defer { av_frame_unref(frame) }
+                decodedCount += 1
+                let rate = frame.pointee.sample_rate > 0
+                    ? frame.pointee.sample_rate : codecParameters.pointee.sample_rate
+                guard rate > 0, frame.pointee.pts != Int64.min else { continue }
+                let start = Double(frame.pointee.pts)
+                    * Double(timeBase.num) / Double(timeBase.den)
+                let count = Int(frame.pointee.nb_samples)
+                let end = start + Double(count) / Double(rate)
+                lastFrame = String(
+                    format: "start=%.9f end=%.9f samples=%d", start, end, count
+                )
+                // Half-open frame interval [start, end); this is a nominal
+                // timestamp window, not a bit-perfect PCM comparison.
+                if start <= seconds && end > seconds && firstOverlapping == "none" {
+                    firstOverlapping = lastFrame
+                }
+                if start < seconds {
+                    discardedWholeFrames += 1
+                    if end > seconds { wouldDropCovering += 1 }
+                } else if firstRetainedPTS == "none" {
+                    firstRetainedPTS = String(format: "%.9f", start)
+                }
+            }
+        }
+
+        for _ in 0..<512 {
+            let readCode = av_read_frame(context, packet)
+            if readCode < 0 {
+                readEndCode = readCode
+                sendError = avcodec_send_packet(allocated, nil)
+                consumeReadyFrames()
+                break
+            }
+            if packet.pointee.stream_index == Int32(index) {
+                let code = avcodec_send_packet(allocated, packet)
+                if code < 0 { sendError = code }
+                consumeReadyFrames()
+            }
+            av_packet_unref(packet)
+        }
+
+        return "seekCode=\(seekCode) decodedFrames=\(decodedCount) "
+            + "discardedWhole=\(discardedWholeFrames) "
+            + "droppedTargetCovering=\(wouldDropCovering) "
+            + "targetFrame={\(firstOverlapping)} "
+            + "firstWouldRetainPTS=\(firstRetainedPTS) "
+            + "lastFrame={\(lastFrame)} readEnd=\(readEndCode) "
+            + "sendError=\(sendError)"
+    }
+
     private func engineSeek(url: URL, seconds: Double) throws -> (Double, Int) {
         let source = try OpenedSource.open(url: url)
         let decoder = AudioDecoder()
@@ -159,6 +265,13 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                         swift = "error=\(error)"
                         failure = true
                     }
+                    let frameEvidence: String
+                    do {
+                        frameEvidence = try traceDecodedFrames(url: url, seconds: target)
+                    } catch {
+                        frameEvidence = "traceError=\(error)"
+                    }
+                    print("G0_B03_FRAMES \(caseID) \(frameEvidence)")
                     print(
                         "G0_B03 \(caseID) avformat_seek_file=\(native) "
                             + "av_seek_frame=\(alternate) ApoloEngine=\(swift) "
