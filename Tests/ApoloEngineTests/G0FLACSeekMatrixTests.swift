@@ -387,6 +387,194 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(errors, 0, "Cannot trust an incomplete route observation")
     }
 
+    /// R3 maps public demuxer behaviour around packet boundaries. FFmpeg's
+    /// internal read_timestamp()/binary-search iterations are *not* exposed
+    /// here; byte-position observations are external correlates only.
+    /// No production fallback or seek flag is changed.
+    private func probeSeekTick(
+        url: URL,
+        sampleTick: Int64,
+        fastSeek: Bool
+    ) throws -> String {
+        var owned = avformat_alloc_context()
+        guard let allocated = owned else { throw MatrixError.missingFormatContext }
+        if fastSeek {
+            allocated.pointee.flags |= Int32(AVFMT_FLAG_FAST_SEEK)
+        }
+        defer { avformat_close_input(&owned) }
+        let openCode = url.path.withCString {
+            avformat_open_input(&owned, $0, nil, nil)
+        }
+        guard openCode >= 0, let context = owned else {
+            return "openCode=\(openCode) setupFailed=1"
+        }
+        let streamCode = avformat_find_stream_info(context, nil)
+        guard streamCode >= 0,
+              context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              stream.pointee.time_base.num == 1,
+              stream.pointee.time_base.den == 44100,
+              let pb = context.pointee.pb
+        else {
+            return "streamInfoCode=\(streamCode) setupFailed=1"
+        }
+
+        let bytes = avio_size(pb)
+        let positionBefore = avio_seek(pb, 0, SEEK_CUR)
+        let seekCode = avformat_seek_file(
+            context, 0, Int64.min, sampleTick, Int64.max,
+            AVSEEK_FLAG_BACKWARD
+        )
+        let positionAfterSeek = avio_seek(pb, 0, SEEK_CUR)
+
+        var readCode = "notAttempted"
+        var packetPTS = "none"
+        var packetPos = "none"
+        var packetSize = "none"
+        var positionAfterRead = "notAttempted"
+        if seekCode >= 0 {
+            var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            defer { av_packet_free(&ownedPacket) }
+            guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+            let rc = av_read_frame(context, packet)
+            readCode = String(rc)
+            if rc >= 0 {
+                packetPTS = String(packet.pointee.pts)
+                packetPos = String(packet.pointee.pos)
+                packetSize = String(packet.pointee.size)
+            }
+            positionAfterRead = String(avio_seek(pb, 0, SEEK_CUR))
+        }
+        let actualFastSeek = context.pointee.flags & Int32(AVFMT_FLAG_FAST_SEEK)
+        return "timeBase=1/44100 fileBytes=\(bytes) "
+            + "fastFlag=\(actualFastSeek != 0) beforeByte=\(positionBefore) "
+            + "afterSeekByte=\(positionAfterSeek) seekCode=\(seekCode) "
+            + "nextReadCode=\(readCode) nextPacketPTS=\(packetPTS) "
+            + "nextPacketPos=\(packetPos) nextPacketBytes=\(packetSize) "
+            + "afterReadByte=\(positionAfterRead)"
+    }
+
+    private func packetBoundaryMap(
+        url: URL,
+        focus: Int64
+    ) throws -> String {
+        let source = try OpenedSource.open(url: url)
+        var owned = source.takeFormatContext()
+        defer { avformat_close_input(&owned) }
+        guard let context = owned,
+              let pb = context.pointee.pb
+        else { throw MatrixError.missingFormatContext }
+        let fileBytes = avio_size(pb)
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        defer { av_packet_free(&ownedPacket) }
+        guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+        var count = 0
+        var first = "none"
+        var last = "none"
+        var prior = "none"
+        var following = "none"
+        var lastPTS = Int64.min
+        var monotonic = true
+        for _ in 0..<512 {
+            let rc = av_read_frame(context, packet)
+            if rc < 0 { break }
+            defer { av_packet_unref(packet) }
+            if packet.pointee.stream_index != 0 { continue }
+            let pts = packet.pointee.pts
+            let entry = "\(pts)@\(packet.pointee.pos)+\(packet.pointee.size)"
+            if count == 0 { first = entry }
+            if pts < lastPTS { monotonic = false }
+            lastPTS = pts
+            if pts <= focus { prior = entry }
+            if pts > focus && following == "none" { following = entry }
+            last = entry
+            count += 1
+        }
+        return "packets=\(count) fileBytes=\(fileBytes) "
+            + "first=\(first) last=\(last) "
+            + "atOrBefore=\(prior) after=\(following) "
+            + "packetPTSMonotonic=\(monotonic)"
+    }
+
+    /// R3 intentionally uses exact integer 44.1-kHz ticks instead of Double
+    /// seconds, to distinguish seek-index failures from clock quantization.
+    /// Failing foci + nearest packet boundaries are paired with a 10s control.
+    func testG0B03GenericSeekBoundaryObservation() throws {
+        let inputs: [(tag: String, durationSamples: Int64,
+                       focus: Int64, packetStart: Int64, packetEnd: Int64)] = [
+            ("025", 11025, 2756, 0, 4608),
+            ("050", 22050, 11025, 9216, 13824),
+            ("200", 88200, 79380, 78336, 82944),
+            ("1000", 441000, 396900, 396288, 400896),
+        ]
+        var attempted = 0
+        var setupErrors = 0
+        var observedFailedSeek = 0
+        var observedAcceptedSeek = 0
+        for item in inputs {
+            var samples: Set<Int64> = [
+                0, item.durationSamples - 1,
+                item.focus - 1, item.focus, item.focus + 1,
+                item.packetStart - 1, item.packetStart, item.packetStart + 1,
+                item.packetEnd - 1, item.packetEnd, item.packetEnd + 1,
+            ]
+            samples = Set(samples.filter {
+                $0 >= 0 && $0 < item.durationSamples
+            })
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                do {
+                    let geometry = try packetBoundaryMap(url: url, focus: item.focus)
+                    print(
+                        "G0_B03_R3_PACKET_MAP durationSamples=\(item.durationSamples) "
+                            + "focus=\(item.focus) table=\(table) \(geometry)"
+                    )
+                } catch {
+                    setupErrors += 1
+                    print("G0_B03_R3_PACKET_MAP setupError=\(error)")
+                }
+
+                for fast in [false, true] {
+                    for tick in samples.sorted() {
+                        attempted += 1
+                        let label = "durationSamples=\(item.durationSamples) "
+                            + "focus=\(item.focus) table=\(table) "
+                            + "fast=\(fast) sampleTick=\(tick)"
+                        do {
+                            let observation = try probeSeekTick(
+                                url: url, sampleTick: tick, fastSeek: fast
+                            )
+                            print("G0_B03_R3 \(label) \(observation)")
+                            if observation.contains("setupFailed=1") {
+                                setupErrors += 1
+                            } else if observation.contains("seekCode=-1 ") {
+                                observedFailedSeek += 1
+                            } else if observation.contains("seekCode=0 ") {
+                                observedAcceptedSeek += 1
+                            } else {
+                                setupErrors += 1
+                            }
+                        } catch {
+                            setupErrors += 1
+                            print("G0_B03_R3 \(label) setupError=\(error)")
+                        }
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R3_SUMMARY attempted=\(attempted) "
+                + "accepted=\(observedAcceptedSeek) rejectedMinusOne=\(observedFailedSeek) "
+                + "setupErrors=\(setupErrors)"
+        )
+        XCTAssertGreaterThanOrEqual(attempted, 140)
+        XCTAssertEqual(setupErrors, 0, "R3 observation incomplete")
+        XCTAssertEqual(
+            observedAcceptedSeek + observedFailedSeek, attempted,
+            "R3 requires one interpretable result per probe"
+        )
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
