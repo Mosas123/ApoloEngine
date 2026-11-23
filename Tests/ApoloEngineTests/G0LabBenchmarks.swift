@@ -84,7 +84,7 @@ final class G0LabBenchmarks: XCTestCase {
         defer { decoder.close() }
         guard try decoder.readNextBuffer() != nil else { throw FixtureError.missingPCM }
 
-        let target = duration > 0 ? min(duration * 0.25, 0.10) : 0
+        let target = duration > 0 ? max(0, min(duration * 0.25, duration - 0.01)) : 0
         let started = DispatchTime.now().uptimeNanoseconds
         try decoder.seek(to: target)
         let first = try decoder.readNextBuffer()
@@ -117,14 +117,72 @@ final class G0LabBenchmarks: XCTestCase {
         report("local-flac-open-decode-to-eof-close", values)
     }
 
+    /// Controlled seek fixture: two seconds of 44.1-kHz stereo PCM WAV.
+    /// Unlike the 250-ms FLAC regression fixture, the target is separated
+    /// from startup and there are sufficient decoded frames after the seek.
+    private func makeSeekControlWAV() throws -> URL {
+        let sampleRate = 44_100
+        let frames = 2 * sampleRate
+        let channels = 2
+        let dataSize = frames * channels * MemoryLayout<Int16>.size
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("g0-seek-control-\(UUID().uuidString).wav")
+
+        var data = Data(capacity: 44 + dataSize)
+        func appendU32(_ value: UInt32) {
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+        func appendU16(_ value: UInt16) {
+            var le = value.littleEndian
+            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        }
+
+        data.append(contentsOf: Array("RIFF".utf8))
+        appendU32(UInt32(36 + dataSize))
+        data.append(contentsOf: Array("WAVEfmt ".utf8))
+        appendU32(16)
+        appendU16(1)
+        appendU16(UInt16(channels))
+        appendU32(UInt32(sampleRate))
+        appendU32(UInt32(sampleRate * channels * 2))
+        appendU16(UInt16(channels * 2))
+        appendU16(16)
+        data.append(contentsOf: Array("data".utf8))
+        appendU32(UInt32(dataSize))
+        for i in 0..<frames {
+            var sample = Int16(sin(2 * Double.pi * 440 * Double(i) / Double(sampleRate)) * 12_000)
+                .littleEndian
+            withUnsafeBytes(of: &sample) { bytes in
+                for _ in 0..<channels { data.append(contentsOf: bytes) }
+            }
+        }
+        try data.write(to: url)
+        return url
+    }
+
     func testG0SeekToPCM20Times() throws {
-        let url = try fixture()
+        let url = try makeSeekControlWAV()
+        defer { try? FileManager.default.removeItem(at: url) }
         _ = try seekToFirstPCM(url) // Warm-up.
         var values: [UInt64] = []
         for _ in 0..<repetitions {
             values.append(try seekToFirstPCM(url))
         }
-        report("local-flac-seek-to-first-pcm", values)
+        report("local-wav-seek-to-first-pcm-control", values)
+    }
+
+    /// An observation, NOT a success assertion: the original 250-ms FLAC
+    /// fixture returned unsupportedFormat on avformat_seek_file in G0 #45219830168.
+    /// Preserve the outcome visibly for B03 rather than claiming FLAC seek passes.
+    func testG0ShortFLACSeekObservation() throws {
+        let url = try fixture()
+        do {
+            let ns = try seekToFirstPCM(url)
+            print("G0_LAB phase=short-flac-seek-observation outcome=success elapsedNs=\(ns)")
+        } catch {
+            print("G0_LAB phase=short-flac-seek-observation outcome=error error=\(error)")
+        }
     }
 
     /// XCTest collects process-level CPU and memory metrics for an entire
