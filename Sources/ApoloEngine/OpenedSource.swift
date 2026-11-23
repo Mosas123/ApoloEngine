@@ -91,6 +91,10 @@ final class OpenedSource: @unchecked Sendable {
             var context: UnsafeMutablePointer<AVFormatContext>? = allocated
             let openStarted = DispatchTime.now().uptimeNanoseconds
             let openCode = avformat_open_input(&context, nil, nil, &options)
+            diagnostics?.record(
+                .probeOpen,
+                milliseconds: AudioDiagnostics.elapsedMs(since: openStarted)
+            )
             diagnostics?.emit(
                 "probe.open ms=\(AudioDiagnostics.elapsedMs(since: openStarted)) code=\(openCode)"
             )
@@ -106,6 +110,10 @@ final class OpenedSource: @unchecked Sendable {
             do {
                 let probeStarted = DispatchTime.now().uptimeNanoseconds
                 let info = try buildInfo(context)
+                diagnostics?.record(
+                    .probeStreamInfo,
+                    milliseconds: AudioDiagnostics.elapsedMs(since: probeStarted)
+                )
                 diagnostics?.emit(
                     "probe.streamInfo ms=\(AudioDiagnostics.elapsedMs(since: probeStarted)) "
                         + "container=\(info.container) codec=\(info.audioTracks.first?.codec ?? "unknown") "
@@ -131,9 +139,14 @@ final class OpenedSource: @unchecked Sendable {
         // Use the filesystem path for local media; preserve URL semantics for
         // any non-file protocol.
         let input = url.isFileURL ? url.path : url.absoluteString
+        let openStarted = DispatchTime.now().uptimeNanoseconds
         let openCode = input.withCString {
             avformat_open_input(&context, $0, nil, &options)
         }
+        diagnostics?.record(
+            .probeOpen,
+            milliseconds: AudioDiagnostics.elapsedMs(since: openStarted)
+        )
         av_dict_free(&options)
         if url.isFileURL {
             // Safe on-device diagnostics: never expose the user's file path.
@@ -146,7 +159,12 @@ final class OpenedSource: @unchecked Sendable {
         }
 
         do {
+            let probeStarted = DispatchTime.now().uptimeNanoseconds
             let info = try buildInfo(context)
+            diagnostics?.record(
+                .probeStreamInfo,
+                milliseconds: AudioDiagnostics.elapsedMs(since: probeStarted)
+            )
             return OpenedSource(
                 info: info,
                 formatContext: context,
