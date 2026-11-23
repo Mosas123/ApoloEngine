@@ -24,6 +24,11 @@ final class AVPlayerHost {
     private var lastState: PlaybackState = .idle
     private var tapProcessors: [AudioTapProcessor] = []
     private var endObservers: [NSObjectProtocol] = []
+    private var lastObservedItem: AVPlayerItem?
+    private var lastObservedTime: TimeInterval?
+    private var lastObservedDuration: TimeInterval?
+    private var clockAudit = NativeClockAudit()
+    private(set) var nativeEndEvidence: NativeEndedItemEvidence?
     private var equalizer = EqualizerSettings.flat
     private var limiterEnabled = true
     private var trackGainDB: Double = 0
@@ -32,6 +37,9 @@ final class AVPlayerHost {
     var onTime: (@MainActor (TimeInterval) -> Void)?
     var onTrackChange: (@MainActor () -> Void)?
     var onLiveTitle: (@MainActor (String) -> Void)?
+    var onNativeEndEvidence: (@MainActor (NativeEndedItemEvidence) -> Void)?
+    var onNativeClockTrace: (@MainActor (NativeClockTrace) -> Void)?
+    var onNativeAccessSummary: (@MainActor (TimeInterval?, Int) -> Void)?
 
     init() {
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
@@ -46,14 +54,21 @@ final class AVPlayerHost {
     }
 
     var currentTime: TimeInterval {
+        // AVQueuePlayer may have already dequeued the last item at EOF.
+        // Reporting zero here invents a premature ending in the app layer.
+        if finished && player.currentItem == nil {
+            return nativeEndEvidence?.position ?? 0
+        }
         let time = player.currentTime().seconds
-        return time.isFinite ? time : 0
+        return time.isFinite && time >= 0 ? time : 0
     }
 
     var duration: TimeInterval {
-        guard let duration = player.currentItem?.duration, duration.isNumeric else {
-            return 0
+        if finished && player.currentItem == nil {
+            return nativeEndEvidence?.duration ?? 0
         }
+        guard let duration = player.currentItem?.duration, duration.isNumeric,
+              duration.seconds.isFinite, duration.seconds > 0 else { return 0 }
         return duration.seconds
     }
 
@@ -226,6 +241,10 @@ final class AVPlayerHost {
 
     func seek(to seconds: TimeInterval) async {
         guard !isLiveStream else { return }
+        // A seek may invalidate the previously observed time of this SAME
+        // item. Never use its pre-seek clock to diagnose a later EOF.
+        lastObservedTime = nil
+        clockAudit.invalidateBaseline()
         let time = CMTime(seconds: seconds, preferredTimescale: 600)
         _ = await player.seek(
             to: time,
@@ -268,6 +287,7 @@ final class AVPlayerHost {
     }
 
     private func observeEnd(of item: AVPlayerItem) {
+        let generation = loadGeneration
         let token = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.didPlayToEndTimeNotification,
             object: item,
@@ -277,20 +297,22 @@ final class AVPlayerHost {
             // The block runs on the main queue, so reading the player here is
             // safe without crossing an isolation boundary.
             MainActor.assumeIsolated {
-                self?.handleEnd(of: ended)
+                guard let self, self.loadGeneration == generation else { return }
+                self.handleEnd(of: ended)
             }
         }
         endObservers.append(token)
     }
 
     private func observeFailure(of item: AVPlayerItem) {
+        let generation = loadGeneration
         let token = NotificationCenter.default.addObserver(
             forName: AVPlayerItem.failedToPlayToEndTimeNotification,
             object: item,
             queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self else { return }
+                guard let self, self.loadGeneration == generation else { return }
                 if self.isLiveStream { self.finished = true }
                 self.publish(.failed("Playback failed"))
             }
@@ -299,6 +321,7 @@ final class AVPlayerHost {
     }
 
     private func handleEnd(of ended: AVPlayerItem) {
+        guard !finished else { return }
         if isLiveStream {
             // A live station going silent is not the end of a song or queue.
             // Keep the failure stable; the periodic tick must not turn it
@@ -307,6 +330,36 @@ final class AVPlayerHost {
             publish(.failed("Live stream ended"))
             return
         }
+        // Sample the notification's item, never the possibly nil/new
+        // AVQueuePlayer.currentItem. Previous-track observations are rejected.
+        let itemPosition = ended.currentTime()
+        let itemDuration = ended.duration
+        let evidence = NativeEndedItemEvidence.make(
+            endedPosition: itemPosition.isNumeric ? itemPosition.seconds : nil,
+            endedDuration: itemDuration.isNumeric ? itemDuration.seconds : nil,
+            lastObservedPosition: lastObservedTime,
+            lastObservedDuration: lastObservedDuration,
+            observationMatchesEndedItem: lastObservedItem === ended
+        )
+        nativeEndEvidence = evidence
+        onNativeEndEvidence?(evidence)
+        if let position = evidence.position,
+           let finalClock = clockAudit.finish(
+               position: position,
+               uptime: ProcessInfo.processInfo.systemUptime,
+               playerRate: Double(player.rate),
+               motion: nativeClockMotion
+           ) {
+            onNativeClockTrace?(finalClock)
+        }
+        if let lastAccess = ended.accessLog()?.events.last {
+            let watched = lastAccess.durationWatched
+            onNativeAccessSummary?(
+                watched.isFinite && watched >= 0 ? watched : nil,
+                lastAccess.numberOfStalls
+            )
+        }
+
         guard let last = player.items().last else {
             finished = true
             publish(.finished)
@@ -338,16 +391,54 @@ final class AVPlayerHost {
             NotificationCenter.default.removeObserver(observer)
         }
         endObservers.removeAll()
+        nativeEndEvidence = nil
+        lastObservedItem = nil
+        lastObservedTime = nil
+        lastObservedDuration = nil
+        clockAudit.reset()
         isLiveStream = false
         tapProcessors.removeAll()
         player.removeAllItems()
     }
 
     private func tick(_ time: CMTime) {
+        if !isLiveStream, let item = player.currentItem {
+            if item !== lastObservedItem {
+                lastObservedTime = nil
+                lastObservedDuration = nil
+                lastObservedItem = item
+                clockAudit.reset()
+            }
+            let position = item.currentTime()
+            if position.isNumeric && position.seconds.isFinite && position.seconds >= 0 {
+                lastObservedTime = position.seconds
+                if let trace = clockAudit.observe(
+                    position: position.seconds,
+                    uptime: ProcessInfo.processInfo.systemUptime,
+                    playerRate: Double(player.rate),
+                    motion: nativeClockMotion
+                ) {
+                    onNativeClockTrace?(trace)
+                }
+            }
+            let length = item.duration
+            if length.isNumeric && length.seconds.isFinite && length.seconds > 0 {
+                lastObservedDuration = length.seconds
+            }
+        }
         if time.isNumeric {
             onTime?(isLiveStream ? 0 : time.seconds)
         }
         refreshState()
+    }
+
+    private var nativeClockMotion: NativeClockMotion {
+        switch player.timeControlStatus {
+        case .playing: return .playing
+        case .paused: return .paused
+        case .waitingToPlayAtSpecifiedRate: return .waiting
+        @unknown default: return .waiting
+        }
     }
 
     private func refreshState() {

@@ -81,6 +81,37 @@ public final class ApoloEngine {
         host.onTime = { [weak self] time in
             self?.elapsed = time
         }
+        host.onNativeEndEvidence = { [weak self] evidence in
+            guard let self, self.route == .avPlayer else { return }
+            // No URLs, tokens, track IDs or metadata: numeric-only QA data.
+            let position = evidence.position.map { String(format: "%.3f", $0) } ?? "unknown"
+            let duration = evidence.duration.map { String(format: "%.3f", $0) } ?? "unknown"
+            self.diagnosticEvents.emit(
+                "renderer.nativeEOF position=\(position) duration=\(duration) origin=\(evidence.origin.rawValue)"
+            )
+        }
+        host.onNativeClockTrace = { [weak self] trace in
+            guard let self, self.route == .avPlayer else { return }
+            let fmt: (TimeInterval) -> String = { String(format: "%.3f", $0) }
+            self.diagnosticEvents.emit(
+                "renderer.nativeClock kind=\(trace.kind.rawValue)"
+                    + " pos=\(fmt(trace.position)) uptime=\(fmt(trace.uptimeSinceStart))"
+                    + " rate=\(fmt(trace.playerRate)) status=\(trace.motion.rawValue)"
+                    + " sampledWall=\(fmt(trace.sampledWall))"
+                    + " sampledMedia=\(fmt(trace.sampledMedia))"
+                    + " mediaExcess=\(fmt(trace.mediaExcessOverRate))"
+                    + " maxJump=\(fmt(trace.largestSingleExcess))"
+                    + " jumps=\(trace.jumpCount) gaps=\(trace.samplingGapCount)"
+                    + " nonUnitRateSamples=\(trace.nonUnitRateSampleCount)"
+            )
+        }
+        host.onNativeAccessSummary = { [weak self] watched, stalls in
+            guard let self, self.route == .avPlayer else { return }
+            let duration = watched.map { String(format: "%.3f", $0) } ?? "unknown"
+            self.diagnosticEvents.emit(
+                "renderer.nativeAccess watched=\(duration) stalls=\(stalls)"
+            )
+        }
         host.onTrackChange = { [weak self] in
             self?.advanceFromQueue()
         }
