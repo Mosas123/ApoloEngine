@@ -248,6 +248,145 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         return (pts, CMSampleBufferGetNumSamples(sample))
     }
 
+    /// B03-R2: isolate FFmpeg's demuxer seek route from AudioDecoder.
+    /// FAST_SEEK must be enabled before avformat_open_input, because
+    /// flac_read_header() only imports SEEKTABLE entries under that flag.
+    /// Every variant gets a fresh context to avoid contaminated indexes.
+    private enum RawSeekVariant: String, CaseIterable {
+        case formatUnbounded
+        case formatNonnegativeBounds
+        case formatAtOrBefore
+        case frameBackward
+        case frameForward
+        case frameAny
+    }
+
+    private func probeDemuxerSeek(
+        url: URL,
+        seconds: Double,
+        duration: Double,
+        fastSeek: Bool,
+        variant: RawSeekVariant
+    ) throws -> String {
+        var owned = avformat_alloc_context()
+        guard let allocated = owned else { throw MatrixError.missingFormatContext }
+        if fastSeek {
+            allocated.pointee.flags |= Int32(AVFMT_FLAG_FAST_SEEK)
+        }
+        defer {
+            if owned != nil { avformat_close_input(&owned) }
+        }
+        let openCode = url.path.withCString {
+            avformat_open_input(&owned, $0, nil, nil)
+        }
+        guard openCode >= 0, let context = owned else {
+            return "openCode=\(openCode)"
+        }
+        let infoCode = avformat_find_stream_info(context, nil)
+        guard infoCode >= 0 else {
+            return "streamInfoCode=\(infoCode)"
+        }
+        // The fixture generator creates one audio-only FLAC stream.
+        guard context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              let codecpar = stream.pointee.codecpar,
+              codecpar.pointee.codec_type == AVMEDIA_TYPE_AUDIO,
+              stream.pointee.time_base.num > 0,
+              stream.pointee.time_base.den > 0
+        else { throw MatrixError.missingStream }
+
+        let rate = Double(stream.pointee.time_base.num)
+            / Double(stream.pointee.time_base.den)
+        let target = Int64(seconds / rate)
+        let end = Int64(duration / rate)
+        let seekCode: Int32
+        switch variant {
+        case .formatUnbounded:
+            seekCode = avformat_seek_file(
+                context, 0, Int64.min, target, Int64.max, AVSEEK_FLAG_BACKWARD
+            )
+        case .formatNonnegativeBounds:
+            seekCode = avformat_seek_file(context, 0, 0, target, end, 0)
+        case .formatAtOrBefore:
+            seekCode = avformat_seek_file(
+                context, 0, Int64.min, target, target, 0
+            )
+        case .frameBackward:
+            seekCode = av_seek_frame(context, 0, target, AVSEEK_FLAG_BACKWARD)
+        case .frameForward:
+            seekCode = av_seek_frame(context, 0, target, 0)
+        case .frameAny:
+            seekCode = av_seek_frame(context, 0, target, AVSEEK_FLAG_ANY)
+        }
+
+        var readCode: Int32 = Int32.min
+        var packetPTS = "none"
+        var packetPosition = "none"
+        if seekCode >= 0 {
+            var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            defer { av_packet_free(&ownedPacket) }
+            guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+            // A successful return is not necessarily correct media delivery:
+            // record the next packet's actual PTS/byte position as evidence.
+            readCode = av_read_frame(context, packet)
+            if readCode >= 0 {
+                packetPTS = String(packet.pointee.pts)
+                packetPosition = String(packet.pointee.pos)
+            }
+        }
+        let actualFastSeek = context.pointee.flags & Int32(AVFMT_FLAG_FAST_SEEK)
+        return "opened=1 streamInfoCode=\(infoCode) "
+            + "timeBase=\(stream.pointee.time_base.num)/\(stream.pointee.time_base.den) "
+            + "targetTicks=\(target) endTicks=\(end) "
+            + "fastSeekFlag=\(actualFastSeek != 0) "
+            + "seekCode=\(seekCode) nextReadCode=\(readCode) "
+            + "nextPacketPTS=\(packetPTS) nextPacketPos=\(packetPosition)"
+    }
+
+    /// Targeted failing timestamps plus a positive 10-second seek control.
+    /// This is intentionally an OBSERVATION: the existing 32-case test
+    /// remains the strict failure gate. No alternate seek path is a fix.
+    func testG0B03LibavformatRouteObservation() throws {
+        let targets: [(tag: String, duration: Double, target: Double)] = [
+            ("025", 0.25, 0.0625), // existing raw seek -1
+            ("050", 0.50, 0.25),   // existing raw seek -1
+            ("200", 2.00, 1.80),   // existing raw seek -1
+            ("1000", 10.00, 9.00)  // existing working control
+        ]
+        var recorded = 0
+        var errors = 0
+        for item in targets {
+            for seektable in [false, true] {
+                let url = try fixture(item.tag, withSeektable: seektable)
+                for fastSeek in [false, true] {
+                    for variant in RawSeekVariant.allCases {
+                        let label = "duration=\(item.duration) target=\(item.target) "
+                            + "table=\(seektable) fastSeek=\(fastSeek) "
+                            + "variant=\(variant.rawValue)"
+                        do {
+                            let result = try probeDemuxerSeek(
+                                url: url,
+                                seconds: item.target,
+                                duration: item.duration,
+                                fastSeek: fastSeek,
+                                variant: variant
+                            )
+                            print("G0_B03_ROUTE \(label) \(result)")
+                            if !result.contains("seekCode=") { errors += 1 }
+                        } catch {
+                            print("G0_B03_ROUTE \(label) setupError=\(error)")
+                            errors += 1
+                        }
+                        recorded += 1
+                    }
+                }
+            }
+        }
+        print("G0_B03_ROUTE_SUMMARY attempted=\(recorded) setupErrors=\(errors)")
+        XCTAssertEqual(recorded, 96)
+        XCTAssertEqual(errors, 0, "Cannot trust an incomplete route observation")
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
