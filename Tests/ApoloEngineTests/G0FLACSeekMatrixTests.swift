@@ -587,7 +587,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         url: URL,
         sampleTick: Int64,
         fastSeek: Bool,
-        label: String
+        label: String,
+        traceStage: String = "R4"
     ) throws -> String {
         var owned = avformat_alloc_context()
         guard let allocated = owned else { throw MatrixError.missingFormatContext }
@@ -615,7 +616,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         let priorLogLevel = av_log_get_level()
         // NSLog writes to the same diagnostic stream as libavutil's default
         // av_log callback and supplies distinctive per-case boundaries.
-        NSLog("G0_B03_R4_TRACE_BEGIN \(label)")
+        NSLog("G0_B03_\(traceStage)_TRACE_BEGIN \(label)")
         let seekCode: Int32
         do {
             av_log_set_level(AV_LOG_TRACE)
@@ -625,7 +626,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 AVSEEK_FLAG_BACKWARD
             )
         }
-        NSLog("G0_B03_R4_TRACE_END \(label) seekCode=\(seekCode)")
+        NSLog("G0_B03_\(traceStage)_TRACE_END \(label) seekCode=\(seekCode)")
 
         var nextReadCode = "notAttempted"
         var nextPacketPTS = "none"
@@ -1012,6 +1013,106 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertGreaterThan(attempted, 90, "R6 did not sample all packet tails")
         XCTAssertEqual(setupErrors, 0, "R6 parser observation incomplete")
         XCTAssertEqual(validPTS + missingPTS, attempted)
+    }
+
+    /// R7 correlates the *actual* byte start reported by FFmpeg's native
+    /// generic-search trace with independently measured packet geometry.
+    /// A requested sample inside a frame does NOT imply that FFmpeg will
+    /// probe an offset inside that same frame. Do not classify the requested
+    /// packet as the actual search probe; use the trace's start: field.
+    ///
+    /// No direct call to private flac_read_timestamp, no modified FFmpeg,
+    /// no forced byte seek, no index insertion and no production fallback.
+    func testG0B03NativeDemuxerTailTraceObservation() throws {
+        let inputs: [(tag: String, totalSamples: Int64)] = [
+            ("025", 11025), ("050", 22050),
+            ("200", 88200), ("1000", 441000)
+        ]
+        var attempted = 0
+        var setupErrors = 0
+        var accepted = 0
+        var rejected = 0
+        var expected = 0
+
+        for item in inputs {
+            let url = try fixture(item.tag, withSeektable: false)
+            // Separate demuxer context: no index or AVIO mutations to
+            // the fresh contexts used by the actual seek probes below.
+            let frames = try demuxedFLACPacketGeometryR6(url: url)
+            let fileBytes = try Data(contentsOf: url).count
+            let tailStart = max(0, frames.count - 5)
+            let selected = Array(tailStart..<frames.count)
+            print(
+                "G0_B03_R7_MAP durationTag=\(item.tag) "
+                    + "totalPackets=\(frames.count) fileBytes=\(fileBytes) "
+                    + "selectedPackets=\(selected.count)"
+            )
+            // Emit the entire map, not just the tail: ff_gen_search may
+            // interpolate to any byte interval in the input.
+            for (index, frame) in frames.enumerated() {
+                print(
+                    "G0_B03_R7_PACKET durationTag=\(item.tag) "
+                        + "packetIndex=\(index) pts=\(frame.pts) "
+                        + "startByte=\(frame.position) bytes=\(frame.bytes)"
+                )
+            }
+
+            for index in selected {
+                let frame = frames[index]
+                let endPTS = index + 1 < frames.count
+                    ? frames[index + 1].pts : item.totalSamples
+                guard frame.pts >= 0, endPTS > frame.pts + 1,
+                      endPTS <= item.totalSamples
+                else { throw MatrixError.invalidFixture }
+                let midpoint = frame.pts + (endPTS - frame.pts) / 2
+                let targets: [(kind: String, tick: Int64)] = [
+                    ("boundary", frame.pts), ("midSample", midpoint)
+                ]
+                expected += targets.count
+                for target in targets {
+                    attempted += 1
+                    let label = "durationTag=\(item.tag) "
+                        + "packetIndex=\(index) "
+                        + "targetKind=\(target.kind) "
+                        + "sampleTick=\(target.tick) "
+                        + "targetPacketStartByte=\(frame.position) "
+                        + "targetPacketPTS=\(frame.pts) "
+                        + "targetPacketEndPTS=\(endPTS) "
+                        + "targetPacketStartsRemaining=\(frames.count - index)"
+                    do {
+                        let result = try traceLinkedGenericSeek(
+                            url: url, sampleTick: target.tick,
+                            fastSeek: false, label: label, traceStage: "R7"
+                        )
+                        print("G0_B03_R7_RESULT \(label) \(result)")
+                        if result.contains("setupFailed=1") {
+                            setupErrors += 1
+                        } else if result.contains("seekCode=0 ") {
+                            accepted += 1
+                        } else if result.contains("seekCode=-1 ") {
+                            rejected += 1
+                        } else {
+                            setupErrors += 1
+                        }
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R7_RESULT \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+
+        print(
+            "G0_B03_R7_SUMMARY attempted=\(attempted) expected=\(expected) "
+                + "accepted=\(accepted) rejectedMinusOne=\(rejected) "
+                + "setupErrors=\(setupErrors)"
+        )
+        // Four fixed fixtures: 3 + 5 + 5 + 5 tail packets, two
+        // targets each. The strict B03 functional gate stays separate.
+        XCTAssertEqual(expected, 36)
+        XCTAssertEqual(attempted, expected)
+        XCTAssertEqual(setupErrors, 0, "R7 observation incomplete")
+        XCTAssertEqual(accepted + rejected, attempted)
     }
 
     func testG0B03FLACSeek32Cases() throws {
