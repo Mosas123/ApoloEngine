@@ -175,7 +175,12 @@ final class HTTPStream: @unchecked Sendable {
             }
 
             let requestStarted = DispatchTime.now().uptimeNanoseconds
-            switch requestRange(from: start) {
+            let response = requestRange(from: start)
+            diagnostics?.record(
+                .httpRange,
+                milliseconds: AudioDiagnostics.elapsedMs(since: requestStarted)
+            )
+            switch response {
             case .failure(let error):
                 diagnostics?.emit(
                     "http.range start=\(start) status=networkError "
