@@ -10,8 +10,10 @@ An isolated **iOS Simulator** XCTest run using existing repository-owned `Fixtur
 | --- | --- | --- |
 | `local-flac-probe-and-close` | FFmpeg file open, demux/probe, stream discovery and close | decoder init, renderer, network |
 | `local-flac-open-decode-to-eof-close` | FFmpeg file I/O, libavformat, libavcodec, optional libswresample, ApoloEngine DSP/PCM/CoreMedia buffering and close | network, AVSampleBufferAudioRenderer playback, acoustic signal |
-| `local-flac-seek-to-first-pcm` | `AudioDecoder.seek(to:)`, FFmpeg seek/flush/resampler reset and next decoded buffer | opening file, close, actual audible seek latency |
+| `local-wav-seek-to-first-pcm-control` | 2-second synthetic PCM WAV; `AudioDecoder.seek(to:)`, FFmpeg seek/flush/resampler reset and next decoded buffer | opening file, close, actual audible seek latency; NOT a passing FLAC seek result |
 | `testG0LifecycleCPUAndMemory` | XCTest process-level clock/CPU/memory metrics for 20 complete local decode cycles per measurement iteration | isolated libavcodec CPU, peak on-device RSS, battery, thermal |
+
+**First-run regression preserved:** [G0 run #45219830168](https://github.com/Mosas123/ApoloEngine/actions/runs/45219830168) failed only in FLAC seek warm-up. The 250-ms FLAC fixture (44.1 kHz, 11025 samples, no SEEKTABLE metadata block) threw `unsupportedFormat` on `avformat_seek_file` after FFmpeg logged `read_timestamp() failed in the middle`. The failure is recorded in [issue #22](https://github.com/Mosas123/ApoloEngine/issues/22#issuecomment-7107922847), not attributed yet to a generic FFmpeg or ApoloEngine defect. **The revision adds a separate 2-second WAV seek control** and a `short-flac-seek-observation` test which prints `outcome=error` or `outcome=success` without calling either outcome a passing FLAC regression gate. A representative longer FLAC seek fixture remains required.
 
 The benchmark suite is **not** proof of a leak, bit-perfect or sample-exact output, EOF correctness in every file, first audible sample, a specific Apple hardware route, or energy efficiency. An XCTest memory metric is not automatically peak RSS on an iPhone. The 20-cycle benchmark is an exploratory signal, **not** an exhaustive leak detector.
 
@@ -35,6 +37,6 @@ The benchmark suite is **not** proof of a leak, bit-perfect or sample-exact outp
 
 This first benchmark covers the **ApoloEngine local FFmpeg decode bridge** only. The ApoloFFmpeg C libraries still require separately isolated fixtures and profiles for `libavcodec`, `libavformat`, `libavutil`, `libswresample`, `libavfilter`, `libswscale` (and shipped `dav1d`, `zimg`, `zvbi` only where relevant). Never claim this experiment benchmarks each library independently.
 
-Additional gates: network AVIO/HTTP and stop cancellation; local/remote Opus, AAC/ALAC, FLAC and error/EOF; sample-exact PTS/seek and gapless; native Apple routes, ICY FFmpeg path, interruption, sleep/background; `ApoloFFmpeg` A1 source/binary and LGPL compliance; device energy/RSS/CPU and diagnostic overhead comparison against stable baseline. Keep the A1/consumer PRs in draft until verified.
+Additional gates: reproduce the short-FLAC seek observation with a longer representative FLAC and a physical iPhone; network AVIO/HTTP and stop cancellation; local/remote Opus, AAC/ALAC, FLAC and error/EOF; sample-exact PTS/seek and gapless; native Apple routes, ICY FFmpeg path, interruption, sleep/background; `ApoloFFmpeg` A1 source/binary and LGPL compliance; device energy/RSS/CPU and diagnostic overhead comparison against stable baseline. Keep the A1/consumer PRs in draft until verified.
 
 **No source engine code or FFmpeg build recipe is changed by this proposal.**
