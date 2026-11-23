@@ -878,6 +878,142 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(setupErrors, 0, "R5 parser observation incomplete")
     }
 
+    /// R6: read actual demuxed packet geometry from the SAME FLAC fixture.
+    /// Each recorded position is a packet start reported by the linked
+    /// demuxer; it is not an independently CRC-verified FLAC header count.
+    private func demuxedFLACPacketGeometryR6(
+        url: URL
+    ) throws -> [(position: Int, bytes: Int, pts: Int64)] {
+        let source = try OpenedSource.open(url: url)
+        var owned = source.takeFormatContext()
+        defer { avformat_close_input(&owned) }
+        guard let context = owned,
+              context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              stream.pointee.codecpar?.pointee.codec_id == AV_CODEC_ID_FLAC
+        else { throw MatrixError.missingStream }
+
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        defer { av_packet_free(&ownedPacket) }
+        guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+
+        var frames: [(position: Int, bytes: Int, pts: Int64)] = []
+        for _ in 0..<2048 {
+            let code = av_read_frame(context, packet)
+            if code < 0 { break }
+            if packet.pointee.stream_index == 0 {
+                let pos = packet.pointee.pos
+                let size = packet.pointee.size
+                let pts = packet.pointee.pts
+                // The generated deterministic G0 fixtures should all have
+                // positioned, timestamped, positive-size FLAC packets.
+                guard pos >= 0, size > 2, pts != Int64.min,
+                      pos <= Int64(Int.max) - Int64(size)
+                else {
+                    av_packet_unref(packet)
+                    throw MatrixError.invalidFixture
+                }
+                frames.append((Int(pos), Int(size), pts))
+            }
+            av_packet_unref(packet)
+        }
+        guard !frames.isEmpty else { throw MatrixError.invalidFixture }
+        for i in 1..<frames.count {
+            guard frames[i].position > frames[i - 1].position,
+                  frames[i].pts >= frames[i - 1].pts
+            else { throw MatrixError.invalidTimestamp }
+        }
+        return frames
+    }
+
+    /// R6 measures how many *demuxed packet starts* remain after each byte
+    /// offset, rather than guessing the number from audio duration. The
+    /// public parser is restarted for each trial and flushed at file EOF.
+    /// This isolates remaining-media geometry; it does NOT expose the
+    /// private FLAC parser's nb_headers_buffered or exactly reimplement
+    /// flac_read_timestamp/ff_raw_read_partial_packet.
+    func testG0B03FLACParserRemainingPacketStartsObservation() throws {
+        let tags = ["025", "050", "200", "1000"]
+        var attempted = 0
+        var setupErrors = 0
+        var validPTS = 0
+        var missingPTS = 0
+
+        for tag in tags {
+            let url = try fixture(tag, withSeektable: false)
+            let frames = try demuxedFLACPacketGeometryR6(url: url)
+            // Last 16 packets expose the transition near EOF; one initial
+            // packet is included as a long-tail positive control.
+            let tailStart = max(0, frames.count - 16)
+            var chosen = Array(tailStart..<frames.count)
+            if !chosen.contains(0) { chosen.insert(0, at: 0) }
+            print(
+                "G0_B03_R6_PACKET_MAP durationTag=\(tag) "
+                    + "totalDemuxedPackets=\(frames.count) "
+                    + "selectedPackets=\(chosen.count)"
+            )
+
+            for index in chosen {
+                let entry = frames[index]
+                let lastByte = entry.position + entry.bytes - 1
+                let insideOneByte = entry.position + 1
+                let insideMiddle = min(
+                    lastByte, entry.position + entry.bytes / 2
+                )
+                let points: [(kind: String, byte: Int)] = [
+                    ("frameStart", entry.position),
+                    ("insidePlusOne", insideOneByte),
+                    ("insideMiddle", insideMiddle)
+                ]
+                for point in points {
+                    attempted += 1
+                    let remainingStarts = frames.count - index
+                        - (point.kind == "frameStart" ? 0 : 1)
+                    let label = "durationTag=\(tag) packetIndex=\(index) "
+                        + "totalPackets=\(frames.count) "
+                        + "remainingPacketStarts=\(remainingStarts) "
+                        + "packetStartByte=\(entry.position) "
+                        + "packetSize=\(entry.bytes) packetPTS=\(entry.pts) "
+                        + "startKind=\(point.kind) startByte=\(point.byte)"
+                    do {
+                        let result = try probeFLACParserR5(
+                            url: url, startByte: point.byte,
+                            chunkBytes: 1024, flushAtEOF: true
+                        )
+                        let setupBad = result.contains("setupError=")
+                            || result.contains("parserError=flush(")
+                            || result.contains("stalled=true")
+                        let hasPTS = !result.contains("firstValidPTS=none")
+                            && result.contains("firstValidPTS=")
+                        if setupBad {
+                            setupErrors += 1
+                        } else if hasPTS {
+                            validPTS += 1
+                        } else {
+                            missingPTS += 1
+                        }
+                        print(
+                            "G0_B03_R6_PROBE \(label) "
+                                + "hasValidPTS=\(hasPTS) \(result)"
+                        )
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R6_PROBE \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+
+        print(
+            "G0_B03_R6_SUMMARY attempted=\(attempted) "
+                + "validPTS=\(validPTS) missingPTS=\(missingPTS) "
+                + "setupErrors=\(setupErrors)"
+        )
+        XCTAssertGreaterThan(attempted, 90, "R6 did not sample all packet tails")
+        XCTAssertEqual(setupErrors, 0, "R6 parser observation incomplete")
+        XCTAssertEqual(validPTS + missingPTS, attempted)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
