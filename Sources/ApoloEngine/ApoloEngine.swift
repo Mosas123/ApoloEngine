@@ -911,10 +911,13 @@ public final class ApoloEngine {
 final class AudioDiagnostics: @unchecked Sendable {
     private let lock = NSLock()
     private var handler: (@Sendable (String) -> Void)?
+    private var metrics = AudioMetricWindow()
 
     func setHandler(_ newHandler: (@Sendable (String) -> Void)?) {
         lock.lock()
         handler = newHandler
+        // Never combine measurements from different diagnostic subscribers.
+        metrics = AudioMetricWindow()
         lock.unlock()
     }
 
@@ -923,6 +926,21 @@ final class AudioDiagnostics: @unchecked Sendable {
         let callback = handler
         lock.unlock()
         callback?(event)
+    }
+
+    /// Aggregate measured elapsed time on the non-rendering I/O/decoder worker.
+    /// Only allowlisted metric names and integer milliseconds reach the host.
+    func record(_ kind: AudioMetricKind, milliseconds: Int) {
+        lock.lock()
+        guard let callback = handler else {
+            lock.unlock()
+            return
+        }
+        let summary = metrics.record(kind, milliseconds: milliseconds)
+        lock.unlock()
+        if let summary {
+            callback(summary.logLine)
+        }
     }
 
     static func elapsedMs(since start: UInt64) -> Int {
