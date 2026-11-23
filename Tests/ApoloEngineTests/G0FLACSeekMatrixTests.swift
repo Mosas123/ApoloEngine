@@ -1754,7 +1754,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                                     consumedFrames: &rampConsumed
                                 )
                             }
-                            let buffer = try makePCMBufferR10(
+                            let buffer = try self.makePCMBufferR10(
                                 values: floats, frames: kept, tick: keptStart,
                                 format: format
                             )
