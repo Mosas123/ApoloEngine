@@ -2,6 +2,7 @@ import AetherLibavcodec
 import AetherLibavformat
 import AetherLibavutil
 import CoreMedia
+import Darwin
 import Foundation
 import XCTest
 @testable import ApoloEngine
@@ -1304,6 +1305,268 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(attempted, 32)
         XCTAssertEqual(setupErrors, 0, "R8 observation incomplete")
         XCTAssertEqual(rawRejected + missingPCM + delivered, attempted)
+    }
+
+    /// R9 uses native integer PCM from actual AVFrames, before SWR,
+    /// CoreMedia, DSP and the intentional seek ramp. Preserve the native
+    /// sample bytes in canonical interleaved channel order for comparison.
+    private struct NativePCMSequenceR9 {
+        var firstTick: Int64?
+        var endTick: Int64?
+        var frameStarts: [Int64] = []
+        var sampleFormat: Int32?
+        var channels = 0
+        var bytesPerSample = 0
+        var data = Data()
+
+        var stride: Int { channels * bytesPerSample }
+
+        mutating func append(_ frame: UnsafeMutablePointer<AVFrame>) throws {
+            let value = frame.pointee
+            let start = value.pts
+            let count = Int(value.nb_samples)
+            let format = AVSampleFormat(rawValue: value.format)
+            let width = Int(av_get_bytes_per_sample(format))
+            let channelCount = Int(value.ch_layout.nb_channels)
+            guard start >= 0, count > 0, value.sample_rate == 44100,
+                  channelCount == 2, width > 0,
+                  let planes = value.extended_data,
+                  endTick == nil || endTick == start,
+                  sampleFormat == nil || sampleFormat == value.format,
+                  channels == 0 || channels == channelCount,
+                  bytesPerSample == 0 || bytesPerSample == width
+            else { throw MatrixError.invalidFixture }
+            if firstTick == nil { firstTick = start }
+            frameStarts.append(start)
+            endTick = start + Int64(count)
+            sampleFormat = value.format
+            channels = channelCount
+            bytesPerSample = width
+            if av_sample_fmt_is_planar(format) == 0 {
+                guard let plane = planes[0] else {
+                    throw MatrixError.invalidFixture
+                }
+                data.append(Data(bytes: plane, count: count * stride))
+            } else {
+                // No conversion or resampling. Only reorder native bytes
+                // from planar to interleaved for an unambiguous comparison.
+                for channel in 0..<channelCount {
+                    guard planes[channel] != nil else {
+                        throw MatrixError.invalidFixture
+                    }
+                }
+                for i in 0..<count {
+                    for channel in 0..<channelCount {
+                        guard let plane = planes[channel] else {
+                            throw MatrixError.invalidFixture
+                        }
+                        data.append(plane.advanced(by: i * width), count: width)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Open a fresh native context. For a seek, prime the decoder with
+    /// one decoded frame, then use the same seek flags and post-seek
+    /// avformat/avcodec flushes as AudioDecoder. Unlike production, this
+    /// observer retains every decoded frame so it can measure what exists
+    /// before the Swift whole-frame discard. No production flags changed.
+    private func nativePCMSequenceR9(
+        url: URL, targetTick: Int64?
+    ) throws -> (code: Int32, pcm: NativePCMSequenceR9) {
+        let source = try OpenedSource.open(url: url)
+        var ownedFormat = source.takeFormatContext()
+        defer { avformat_close_input(&ownedFormat) }
+        guard let context = ownedFormat,
+              context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              stream.pointee.time_base.num == 1,
+              stream.pointee.time_base.den == 44100,
+              let parameters = stream.pointee.codecpar,
+              parameters.pointee.codec_id == AV_CODEC_ID_FLAC,
+              let codec = avcodec_find_decoder(parameters.pointee.codec_id),
+              let allocated = avcodec_alloc_context3(codec)
+        else { throw MatrixError.missingStream }
+        var ownedCodec: UnsafeMutablePointer<AVCodecContext>? = allocated
+        defer { avcodec_free_context(&ownedCodec) }
+        guard avcodec_parameters_to_context(allocated, parameters) >= 0,
+              avcodec_open2(allocated, codec, nil) >= 0
+        else { throw MatrixError.invalidFixture }
+
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        var ownedFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer {
+            av_packet_free(&ownedPacket)
+            av_frame_free(&ownedFrame)
+        }
+        guard let packet = ownedPacket, let frame = ownedFrame
+        else { throw MatrixError.missingPacket }
+        let eofCode: Int32 = -541_478_725
+        let againCode = -Int32(EAGAIN)
+
+        func drain(into output: inout NativePCMSequenceR9) throws -> Int32 {
+            for _ in 0..<2048 {
+                let rc = avcodec_receive_frame(allocated, frame)
+                if rc == againCode || rc == eofCode { return rc }
+                guard rc >= 0 else { throw MatrixError.invalidFixture }
+                defer { av_frame_unref(frame) }
+                try output.append(frame)
+            }
+            throw MatrixError.invalidFixture
+        }
+
+        // Priming models the first PCM read in R8, without running DSP.
+        if let targetTick {
+            var primed = NativePCMSequenceR9()
+            for _ in 0..<512 {
+                guard av_read_frame(context, packet) >= 0
+                else { throw MatrixError.missingPCM }
+                defer { av_packet_unref(packet) }
+                guard packet.pointee.stream_index == 0 else { continue }
+                guard avcodec_send_packet(allocated, packet) >= 0
+                else { throw MatrixError.invalidFixture }
+                _ = try drain(into: &primed)
+                if primed.firstTick != nil { break }
+            }
+            guard primed.firstTick != nil else { throw MatrixError.missingPCM }
+            let code = avformat_seek_file(
+                context, 0, Int64.min, targetTick, Int64.max,
+                AVSEEK_FLAG_BACKWARD
+            )
+            if code < 0 { return (code, NativePCMSequenceR9()) }
+            avformat_flush(context)
+            avcodec_flush_buffers(allocated)
+        }
+
+        var output = NativePCMSequenceR9()
+        for _ in 0..<2048 {
+            let read = av_read_frame(context, packet)
+            if read == eofCode {
+                let sent = avcodec_send_packet(allocated, nil)
+                guard sent >= 0 || sent == eofCode
+                else { throw MatrixError.invalidFixture }
+                guard try drain(into: &output) == eofCode
+                else { throw MatrixError.invalidFixture }
+                return (0, output)
+            }
+            guard read >= 0 else { throw MatrixError.invalidFixture }
+            defer { av_packet_unref(packet) }
+            guard packet.pointee.stream_index == 0 else { continue }
+            guard avcodec_send_packet(allocated, packet) >= 0
+            else { throw MatrixError.invalidFixture }
+            _ = try drain(into: &output)
+        }
+        throw MatrixError.invalidFixture
+    }
+
+    /// A lab-only candidate: discard samples before target, not the entire
+    /// covering frame. Operate only on bytes actually decoded after seek;
+    /// never manufacture missing samples from the reference. Compare the
+    /// candidate with the linear native PCM suffix byte for byte.
+    func testG0B03NativePCMTrimCandidateObservation() throws {
+        let inputs: [(tag: String, seconds: Double, samples: Int64)] = [
+            ("025", 0.25, 11025), ("050", 0.50, 22050),
+            ("200", 2.0, 88200), ("1000", 10.0, 441000)
+        ]
+        let fractions: [(name: String, value: Double)] = [
+            ("start", 0), ("quarter", 0.25),
+            ("middle", 0.50), ("near-end", 0.90)
+        ]
+        var attempted = 0
+        var rejected = 0
+        var exact = 0
+        var incomplete = 0
+        var mismatched = 0
+        var setupErrors = 0
+        for item in inputs {
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                let linear = try nativePCMSequenceR9(url: url, targetTick: nil)
+                let reference = linear.pcm
+                guard linear.code == 0, reference.firstTick == 0,
+                      reference.endTick == item.samples, reference.stride > 0,
+                      reference.data.count == Int(item.samples) * reference.stride
+                else { throw MatrixError.invalidFixture }
+                print(
+                    "G0_B03_R9_REFERENCE durationTag=\(item.tag) table=\(table) "
+                        + "frames=\(item.samples) stride=\(reference.stride) "
+                        + "format=\(reference.sampleFormat ?? -1)"
+                )
+                for position in fractions {
+                    attempted += 1
+                    let seconds = item.seconds * position.value
+                    let target = Int64(seconds / (1.0 / 44100.0))
+                    let label = "durationTag=\(item.tag) table=\(table) "
+                        + "position=\(position.name) targetTick=\(target)"
+                    do {
+                        let result = try nativePCMSequenceR9(
+                            url: url, targetTick: target
+                        )
+                        if result.code < 0 {
+                            rejected += 1
+                            print("G0_B03_R9_CASE \(label) seekCode=\(result.code)")
+                            continue
+                        }
+                        let actual = result.pcm
+                        guard let first = actual.firstTick,
+                              let end = actual.endTick
+                        else {
+                            incomplete += 1
+                            print("G0_B03_R9_CASE \(label) seekCode=0 rawPCM=none")
+                            continue
+                        }
+                        guard actual.sampleFormat == reference.sampleFormat,
+                              actual.stride == reference.stride,
+                              first >= 0, end <= item.samples, end >= first,
+                              actual.data.count == Int(end - first) * actual.stride
+                        else { throw MatrixError.invalidFixture }
+
+                        let candidateStart = min(end, max(first, target))
+                        let trimBytes = Int(candidateStart - first) * actual.stride
+                        let candidate = actual.data.dropFirst(trimBytes)
+                        let referenceStart = Int(candidateStart) * actual.stride
+                        let referenceEnd = Int(end) * actual.stride
+                        let matches = candidate.elementsEqual(
+                            reference.data[referenceStart..<referenceEnd]
+                        )
+                        let wholeFrameStart = actual.frameStarts.first { $0 >= target }
+                        let wholeFrameEnd = wholeFrameStart ?? end
+                        let recovered = max(0, wholeFrameEnd - candidateStart)
+                        let complete = candidateStart == target && end == item.samples
+                        if !matches {
+                            mismatched += 1
+                        } else if complete {
+                            exact += 1
+                        } else {
+                            incomplete += 1
+                        }
+                        print(
+                            "G0_B03_R9_CASE \(label) seekCode=0 "
+                                + "rawFirst=\(first) rawEnd=\(end) "
+                                + "wholeFrameFirst=\(wholeFrameStart.map(String.init) ?? "none") "
+                                + "candidateFirst=\(candidateStart) "
+                                + "candidateFrames=\(end - candidateStart) "
+                                + "leadingGap=\(candidateStart - target) "
+                                + "tailGap=\(item.samples - end) recoveredFrames=\(recovered) "
+                                + "comparedBytes=\(candidate.count) bytesEqual=\(matches) "
+                                + "complete=\(complete)"
+                        )
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R9_CASE \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R9_SUMMARY attempted=\(attempted) rejected=\(rejected) "
+                + "exact=\(exact) incomplete=\(incomplete) "
+                + "mismatched=\(mismatched) setupErrors=\(setupErrors)"
+        )
+        XCTAssertEqual(attempted, 32)
+        XCTAssertEqual(setupErrors, 0, "R9 observation incomplete")
+        XCTAssertEqual(rejected + exact + incomplete + mismatched, attempted)
     }
 
     func testG0B03FLACSeek32Cases() throws {
