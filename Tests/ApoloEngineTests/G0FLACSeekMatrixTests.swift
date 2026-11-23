@@ -575,6 +575,130 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         )
     }
 
+    /// R4 uses the linked FFmpeg's *existing* AV_LOG_TRACE output to expose
+    /// ff_gen_search/read_timestamp brackets. Unlike R3, this deliberately
+    /// avoids avio_size(), avio_seek(SEEK_CUR), and external packet scanning
+    /// before seek: a second observation path must not perturb its target.
+    ///
+    /// AV_LOG_TRACE is process-global in libavutil. Set it only for the single
+    /// synchronous seek, restore it in defer, and do not run this diagnostic
+    /// alongside a concurrent codec workload. The test is LAB-ONLY.
+    private func traceLinkedGenericSeek(
+        url: URL,
+        sampleTick: Int64,
+        fastSeek: Bool,
+        label: String
+    ) throws -> String {
+        var owned = avformat_alloc_context()
+        guard let allocated = owned else { throw MatrixError.missingFormatContext }
+        if fastSeek {
+            allocated.pointee.flags |= Int32(AVFMT_FLAG_FAST_SEEK)
+        }
+        defer { avformat_close_input(&owned) }
+
+        let openCode = url.path.withCString {
+            avformat_open_input(&owned, $0, nil, nil)
+        }
+        guard openCode >= 0, let context = owned else {
+            return "openCode=\(openCode) setupFailed=1"
+        }
+        let infoCode = avformat_find_stream_info(context, nil)
+        guard infoCode >= 0,
+              context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              stream.pointee.time_base.num == 1,
+              stream.pointee.time_base.den == 44100
+        else {
+            return "streamInfoCode=\(infoCode) setupFailed=1"
+        }
+
+        let priorLogLevel = av_log_get_level()
+        // NSLog writes to the same diagnostic stream as libavutil's default
+        // av_log callback and supplies distinctive per-case boundaries.
+        NSLog("G0_B03_R4_TRACE_BEGIN \(label)")
+        let seekCode: Int32
+        do {
+            av_log_set_level(AV_LOG_TRACE)
+            defer { av_log_set_level(priorLogLevel) }
+            seekCode = avformat_seek_file(
+                context, 0, Int64.min, sampleTick, Int64.max,
+                AVSEEK_FLAG_BACKWARD
+            )
+        }
+        NSLog("G0_B03_R4_TRACE_END \(label) seekCode=\(seekCode)")
+
+        var nextReadCode = "notAttempted"
+        var nextPacketPTS = "none"
+        var nextPacketPos = "none"
+        if seekCode >= 0 {
+            var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+            defer { av_packet_free(&ownedPacket) }
+            guard let packet = ownedPacket else { throw MatrixError.missingPacket }
+            let rc = av_read_frame(context, packet)
+            nextReadCode = String(rc)
+            if rc >= 0 {
+                nextPacketPTS = String(packet.pointee.pts)
+                nextPacketPos = String(packet.pointee.pos)
+            }
+        }
+        return "streamInfoCode=\(infoCode) timeBase=1/44100 "
+            + "targetTick=\(sampleTick) seekCode=\(seekCode) "
+            + "nextReadCode=\(nextReadCode) "
+            + "nextPacketPTS=\(nextPacketPTS) "
+            + "nextPacketPos=\(nextPacketPos)"
+    }
+
+    /// Reproduce three failing generic-search targets, their nearest known
+    /// working packet boundary, one long-file control, and the table+FAST
+    /// bypass. The trace messages are FFmpeg's own, not an inferred model of
+    /// read_timestamp. Neither source code nor production flags are patched.
+    func testG0B03LinkedFFmpegInternalTraceObservation() throws {
+        let cases: [(
+            tag: String, tick: Int64, table: Bool,
+            fast: Bool, expectedSuccess: Bool
+        )] = [
+            ("025", 2756, false, false, false),
+            ("025", 4608, false, false, true),
+            ("050", 11025, false, false, false),
+            ("050", 13824, false, false, true),
+            ("200", 79380, false, false, false),
+            ("200", 82944, false, false, true),
+            ("1000", 396900, false, false, true),
+            ("200", 79380, true, true, true)
+        ]
+        var observed = 0
+        var unexpected = 0
+        for item in cases {
+            let url = try fixture(item.tag, withSeektable: item.table)
+            let label = "durationTag=\(item.tag) sampleTick=\(item.tick) "
+                + "table=\(item.table) fastSeek=\(item.fast)"
+            do {
+                let observation = try traceLinkedGenericSeek(
+                    url: url, sampleTick: item.tick,
+                    fastSeek: item.fast, label: label
+                )
+                print("G0_B03_R4_RESULT \(label) \(observation)")
+                let resultSuccessful = observation.contains("seekCode=0 ")
+                let resultFailed = observation.contains("seekCode=-1 ")
+                if observation.contains("setupFailed=1")
+                    || !(resultSuccessful || resultFailed)
+                    || resultSuccessful != item.expectedSuccess {
+                    unexpected += 1
+                }
+            } catch {
+                print("G0_B03_R4_RESULT \(label) setupError=\(error)")
+                unexpected += 1
+            }
+            observed += 1
+        }
+        print("G0_B03_R4_SUMMARY attempted=\(observed) unexpected=\(unexpected)")
+        XCTAssertEqual(observed, 8)
+        XCTAssertEqual(
+            unexpected, 0,
+            "R4 setup or known control outcomes changed; inspect raw logs"
+        )
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
