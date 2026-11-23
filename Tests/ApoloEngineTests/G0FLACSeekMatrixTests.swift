@@ -699,6 +699,185 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         )
     }
 
+    /// R5 isolates the PUBLIC FLAC AVCodecParser (libavcodec parser API),
+    /// not the production decoder. It mirrors flac_read_timestamp's parser
+    /// setup but feeds fixed-size local byte slices to distinguish a short
+    /// remainder from the parser's EOF-flush behavior.
+    ///
+    /// It is intentionally NOT a reimplementation of ff_raw_read_partial_packet:
+    /// 1024/4096 are controlled input chunk sizes, not asserted AVIO sizes.
+    /// Keep each parser and AVCodecContext independent across trials.
+    private func probeFLACParserR5(
+        url: URL,
+        startByte: Int,
+        chunkBytes: Int,
+        flushAtEOF: Bool
+    ) throws -> String {
+        let input = Array(try Data(contentsOf: url))
+        guard startByte >= 0, startByte < input.count,
+              chunkBytes > 0, chunkBytes <= 4096
+        else { throw MatrixError.invalidFixture }
+
+        let source = try OpenedSource.open(url: url)
+        var ownedFormat = source.takeFormatContext()
+        defer { avformat_close_input(&ownedFormat) }
+        guard let context = ownedFormat,
+              context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              let codecpar = stream.pointee.codecpar,
+              codecpar.pointee.codec_id == AV_CODEC_ID_FLAC
+        else { throw MatrixError.missingStream }
+
+        guard let allocated = avcodec_alloc_context3(nil)
+        else { throw MatrixError.missingFormatContext }
+        var ownedCodec: UnsafeMutablePointer<AVCodecContext>? = allocated
+        defer { avcodec_free_context(&ownedCodec) }
+        let parameterCode = avcodec_parameters_to_context(allocated, codecpar)
+        guard parameterCode >= 0 else {
+            return "setupError=parameters(\(parameterCode))"
+        }
+        guard let parser = av_parser_init(codecpar.pointee.codec_id)
+        else { return "setupError=parserUnavailable" }
+        defer { av_parser_close(parser) }
+        parser.pointee.flags |= PARSER_FLAG_USE_CODEC_TS
+
+        var cursor = startByte
+        var calls = 0
+        var outputs = 0
+        var outputsWithoutPTS = 0
+        var firstPTS = "none"
+        var firstPTSOffset = "none"
+        var firstOutputBytes = "none"
+        var validFound = false
+        var parserError = "none"
+        var stalled = false
+
+        func observe(_ emittedBytes: Int32) {
+            guard emittedBytes > 0 else { return }
+            outputs += 1
+            let pts = parser.pointee.pts
+            if pts == Int64.min {
+                outputsWithoutPTS += 1
+            } else if !validFound {
+                validFound = true
+                firstPTS = String(pts)
+                firstPTSOffset = String(parser.pointee.next_frame_offset)
+                firstOutputBytes = String(emittedBytes)
+            }
+        }
+
+        // The real FLAC demuxer passes the initial *ppos as the parser's
+        // position argument; do the same. Raw packets otherwise have NOPTS.
+        while cursor < input.count && calls < 2048 && !validFound {
+            let amount = min(chunkBytes, input.count - cursor)
+            var padded = Array(input[cursor..<(cursor + amount)])
+            padded.append(contentsOf: repeatElement(UInt8(0), count: 64))
+            var outData: UnsafeMutablePointer<UInt8>?
+            var outSize: Int32 = 0
+            let consumed: Int32 = padded.withUnsafeBufferPointer { raw in
+                av_parser_parse2(
+                    parser, allocated, &outData, &outSize,
+                    raw.baseAddress, Int32(amount),
+                    Int64.min, Int64.min, Int64(startByte)
+                )
+            }
+            calls += 1
+            if consumed < 0 || Int(consumed) > amount {
+                parserError = String(consumed)
+                break
+            }
+            observe(outSize)
+            cursor += Int(consumed)
+            if consumed == 0 && outSize == 0 {
+                stalled = true
+                break
+            }
+        }
+
+        var flushCalls = 0
+        if flushAtEOF && cursor == input.count
+            && !validFound && parserError == "none" && !stalled {
+            for _ in 0..<4 {
+                var outData: UnsafeMutablePointer<UInt8>?
+                var outSize: Int32 = 0
+                // A nonnull padded pointer with zero input length models
+                // av_parser_parse2() at EOF without unpadded read risk.
+                let padding = [UInt8](repeating: 0, count: 64)
+                let ret: Int32 = padding.withUnsafeBufferPointer { raw in
+                    av_parser_parse2(
+                        parser, allocated, &outData, &outSize,
+                        raw.baseAddress, 0, Int64.min,
+                        Int64.min, Int64(startByte)
+                    )
+                }
+                flushCalls += 1
+                if ret < 0 {
+                    parserError = "flush(\(ret))"
+                    break
+                }
+                observe(outSize)
+                if outSize == 0 || validFound { break }
+            }
+        }
+
+        return "totalBytes=\(input.count) startByte=\(startByte) "
+            + "availableBytes=\(input.count - startByte) chunkBytes=\(chunkBytes) "
+            + "eofFlush=\(flushAtEOF) calls=\(calls) cursor=\(cursor) "
+            + "flushCalls=\(flushCalls) outputs=\(outputs) "
+            + "outputsWithoutPTS=\(outputsWithoutPTS) "
+            + "firstValidPTS=\(firstPTS) firstValidNextFrameOffset=\(firstPTSOffset) "
+            + "firstValidOutputBytes=\(firstOutputBytes) "
+            + "parserError=\(parserError) stalled=\(stalled)"
+    }
+
+    /// R5 short-tail parser experiment: compare starts at actual FLAC frame
+    /// boundaries with a byte inside that frame (from R4), against the next
+    /// header. Includes long FLAC control and EOF flush on/off.
+    /// All 48 cases are observational; behavior is not required to PASS.
+    func testG0B03FLACParserEOFAndHeaderObservation() throws {
+        let cases: [(tag: String, frameStart: Int, middle: Int, nextFrame: Int)] = [
+            ("025", 8288, 9058, 9576),
+            ("050", 10864, 11370, 12152),
+            ("200", 30295, 30594, 31595),
+            ("1000", 119396, 119603, 120688)
+        ]
+        var attempted = 0
+        var setupErrors = 0
+        for item in cases {
+            let url = try fixture(item.tag, withSeektable: false)
+            for start in [
+                ("frameStart", item.frameStart),
+                ("insideFrame", item.middle),
+                ("nextFrame", item.nextFrame)
+            ] {
+                for chunk in [1024, 4096] {
+                    for flush in [false, true] {
+                        attempted += 1
+                        let label = "durationTag=\(item.tag) "
+                            + "startKind=\(start.0) startByte=\(start.1) "
+                            + "chunkBytes=\(chunk) eofFlush=\(flush)"
+                        do {
+                            let observation = try probeFLACParserR5(
+                                url: url, startByte: start.1,
+                                chunkBytes: chunk, flushAtEOF: flush
+                            )
+                            print("G0_B03_R5_PARSER \(label) \(observation)")
+                            if observation.contains("setupError=") {
+                                setupErrors += 1
+                            }
+                        } catch {
+                            setupErrors += 1
+                            print("G0_B03_R5_PARSER \(label) setupError=\(error)")
+                        }
+                    }
+                }
+            }
+        }
+        print("G0_B03_R5_SUMMARY attempted=\(attempted) setupErrors=\(setupErrors)")
+        XCTAssertEqual(attempted, 48)
+        XCTAssertEqual(setupErrors, 0, "R5 parser observation incomplete")
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
