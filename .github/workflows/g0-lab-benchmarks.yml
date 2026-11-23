@@ -1,0 +1,83 @@
+name: G0 lab benchmarks (diagnostic only)
+
+on:
+  # Running from a PR is necessary while this workflow is review-only:
+  # workflow_dispatch workflows only appear normally after reaching default.
+  pull_request:
+    branches: [main]
+    paths:
+      - "Tests/ApoloEngineTests/G0LabBenchmarks.swift"
+      - ".github/workflows/g0-lab-benchmarks.yml"
+      - "docs/G0_LAB_BENCHMARKS.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apolo-g0-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  local-flac-lab:
+    # Never run this benchmark for unrelated PRs.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'diag/g0-lab-')
+    name: Opt-in FLAC timings + XCTest CPU/memory (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact branch under test
+        uses: actions/checkout@v6.0.2
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Record reproducibility context
+        run: |
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "runner=$(uname -a)"
+            xcodebuild -version
+            swift --version
+            echo "fixture SHA256:"
+            shasum -a 256 Tests/ApoloEngineTests/Fixtures/tone.flac
+          } | tee g0-lab-environment.txt
+
+      - name: Run isolated test suite
+        env:
+          # xcodebuild forwards TEST_RUNNER_* to the simulator test process,
+          # stripping the prefix. Unset in ordinary CI = benchmark skipped.
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -eo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 \
+            | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          echo "Simulator=$NAME" | tee -a g0-lab-environment.txt
+          xcodebuild test \
+            -scheme ApoloEngine \
+            -destination "platform=iOS Simulator,name=$NAME" \
+            -derivedDataPath .build/G0Lab \
+            -resultBundlePath "$GITHUB_WORKSPACE/g0-lab.xcresult" \
+            -only-testing:ApoloEngineTests/G0LabBenchmarks \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            2>&1 | tee g0-lab-output.log
+
+      - name: Preserve raw results for offline interpretation
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apolo-g0-lab-simulator-${{ github.run_id }}
+          path: |
+            g0-lab-output.log
+            g0-lab-environment.txt
+            g0-lab.xcresult
+          if-no-files-found: warn
+          retention-days: 14
