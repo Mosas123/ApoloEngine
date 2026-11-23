@@ -116,6 +116,7 @@ jobs:
             -resultBundlePath "$GITHUB_WORKSPACE/g0-lab.xcresult" \
             -only-testing:ApoloEngineTests/G0LabBenchmarks \
             -only-testing:ApoloEngineTests/G0FLACSeekMatrixTests \
+            -parallel-testing-enabled NO \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
             -test-timeouts-enabled YES \
             -default-test-execution-time-allowance 120 \
