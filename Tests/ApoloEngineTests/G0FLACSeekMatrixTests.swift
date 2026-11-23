@@ -736,7 +736,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         guard parameterCode >= 0 else {
             return "setupError=parameters(\(parameterCode))"
         }
-        guard let parser = av_parser_init(codecpar.pointee.codec_id)
+        guard let parser = av_parser_init(Int32(codecpar.pointee.codec_id.rawValue))
         else { return "setupError=parserUnavailable" }
         defer { av_parser_close(parser) }
         parser.pointee.flags |= PARSER_FLAG_USE_CODEC_TS
