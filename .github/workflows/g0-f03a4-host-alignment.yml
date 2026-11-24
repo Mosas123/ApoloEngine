@@ -55,7 +55,15 @@ jobs:
           b34a8ec65857a0804d1fa718a16a37dd3c2bcdff8fe341bed59b21d322fb1ca3  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48031.f32
           SHA256
           python3 scripts/g0_generate_lossy_matrix.py verify Tests/ApoloEngineTests/Fixtures/G0Lossy
-          command -v ffprobe
+      - name: Provide host ffprobe if absent (no fixture regeneration)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v ffprobe >/dev/null; then
+            sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+            sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends ffmpeg
+          fi
+          ffprobe -version
       - name: Observe source-reference alignment and container metadata
         shell: bash
         run: |
