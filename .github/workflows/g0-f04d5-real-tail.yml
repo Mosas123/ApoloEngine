@@ -1,0 +1,180 @@
+name: G0 F04D.5 paired controlled real bridge tail
+
+on:
+  pull_request:
+    branches: [diag/f04d4-bridge-origin-20261124]
+    paths: [".github/workflows/g0-f04d5-real-tail.yml", "Tests/ApoloEngineTests/G0F04TailTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f04d5-real-tail-20261124'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install signed Ubuntu FFmpeg packages
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg
+      - name: Generate exact PCM Matroska origin and gap fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir G0F04D5
+          python3 - <<'PY'
+          import hashlib,json,pathlib,shutil,struct,subprocess
+          root=pathlib.Path("G0F04D5")
+          def run(args):
+              return subprocess.check_output(args,timeout=60)
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          ff=shutil.which("ffmpeg"); probe=shutil.which("ffprobe")
+          source=root/"source.s16"
+          source.write_bytes(b"".join(struct.pack("<hh",(i*113)%30001-15000,(i*997)%28001-14000) for i in range(16391)))
+          manifest={"ffmpeg_version":run([ff,"-version"]).decode(),"ffprobe_version":run([probe,"-version"]).decode(),"packages":run(["dpkg-query","-W","ffmpeg"]).decode(),"exe_sha256":{x:sha(pathlib.Path(x)) for x in (ff,probe)},"source_sha256":sha(source),"fixtures":{}}
+          for name,origin,gap in [("zero",0,0),("origin",12336,0),("gap",0,2400),("originGap",12336,2400)]:
+              dest=root/(name+".mka")
+              filtergraph=f"asetnsamples=n=960:p=0,asetpts=PTS+{origin}+{gap}*gte(N\\,7680)"
+              run([ff,"-v","error","-y","-f","s16le","-ar","48000","-ac","2","-i",str(source),"-af",filtergraph,"-c:a","pcm_s16le","-map_metadata","-1","-avoid_negative_ts","disabled","-f","matroska",str(dest)])
+              info=json.loads(run([probe,"-v","error","-select_streams","a:0","-show_streams","-show_frames","-of","json",str(dest)]))
+              stream=info["streams"][0]; frames=info["frames"]
+              assert stream["time_base"]=="1/1000",(name,stream["time_base"])
+              assert sum(f["nb_samples"] for f in frames)==16391
+              assert frames[0]["pts"]*48==origin,(name,frames[0]["pts"],origin)
+              gaps=[(b["pts"]-a["pts"])*48-a["nb_samples"] for a,b in zip(frames,frames[1:]) if (b["pts"]-a["pts"])*48!=a["nb_samples"]]
+              assert gaps==([gap] if gap else []),(name,gaps)
+              decoded=run([ff,"-v","error","-i",str(dest),"-f","s16le","-c:a","pcm_s16le","-"])
+              assert decoded==source.read_bytes()
+              manifest["fixtures"][name]={"sha256":sha(dest),"frames":frames,"stream":stream}
+              print("G0_F04D5_FIXTURE",name,sha(dest),"origin",origin,"gaps",gaps)
+          (root/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          PY
+          (cd G0F04D5 && sha256sum *.mka source.s16 manifest.json > SHA256SUMS)
+      - name: Preserve exact fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f04d5-fixtures
+          path: G0F04D5/
+          if-no-files-found: error
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f04d5-real-tail-20261124'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical generated fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f04d5-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F04D5
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F04D5
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Apply temporary output-rate-only laboratory override
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        if channels > 8 {\n            channels = 2\n        }\n"
+          assert s.count(old)==1
+          addition="""
+                  // F04D.5 laboratory-only override; never committed to Sources.
+                  if let raw = getenv("APOLO_G0_F04D5_RATE"),
+                     let rate = Int32(String(cString: raw)),
+                     [44100, 48000, 96000].contains(rate) {
+                      sampleRate = rate
+                  }
+          """
+          p.write_text(s.replace(old,old+addition))
+          PY
+          git diff -- Sources/ApoloEngine/AudioDecoder.swift | tee g0-f04d5-source-override.patch
+          test "$(git diff --name-only)" = "Sources/ApoloEngine/AudioDecoder.swift"
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f04d5-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f04d5-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F04D5-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f04d5-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F04TailTests/testG0F04D5RealBridgeTail \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 120 \
+              -maximum-test-execution-time-allowance 300 \
+              2>&1 | tee "g0-f04d5-$variant-output.log"; then
+              echo "G0_F04D5_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F04D5_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Restore unmodified production source
+        if: always()
+        run: |
+          git restore -- Sources/ApoloEngine/AudioDecoder.swift Package.swift
+          git diff --exit-code -- Sources/ApoloEngine/AudioDecoder.swift Package.swift
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f04d5-paired-${{ github.run_id }}
+          path: |
+            g0-f04d5-*-output.log
+            g0-f04d5-*-dependency.patch
+            g0-f04d5-environment.txt
+            g0-f04d5-source-override.patch
+            g0-f04d5-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
