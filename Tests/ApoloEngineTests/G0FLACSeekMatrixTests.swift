@@ -1688,8 +1688,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                     var maxError: Float = 0
                     do {
                         let result = try nativePCMSequenceR9(
-                            url: url, targetTick: target
-                        ) { frame in
+                            url: url, targetTick: target,
+                            onFrame: { frame in
                             let value = frame.pointee
                             let start = value.pts
                             let count = Int(value.nb_samples)
@@ -1789,7 +1789,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                             framesEmitted += kept
                             outputBuffers += 1
                             peakBufferFrames = max(peakBufferFrames, capacity)
-                        }
+                            }
+                        )
                         if result.code < 0 {
                             rejected += 1
                             print("G0_B03_R10_CASE \(label) seekCode=\(result.code)")
@@ -1890,8 +1891,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                                     packets += 1
                                     payloadBytes += size
                                 },
-                                onSeek: { _, elapsed in seekNS = elapsed }
-                            ) { frame in
+                                onSeek: { _, elapsed in seekNS = elapsed },
+                                onFrame: { frame in
                                 var one = NativePCMSequenceR9()
                                 try one.append(frame)
                                 guard let start = one.firstTick,
@@ -1927,7 +1928,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                                 if !bytes.elementsEqual(reference.data[a..<b]) {
                                     mismatchedFrames += 1
                                 }
-                            }
+                                }
+                            )
                             let totalNS = DispatchTime.now().uptimeNanoseconds - started
                             if result.code < 0 {
                                 rejected += 1
