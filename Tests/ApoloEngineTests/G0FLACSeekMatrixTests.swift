@@ -5569,6 +5569,160 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(errors, 0)
     }
 
+    // F03A.3: observe all ten actual bridge outputs and source-length excess.
+    // Keep original strict tests, compare PCM without modifying timestamps.
+    func testG0F03A3ExtendedBridgeAndPaddingObservation() throws {
+        var attempted = 0
+        var pcmExact = 0
+        var controlPCMExact = 0
+        var errors = 0
+        func compare(_ a: [Float], _ b: [Float]) -> (Int, Double, Double) {
+            guard a.count == b.count, !a.isEmpty else { return (-1, .infinity, .infinity) }
+            var different = 0
+            var maxError = 0.0
+            var squares = 0.0
+            for (x, y) in zip(a, b) {
+                if x.bitPattern != y.bitPattern { different += 1 }
+                let delta = abs(Double(x) - Double(y))
+                maxError = max(maxError, delta)
+                squares += delta * delta
+            }
+            return (different, maxError, sqrt(squares / Double(a.count)))
+        }
+        let cases: [(codec: String, ext: String, rate: Int, channels: Int, frames: Int)] = [
+            ("aac", "m4a", 44100, 2, 49152), ("aac", "m4a", 48000, 1, 49152),
+            ("opus", "opus", 48000, 1, 48000), ("opus", "opus", 48000, 2, 48000),
+            ("aac", "m4a", 48000, 2, 48017), ("aac", "aac", 44100, 2, 48123),
+            ("opus", "opus", 48000, 1, 48017), ("opus", "opus", 48000, 2, 48239),
+            ("opus", "mp4", 48000, 2, 48019), ("opus", "webm", 48000, 2, 48031)
+        ]
+        var comparedValues = 0
+        var excessCases = 0
+        for p in cases {
+            let channels = p.channels
+            attempted += 1
+            let name = "f03a_\(p.codec)_\(p.rate)_\(channels)_\(p.frames)"
+            do {
+                let url = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: p.ext, subdirectory: "Fixtures/G0Lossy"))
+                let refURL = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: "f32", subdirectory: "Fixtures/G0Lossy"))
+                let data = try Data(contentsOf: refURL)
+                guard !data.isEmpty, data.count % (channels * 4) == 0 else { throw MatrixError.invalidFixture }
+                let hostFrames = data.count / (channels * 4)
+                guard hostFrames >= p.frames, hostFrames <= p.frames + 2048 else { throw MatrixError.invalidFixture }
+                let host: [Float] = data.withUnsafeBytes { bytes in
+                    (0..<(bytes.count / 4)).map {
+                        Float(bitPattern: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: $0 * 4, as: UInt32.self)))
+                    }
+                }
+                guard host.allSatisfy({ $0.isFinite }) else { throw MatrixError.invalidFixture }
+                let raw = try rawF03A(url: url, codecName: p.codec, rate: Int32(p.rate),
+                    channels: channels, maxFrames: p.frames + 4096, traceMode: "F03A3-original")
+                let control = try rawF03A(url: url, codecName: p.codec, rate: Int32(p.rate),
+                    channels: channels, maxFrames: p.frames + 4096, traceMode: "F03A3-control",
+                    setPacketTimeBase: true)
+                let rawHost = compare(raw.values, host)
+                let controlRaw = compare(control.values, raw.values)
+                let controlHost = compare(control.values, host)
+                if controlRaw.0 == 0 && control.values.count == host.count { controlPCMExact += 1 }
+                print("G0_F03A3_NATIVE fixture=\(name) mode=original frames=\(raw.values.count / channels) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") discontinuities=\(raw.discontinuities) missingPTS=\(raw.missingPTS) hostDifferent=\(rawHost.0) hostMax=\(rawHost.1) hostRMS=\(rawHost.2) eof=true")
+                print("G0_F03A3_NATIVE fixture=\(name) mode=packetTimeBase frames=\(control.values.count / channels) first=\(control.first.map(String.init) ?? "none") end=\(control.end.map(String.init) ?? "none") discontinuities=\(control.discontinuities) missingPTS=\(control.missingPTS) originalDifferent=\(controlRaw.0) originalMax=\(controlRaw.1) hostDifferent=\(controlHost.0) hostMax=\(controlHost.1) hostRMS=\(controlHost.2) eof=true")
+                let source = try OpenedSource.open(url: url)
+                defer { source.close() }
+                let decoder = AudioDecoder()
+                decoder.limiterEnabled = false
+                try decoder.adopt(source)
+                defer { decoder.close() }
+                var values: [Float] = []
+                var first: Int64?
+                var end: Int64?
+                var discontinuities = 0
+                var negativePTS = 0
+                var invalidPTS = 0
+                var offGridPTS = 0
+                var index = 0
+                var reachedEOF = false
+                for _ in 0..<2048 {
+                    guard let sample = try decoder.readNextBuffer() else {
+                        reachedEOF = true
+                        break
+                    }
+                    index += 1
+                    let count = CMSampleBufferGetNumSamples(sample)
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    let duration = CMSampleBufferGetDuration(sample)
+                    let seconds = pts.seconds
+                    let cursor = values.count / channels
+                    // Observe, rather than repair, the timeline.
+                    if seconds.isFinite, abs(seconds) < 60 {
+                        let scaled = seconds * Double(p.rate)
+                        let tick = Int64(scaled.rounded())
+                        if tick < 0 { negativePTS += 1 }
+                        if abs(scaled - Double(tick)) >= 0.001 { offGridPTS += 1 }
+                        if let old = end, old != tick { discontinuities += 1 }
+                        if first == nil { first = tick }
+                        end = tick + Int64(count)
+                        print("G0_F03A3_COREMEDIA fixture=\(name) index=\(index) ptsValue=\(pts.value) ptsScale=\(pts.timescale) tick=\(tick) durationValue=\(duration.value) durationScale=\(duration.timescale) samples=\(count) cursor=\(cursor)")
+                    } else {
+                        invalidPTS += 1
+                        print("G0_F03A3_COREMEDIA fixture=\(name) index=\(index) invalidPTS=true samples=\(count) cursor=\(cursor)")
+                    }
+                    guard count > 0, cursor + count <= p.frames + 4096,
+                          let desc = CMSampleBufferGetFormatDescription(sample),
+                          let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
+                          let block = CMSampleBufferGetDataBuffer(sample)
+                    else { throw MatrixError.invalidFixture }
+                    let shape = asbd.pointee
+                    guard shape.mSampleRate == Double(p.rate),
+                          shape.mChannelsPerFrame == UInt32(channels),
+                          shape.mFormatID == kAudioFormatLinearPCM,
+                          shape.mBitsPerChannel == 32,
+                          shape.mBytesPerFrame == UInt32(channels * 4),
+                          (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+                          (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0,
+                          CMBlockBufferGetDataLength(block) == count * channels * 4
+                    else { throw MatrixError.invalidFixture }
+                    var chunk = [Float](repeating: 0, count: count * channels)
+                    let rc = chunk.withUnsafeMutableBytes { bytes in
+                        CMBlockBufferCopyDataBytes(block, atOffset: 0,
+                            dataLength: bytes.count, destination: bytes.baseAddress!)
+                    }
+                    guard rc == 0, chunk.allSatisfy({ $0.isFinite })
+                    else { throw MatrixError.invalidFixture }
+                    values.append(contentsOf: chunk)
+                }
+                let bridge = compare(values, raw.values)
+                let engineHost = compare(values, host)
+                let exact = reachedEOF && values.count == host.count && bridge.0 == 0
+                if exact { pcmExact += 1; comparedValues += values.count }
+                let excess = hostFrames - p.frames
+                if excess > 0 { excessCases += 1 }
+                // Index-aligned tail observation only: not a claim about
+                // which samples represent encoder delay or padding.
+                let tail = values.dropFirst(p.frames * channels)
+                let tailPeak = tail.reduce(0.0) { max($0, abs(Double($1))) }
+                let tailRMS = tail.isEmpty ? 0.0 : sqrt(tail.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(tail.count))
+                print("G0_F03A3_PADDING fixture=\(name) container=\(p.ext) sourceFrames=\(p.frames) hostFrames=\(hostFrames) rawFrames=\(raw.values.count / channels) engineFrames=\(values.count / channels) hostExcess=\(excess) tailValues=\(tail.count) tailPeak=\(tailPeak) tailRMS=\(tailRMS)")
+                let timelineValid = first == 0 && end == Int64(hostFrames) && discontinuities == 0
+                    && negativePTS == 0 && invalidPTS == 0 && offGridPTS == 0
+                print("G0_F03A3_ENGINE fixture=\(name) frames=\(values.count / channels) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") discontinuities=\(discontinuities) negativePTS=\(negativePTS) invalidPTS=\(invalidPTS) offGridPTS=\(offGridPTS) bridgeDifferent=\(bridge.0) bridgeMax=\(bridge.1) hostDifferent=\(engineHost.0) hostMax=\(engineHost.1) hostRMS=\(engineHost.2) asbdValid=true eof=\(reachedEOF) pcmExact=\(exact) timelineValid=\(timelineValid)")
+            } catch {
+                errors += 1
+                print("G0_F03A3_ERROR fixture=\(name) error=\(error)")
+            }
+        }
+        // PCM-only diagnostic criteria; F03A still asserts strict timing.
+        // Tail observations are never used to trim or rewrite delivered PCM.
+        print("G0_F03A3_SUMMARY attempted=\(attempted) pcmExact=\(pcmExact) controlPCMExact=\(controlPCMExact) errors=\(errors) comparedValues=\(comparedValues) excessCases=\(excessCases)")
+        XCTAssertEqual(attempted, 10)
+        XCTAssertEqual(pcmExact, 10)
+        XCTAssertEqual(controlPCMExact, 10)
+        XCTAssertEqual(comparedValues, 823869)
+        XCTAssertEqual(excessCases, 3)
+        XCTAssertEqual(errors, 0)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
