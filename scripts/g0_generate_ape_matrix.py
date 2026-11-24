@@ -13,6 +13,12 @@ import wave
 PROFILES = ((44100, 1, 16), (44100, 2, 24), (48000, 2, 16),
             (48000, 1, 24), (96000, 2, 24), (192000, 2, 24))
 WORKLOADS = ((2000, 8193), (4000, 80001))
+# F02B.3: cross two complete nominal APE compression-frame boundaries
+# at both ends of the tested rate/bit-depth/channel spectrum.
+MULTI_PROFILES = ((44100, 1, 16), (192000, 2, 24))
+MULTI_WORKLOADS = ((2000, 147457), (4000, 589825))
+CASES = tuple((*p, *w) for p in PROFILES for w in WORKLOADS) + tuple(
+    (*p, *w) for p in MULTI_PROFILES for w in MULTI_WORKLOADS)
 
 
 def sha(data):
@@ -40,22 +46,22 @@ def name(rate, channels, bits, level, frames):
 def verify(out):
     manifest = json.loads((out / "manifest.json").read_text())
     assert manifest["generator"]["binary_sha256"]
-    expected = {name(*p, *w) for p in PROFILES for w in WORKLOADS}
+    expected = {name(*case) for case in CASES}
     entries = manifest["files"]
-    assert len(entries) == len(expected) == 12
+    assert len(entries) == len(expected) == 16
     assert {e["file"] for e in entries} == expected
     assert {f.name for f in out.glob("*.ape")} == expected
     for e in entries:
         p = (e["sample_rate"], e["channels"], e["bit_depth"])
         w = (e["compression"], e["total_samples"])
-        assert p in PROFILES and w in WORKLOADS and e["file"] == name(*p, *w)
+        assert (*p, *w) in CASES and e["file"] == name(*p, *w)
         data = (out / e["file"]).read_bytes()
         assert data[:4] == b"MAC "
         assert struct.unpack_from("<H", data, 4)[0] == e["ape_version"]
         assert len(data) == e["bytes"] and sha(data) == e["sha256"]
         assert e["independent_roundtrip_exact"] is True
         assert sha(raw_pcm(*p, w[1])) == e["source_pcm_sha256"]
-    print("Verified 12 APE fixture hashes, source PCM hashes and manifest.")
+    print("Verified 16 APE fixture hashes, source PCM hashes and manifest (12 original + 4 multi-packet).")
 
 
 def generate(out):
@@ -73,36 +79,35 @@ def generate(out):
     with tempfile.TemporaryDirectory() as scratch:
         source = pathlib.Path(scratch) / "source.wav"
         decoded = pathlib.Path(scratch) / "decoded.wav"
-        for rate, channels, bits in PROFILES:
-            for level, frames in WORKLOADS:
-                raw = raw_pcm(rate, channels, bits, frames)
-                with wave.open(str(source), "wb") as wav:
-                    wav.setnchannels(channels)
-                    wav.setsampwidth(bits // 8)
-                    wav.setframerate(rate)
-                    wav.writeframes(raw)
-                target = out / name(rate, channels, bits, level, frames)
-                target.unlink(missing_ok=True)
-                decoded.unlink(missing_ok=True)
-                subprocess.run([tool, str(source), str(target), f"-c{level}"],
-                               check=True, timeout=60)
-                subprocess.run([tool, str(target), str(decoded), "-d"],
-                               check=True, timeout=60)
-                with wave.open(str(decoded), "rb") as wav:
-                    assert (wav.getframerate(), wav.getnchannels(),
-                            wav.getsampwidth(), wav.getnframes()) == (
-                                rate, channels, bits // 8, frames)
-                    assert wav.readframes(frames) == raw, target.name
-                data = target.read_bytes()
-                assert data[:4] == b"MAC "
-                manifest["files"].append({
-                    "file": target.name, "sample_rate": rate,
-                    "channels": channels, "bit_depth": bits,
-                    "compression": level, "total_samples": frames,
-                    "ape_version": struct.unpack_from("<H", data, 4)[0],
-                    "source_pcm_sha256": sha(raw), "bytes": len(data),
-                    "sha256": sha(data), "independent_roundtrip_exact": True,
-                })
+        for rate, channels, bits, level, frames in CASES:
+            raw = raw_pcm(rate, channels, bits, frames)
+            with wave.open(str(source), "wb") as wav:
+                wav.setnchannels(channels)
+                wav.setsampwidth(bits // 8)
+                wav.setframerate(rate)
+                wav.writeframes(raw)
+            target = out / name(rate, channels, bits, level, frames)
+            target.unlink(missing_ok=True)
+            decoded.unlink(missing_ok=True)
+            subprocess.run([tool, str(source), str(target), f"-c{level}"],
+                           check=True, timeout=60)
+            subprocess.run([tool, str(target), str(decoded), "-d"],
+                           check=True, timeout=60)
+            with wave.open(str(decoded), "rb") as wav:
+                assert (wav.getframerate(), wav.getnchannels(),
+                        wav.getsampwidth(), wav.getnframes()) == (
+                            rate, channels, bits // 8, frames)
+                assert wav.readframes(frames) == raw, target.name
+            data = target.read_bytes()
+            assert data[:4] == b"MAC "
+            manifest["files"].append({
+                "file": target.name, "sample_rate": rate,
+                "channels": channels, "bit_depth": bits,
+                "compression": level, "total_samples": frames,
+                "ape_version": struct.unpack_from("<H", data, 4)[0],
+                "source_pcm_sha256": sha(raw), "bytes": len(data),
+                "sha256": sha(data), "independent_roundtrip_exact": True,
+            })
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     verify(out)
     print(json.dumps(manifest, indent=2, sort_keys=True))

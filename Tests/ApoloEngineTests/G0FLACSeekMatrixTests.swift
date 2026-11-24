@@ -4281,17 +4281,20 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     // unexpected formats. Compare separately from production AudioDecoder.
     private func rawF01PCM(
         url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int,
-        expectedCodec: String? = nil, inferMissingAPEPTS: Bool = false
+        expectedCodec: String? = nil, inferMissingAPEPTS: Bool = false,
+        verifyAPEPacketAnchors: Bool = false
     ) throws -> (values: [Float], first: Int64?, end: Int64?, format: Int32?,
                  packets: Int, frames: Int, observedPTS: Int, inferredPTS: Int,
-                 observedSamples: Int, inferredSamples: Int) {
-        guard !inferMissingAPEPTS || expectedCodec == "ape"
+                 observedSamples: Int, inferredSamples: Int, verifiedPacketAnchors: Int) {
+        guard (!inferMissingAPEPTS || expectedCodec == "ape"),
+              (!verifyAPEPacketAnchors || inferMissingAPEPTS)
         else { throw MatrixError.invalidFixture }
         // F02B.1 retains strict raw PTS requirements by default.
         // F02B.2 is a separate opt-in sequential observation for APE only.
         // Inferred coordinates are local bookkeeping, never written to AVFrame.
         let traceAPE = expectedCodec == "ape"
-        let traceStage = inferMissingAPEPTS ? "G0_F02B2_TRACE" : "G0_F02B1_TRACE"
+        let traceStage = verifyAPEPacketAnchors ? "G0_F02B3_TRACE"
+            : (inferMissingAPEPTS ? "G0_F02B2_TRACE" : "G0_F02B1_TRACE")
         func trace(_ message: @autoclosure () -> String) {
             if traceAPE {
                 print("\(traceStage) fixture=\(url.lastPathComponent) \(message())")
@@ -4351,8 +4354,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         var observedSamples = 0
         var inferredSamples = 0
         var reachedEOF = false
+        var verifiedPacketAnchors = 0
+        var pendingPacketAnchor: Int64?
         defer {
-            trace("stage=terminal packets=\(packetCount) framesObserved=\(frameCount) missingPTS=\(missingPTS) observedPTS=\(observedPTS) inferredPTS=\(inferredPTS) observedSamples=\(observedSamples) inferredSamples=\(inferredSamples) acceptedValues=\(output.count) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") eof=\(reachedEOF)")
+            trace("stage=terminal packets=\(packetCount) framesObserved=\(frameCount) missingPTS=\(missingPTS) observedPTS=\(observedPTS) inferredPTS=\(inferredPTS) observedSamples=\(observedSamples) inferredSamples=\(inferredSamples) verifiedPacketAnchors=\(verifiedPacketAnchors) acceptedValues=\(output.count) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") eof=\(reachedEOF)")
         }
 
         func drain() throws -> Int32 {
@@ -4413,6 +4418,14 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                         AVRational(num: 1, den: rate))
                     observedPTS += 1
                     observedSamples += count
+                }
+                if verifyAPEPacketAnchors, let anchor = pendingPacketAnchor {
+                    guard value.pts != Int64.min, tick == anchor else {
+                        trace("stage=reject reason=packetAnchor expected=\(anchor) tick=\(tick) rawPTS=\(value.pts)")
+                        throw MatrixError.invalidTimestamp
+                    }
+                    verifiedPacketAnchors += 1
+                    pendingPacketAnchor = nil
                 }
                 if inferMissingAPEPTS {
                     guard tick == Int64(output.count / channels),
@@ -4478,7 +4491,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 }
                 reachedEOF = true
                 return (output, first, end, format, packetCount, frameCount,
-                        observedPTS, inferredPTS, observedSamples, inferredSamples)
+                        observedPTS, inferredPTS, observedSamples, inferredSamples,
+                        verifiedPacketAnchors)
             }
             guard rc >= 0 else {
                 trace("stage=reject reason=read code=\(rc)")
@@ -4488,13 +4502,35 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             guard packet.pointee.stream_index == 0 else { continue }
             packetCount += 1
             trace("stage=packet index=\(packetCount) pts=\(packet.pointee.pts) dts=\(packet.pointee.dts) duration=\(packet.pointee.duration) size=\(packet.pointee.size)")
+            let packetStart = output.count / channels
+            let packetDuration = packet.pointee.duration
+            if verifyAPEPacketAnchors {
+                guard pendingPacketAnchor == nil,
+                      packet.pointee.pts == Int64(packetStart),
+                      packetDuration > 0,
+                      packetDuration <= Int64(expectedFrames - packetStart)
+                else {
+                    trace("stage=reject reason=packetGrid cursor=\(packetStart)")
+                    throw MatrixError.invalidTimestamp
+                }
+                pendingPacketAnchor = packet.pointee.pts
+            }
             let sent = avcodec_send_packet(decoder, packet)
             trace("stage=send code=\(sent)")
             guard sent >= 0 else {
                 trace("stage=reject reason=send code=\(sent)")
                 throw MatrixError.invalidFixture
             }
-            _ = try drain()
+            let drained = try drain()
+            if verifyAPEPacketAnchors {
+                let produced = output.count / channels - packetStart
+                guard drained == again, pendingPacketAnchor == nil,
+                      Int64(produced) == packetDuration else {
+                    trace("stage=reject reason=packetCoverage produced=\(produced) duration=\(packetDuration) receive=\(drained)")
+                    throw MatrixError.invalidFixture
+                }
+                trace("stage=packetCoverage packet=\(packetCount) first=\(packetStart) samples=\(produced) verified=true")
+            }
         }
         throw MatrixError.invalidFixture
     }
@@ -4874,6 +4910,140 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(totalObservedPTS + totalInferredPTS, totalFrames)
         XCTAssertEqual(totalObservedSamples + totalInferredSamples, 529164)
         XCTAssertEqual(totalValues, 881940)
+    }
+
+    // F02B.3: verify raw packet boundaries and actual engine PCM over multiple packets.
+    func testG0F02B3APEMultiplePacketFidelity() throws {
+        let profiles: [(rate: Int, channels: Int, bits: Int)] = [
+            (44100, 1, 16), (192000, 2, 24)
+        ]
+        let workloads = [(level: 2000, frames: 147457), (level: 4000, frames: 589825)]
+        var attempted = 0
+        var exact = 0
+        var errors = 0
+        var totalPackets = 0
+        var totalFrames = 0
+        var totalObservedPTS = 0
+        var totalInferredPTS = 0
+        var totalObservedSamples = 0
+        var totalInferredSamples = 0
+        var totalValues = 0
+        var totalVerifiedAnchors = 0
+        var engineExact = 0
+        for p in profiles {
+            for w in workloads {
+                attempted += 1
+                let label = "rate=\(p.rate) channels=\(p.channels) bits=\(p.bits) compression=\(w.level) sourceFrames=\(w.frames)"
+                let name = "f02b_ape_\(p.rate)_\(p.channels)_\(p.bits)_\(w.level)_\(w.frames)"
+                do {
+                    let url = try XCTUnwrap(Bundle.module.url(forResource: name,
+                        withExtension: "ape", subdirectory: "Fixtures/G0APE"))
+                    let expected = makeF01PCMContainer(aiff: false, rate: p.rate,
+                        channels: p.channels, bits: p.bits, frames: w.frames).1
+                    let raw = try rawF01PCM(url: url, rate: Int32(p.rate),
+                        channels: p.channels, bits: p.bits, expectedFrames: w.frames,
+                        expectedCodec: "ape", inferMissingAPEPTS: true,
+                        verifyAPEPacketAnchors: true)
+                    var different = 0
+                    var maxAbsError: Float = 0
+                    if raw.values.count == expected.count {
+                        for (x, y) in zip(raw.values, expected) {
+                            if x.bitPattern != y.bitPattern { different += 1 }
+                            maxAbsError = max(maxAbsError, abs(x - y))
+                        }
+                    } else {
+                        different = -1
+                        maxAbsError = .infinity
+                    }
+                    let complete = raw.first == 0 && raw.end == Int64(w.frames)
+                        && raw.values.count == expected.count && different == 0
+                        && raw.observedPTS > 0 && raw.inferredPTS > 0
+                        && raw.observedPTS + raw.inferredPTS == raw.frames
+                        && raw.observedSamples + raw.inferredSamples == w.frames
+                        && raw.packets >= 3 && raw.verifiedPacketAnchors == raw.packets
+                        && raw.observedPTS >= raw.packets
+                    if complete { exact += 1 }
+                    totalPackets += raw.packets
+                    totalVerifiedAnchors += raw.verifiedPacketAnchors
+                    totalFrames += raw.frames
+                    totalObservedPTS += raw.observedPTS
+                    totalInferredPTS += raw.inferredPTS
+                    totalObservedSamples += raw.observedSamples
+                    totalInferredSamples += raw.inferredSamples
+                    totalValues += raw.values.count
+                    print("G0_F02B3_CASE \(label) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") format=\(raw.format.map(String.init) ?? "none") packets=\(raw.packets) verifiedAnchors=\(raw.verifiedPacketAnchors) decodedFrames=\(raw.frames) observedPTS=\(raw.observedPTS) inferredPTS=\(raw.inferredPTS) observedSamples=\(raw.observedSamples) inferredSamples=\(raw.inferredSamples) values=\(raw.values.count) different=\(different) maxAbsError=\(maxAbsError) eof=true exact=\(complete)")
+                } catch {
+                    errors += 1
+                    print("G0_F02B3_CASE \(label) error=\(error)")
+                }
+                do {
+                    let url = try XCTUnwrap(Bundle.module.url(forResource: name,
+                        withExtension: "ape", subdirectory: "Fixtures/G0APE"))
+                    let expected = makeF01PCMContainer(aiff: false, rate: p.rate,
+                        channels: p.channels, bits: p.bits, frames: w.frames).1
+                    let source = try OpenedSource.open(url: url)
+                    defer { source.close() }
+                    guard source.info.audioTracks.first?.codec == "ape"
+                    else { throw MatrixError.invalidFixture }
+                    let decoder = AudioDecoder()
+                    decoder.limiterEnabled = false
+                    try decoder.adopt(source)
+                    defer { decoder.close() }
+                    var sequence = PCMSequenceR8()
+                    var reachedEOF = false
+                    var asbdValid = true
+                    for _ in 0..<2048 {
+                        guard let sample = try decoder.readNextBuffer() else {
+                            reachedEOF = true
+                            break
+                        }
+                        guard let desc = CMSampleBufferGetFormatDescription(sample),
+                              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                        else { throw MatrixError.invalidFixture }
+                        let shape = asbd.pointee
+                        asbdValid = asbdValid && shape.mSampleRate == Double(p.rate)
+                            && shape.mChannelsPerFrame == UInt32(p.channels)
+                            && shape.mFormatID == kAudioFormatLinearPCM
+                            && shape.mBitsPerChannel == 32
+                            && shape.mBytesPerFrame == UInt32(p.channels * 4)
+                            && (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+                        try sequence.append(sample, rate: Int32(p.rate))
+                        guard sequence.frameCount <= w.frames else { throw MatrixError.invalidFixture }
+                    }
+                    var unequal = 0
+                    var maxError: Float = 0
+                    if sequence.samples.count == expected.count {
+                        for (x, y) in zip(sequence.samples, expected) {
+                            if x.bitPattern != y.bitPattern { unequal += 1 }
+                            maxError = max(maxError, abs(x - y))
+                        }
+                    } else {
+                        unequal = -1
+                        maxError = .infinity
+                    }
+                    let diff = (unequal, maxError)
+                    let exact = reachedEOF && asbdValid && sequence.firstTick == 0
+                        && sequence.nextTick == Int64(w.frames)
+                        && sequence.channels == p.channels && diff.0 == 0
+                    if exact { engineExact += 1 }
+                    print("G0_F02B3_ENGINE \(label) first=\(sequence.firstTick.map(String.init) ?? "none") end=\(sequence.nextTick.map(String.init) ?? "none") frames=\(sequence.frameCount) values=\(sequence.samples.count) different=\(diff.0) maxAbsError=\(diff.1) asbdValid=\(asbdValid) eof=\(reachedEOF) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F02B3_ENGINE \(label) error=\(error)")
+                }
+            }
+        }
+        print("G0_F02B3_SUMMARY attempted=\(attempted) exact=\(exact) engineExact=\(engineExact) errors=\(errors) packets=\(totalPackets) verifiedAnchors=\(totalVerifiedAnchors) decodedFrames=\(totalFrames) observedPTS=\(totalObservedPTS) inferredPTS=\(totalInferredPTS) observedSamples=\(totalObservedSamples) inferredSamples=\(totalInferredSamples) comparedValues=\(totalValues)")
+        XCTAssertEqual(attempted, 4)
+        XCTAssertEqual(exact, 4)
+        XCTAssertEqual(engineExact, 4)
+        XCTAssertGreaterThanOrEqual(totalPackets, 12)
+        XCTAssertEqual(totalVerifiedAnchors, totalPackets)
+        XCTAssertEqual(errors, 0)
+        XCTAssertEqual(totalObservedPTS + totalInferredPTS, totalFrames)
+        XCTAssertEqual(totalObservedSamples + totalInferredSamples, 1474564)
+        XCTAssertEqual(totalValues, 2211846)
     }
 
     func testG0B03FLACSeek32Cases() throws {
