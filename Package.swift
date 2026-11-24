@@ -14,19 +14,19 @@ let package = Package(
     ],
     dependencies: [
         .package(
-            url: "https://github.com/Mosas123/FFmpegBuild",
-            branch: "apolo-union"
+            url: "https://github.com/Mosas123/ApoloFFmpeg",
+            revision: "0760ac161498ced0c63d6057abf52cd3432c5086"
         ),
     ],
     targets: [
         .target(
             name: "ApoloEngine",
             dependencies: [
-                .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
-                .product(name: "AetherLibavcodec", package: "FFmpegBuild"),
-                .product(name: "AetherLibavformat", package: "FFmpegBuild"),
-                .product(name: "AetherLibavutil", package: "FFmpegBuild"),
-                .product(name: "AetherLibswresample", package: "FFmpegBuild"),
+                .product(name: "AetherFFmpegBuild", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavcodec", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavformat", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavutil", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibswresample", package: "ApoloFFmpeg"),
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
@@ -38,10 +38,10 @@ let package = Package(
             name: "ApoloEngineTests",
             dependencies: [
                 "ApoloEngine",
-                .product(name: "AetherLibavcodec", package: "FFmpegBuild"),
-                .product(name: "AetherLibavfilter", package: "FFmpegBuild"),
-                .product(name: "AetherLibavformat", package: "FFmpegBuild"),
-                .product(name: "AetherLibavutil", package: "FFmpegBuild"),
+                .product(name: "AetherLibavcodec", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavfilter", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavformat", package: "ApoloFFmpeg"),
+                .product(name: "AetherLibavutil", package: "ApoloFFmpeg"),
             ],
             resources: [.copy("Fixtures")]
         ),
