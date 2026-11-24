@@ -1,0 +1,287 @@
+name: G0 lab benchmarks (diagnostic only)
+
+on:
+  # The diagnostic workflow never runs for an unrelated PR.
+  pull_request:
+    branches: [main]
+    paths:
+      - "Tests/ApoloEngineTests/G0LabBenchmarks.swift"
+      - "Tests/ApoloEngineTests/G0FLACSeekMatrixTests.swift"
+      - "scripts/g0_generate_flac_matrix.py"
+      - "scripts/g0_generate_ape_matrix.py"
+      - "scripts/g0_generate_lossy_matrix.py"
+      - "scripts/g0_select_dependency.py"
+      - ".github/workflows/g0-lab-benchmarks.yml"
+      - "docs/G0_LAB_BENCHMARKS.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apolo-g0-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fixtures:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'diag/g0-lab-')
+    name: Generate paired FLAC seek fixtures once
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v6.0.2
+
+      - name: Restore exact generator-version fixture cache
+        id: fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            Tests/ApoloEngineTests/Fixtures/G0/
+            g0-flac-fixtures.log
+            g0-flac-fixtures-sha256.txt
+          key: g0-flac-fixtures-v1-ubuntu24-${{ runner.arch }}-${{ hashFiles('scripts/g0_generate_flac_matrix.py') }}
+
+      - name: Check or install fixture generators (not libraries under test)
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 26
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=()
+          if ! command -v ffmpeg >/dev/null; then
+            packages+=(ffmpeg)
+          fi
+          if ! command -v flac >/dev/null || ! command -v metaflac >/dev/null; then
+            packages+=(flac)
+          fi
+          if (( ${#packages[@]} > 0 )); then
+            printf 'Missing generator packages: %s\n' "${packages[*]}"
+            # Bound network operations and expose package-manager errors.
+            sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+            sudo timeout 1200s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends "${packages[@]}"
+          else
+            echo "Using preinstalled fixture generators; skipping apt."
+          fi
+          ffmpeg -version
+          flac --version
+          metaflac --version
+
+      - name: Create one fixed input set for BOTH iOS configurations
+        if: steps.fixture-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          python3 scripts/g0_generate_flac_matrix.py Tests/ApoloEngineTests/Fixtures/G0 \
+            | tee g0-flac-fixtures.log
+          sha256sum Tests/ApoloEngineTests/Fixtures/G0/* \
+            | tee g0-flac-fixtures-sha256.txt
+
+      - name: Verify fixture identity before sharing (fresh or cached)
+        run: |
+          set -euo pipefail
+          test -s g0-flac-fixtures.log
+          test -s g0-flac-fixtures-sha256.txt
+          test -s Tests/ApoloEngineTests/Fixtures/G0/manifest.json
+          sha256sum --strict -c g0-flac-fixtures-sha256.txt
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          root = Path("Tests/ApoloEngineTests/Fixtures/G0")
+          manifest = json.loads((root / "manifest.json").read_text())
+          original = manifest["files"]
+          expanded = manifest["r13_files"]
+          assert len(original) == 8 and len(expanded) == 12
+          entries = original + expanded
+          names = {e["file"] for e in entries}
+          assert len(names) == 20
+          assert names == {f.name for f in root.glob("*.flac")}
+          for entry in entries:
+              data = (root / entry["file"]).read_bytes()
+              assert len(data) == entry["bytes"], entry["file"]
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], entry["file"]
+          f02 = manifest["f02_files"]
+          expected_f02 = {
+              f"f02_{codec}_{rate}_{channels}_{bits}.{ext}"
+              for rate, channels, bits in [(44100,1,16),(44100,2,24),(48000,2,16),(48000,1,24),(96000,2,24),(192000,2,24)]
+              for codec, ext in [("alac","m4a"),("wavpack","wv"),("tta","tta")]
+          }
+          assert len(f02) == 18 and {e["file"] for e in f02} == expected_f02
+          assert expected_f02 == {f.name for f in root.glob("f02_*")}
+          for entry in f02:
+              data = (root / entry["file"]).read_bytes()
+              assert len(data) == entry["bytes"] and entry["host_roundtrip_exact"]
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], entry["file"]
+          print("Verified all 20 FLAC and 18 F02 fixture hashes and manifest entries.")
+          print(json.dumps(manifest["generator"], sort_keys=True))
+          PY
+
+      - name: Restore separate APE fixture cache
+        id: ape-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            Tests/ApoloEngineTests/Fixtures/G0APE/
+            g0-ape-fixtures.log
+            g0-ape-fixtures-sha256.txt
+          key: g0-ape-fixtures-v1-ubuntu24-${{ runner.arch }}-${{ hashFiles('scripts/g0_generate_ape_matrix.py') }}
+
+      - name: Generate APE with independent Monkey's Audio CLI
+        if: steps.ape-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v brew >/dev/null; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+          fi
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1
+          brew install mac
+          brew list --versions mac
+          brew info --json=v2 mac
+          export PATH="$(brew --prefix mac)/bin:$PATH"
+          python3 scripts/g0_generate_ape_matrix.py generate Tests/ApoloEngineTests/Fixtures/G0APE \
+            | tee g0-ape-fixtures.log
+          sha256sum Tests/ApoloEngineTests/Fixtures/G0APE/* | tee g0-ape-fixtures-sha256.txt
+
+      - name: Verify independent APE fixture identity
+        run: |
+          set -euo pipefail
+          test -s g0-ape-fixtures.log
+          sha256sum --strict -c g0-ape-fixtures-sha256.txt
+          python3 scripts/g0_generate_ape_matrix.py verify Tests/ApoloEngineTests/Fixtures/G0APE
+
+      - name: Restore separate F03A lossy fixture cache
+        id: lossy-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            Tests/ApoloEngineTests/Fixtures/G0Lossy/
+            g0-lossy-fixtures.log
+            g0-lossy-fixtures-sha256.txt
+          key: g0-lossy-fixtures-v1-ubuntu24-${{ runner.arch }}-${{ hashFiles('scripts/g0_generate_lossy_matrix.py') }}
+
+      - name: Generate AAC and Opus host differential references
+        if: steps.lossy-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          if ! command -v ffmpeg >/dev/null; then
+            sudo timeout 90s apt-get update
+            sudo timeout 120s apt-get install -y --no-install-recommends ffmpeg
+          fi
+          python3 scripts/g0_generate_lossy_matrix.py generate Tests/ApoloEngineTests/Fixtures/G0Lossy | tee g0-lossy-fixtures.log
+          sha256sum Tests/ApoloEngineTests/Fixtures/G0Lossy/* | tee g0-lossy-fixtures-sha256.txt
+
+      - name: Verify lossy input and reference identity
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c g0-lossy-fixtures-sha256.txt
+          python3 scripts/g0_generate_lossy_matrix.py verify Tests/ApoloEngineTests/Fixtures/G0Lossy
+
+      - name: Share generated bytes and provenance with both jobs
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-b03-fixtures-${{ github.run_id }}
+          path: |
+            Tests/ApoloEngineTests/Fixtures/G0/
+            g0-flac-fixtures.log
+            g0-flac-fixtures-sha256.txt
+            Tests/ApoloEngineTests/Fixtures/G0APE/
+            g0-ape-fixtures.log
+            g0-ape-fixtures-sha256.txt
+            Tests/ApoloEngineTests/Fixtures/G0Lossy/
+            g0-lossy-fixtures.log
+            g0-lossy-fixtures-sha256.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  local-flac-lab:
+    needs: fixtures
+    strategy:
+      fail-fast: false
+      matrix:
+        dependency: [baseline, a1]
+    name: G0 B03 + metrics / ${{ matrix.dependency }} (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 35
+    steps:
+      - name: Checkout exact diagnostic branch
+        uses: actions/checkout@v6.0.2
+
+      - name: Download IDENTICAL seek fixtures from preparation job
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-b03-fixtures-${{ github.run_id }}
+          path: .
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: latest-stable
+
+      - name: Select only the runner-local FFmpeg dependency (never commit)
+        run: |
+          python3 scripts/g0_select_dependency.py ${{ matrix.dependency }}
+          git diff -- Package.swift | tee g0-lab-dependency.patch
+          echo "G0_VARIANT=${{ matrix.dependency }}" >> "$GITHUB_ENV"
+
+      - name: Record environment, fixture identity, and selected dependency
+        run: |
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "variant=${{ matrix.dependency }}"
+            echo "runner=$(uname -a)"
+            xcodebuild -version
+            swift --version
+            echo "paired fixture SHA256:"
+            shasum -a 256 -c g0-flac-fixtures-sha256.txt
+            shasum -a 256 -c g0-ape-fixtures-sha256.txt
+            shasum -a 256 -c g0-lossy-fixtures-sha256.txt
+            echo "original FLAC SHA256:"
+            shasum -a 256 Tests/ApoloEngineTests/Fixtures/tone.flac
+            echo "fixture generator and metadata:"
+            cat Tests/ApoloEngineTests/Fixtures/G0/manifest.json
+            cat Tests/ApoloEngineTests/Fixtures/G0APE/manifest.json
+            cat Tests/ApoloEngineTests/Fixtures/G0Lossy/manifest.json
+          } | tee g0-lab-environment.txt
+
+      - name: Run benchmark AND explicit B03 correctness matrix
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -eo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 \
+            | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          echo "Simulator=$NAME" | tee -a g0-lab-environment.txt
+          xcodebuild test \
+            -scheme ApoloEngine \
+            -destination "platform=iOS Simulator,name=$NAME" \
+            -derivedDataPath .build/G0Lab \
+            -resultBundlePath "$GITHUB_WORKSPACE/g0-lab.xcresult" \
+            -only-testing:ApoloEngineTests/G0LabBenchmarks \
+            -only-testing:ApoloEngineTests/G0FLACSeekMatrixTests \
+            -parallel-testing-enabled NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            2>&1 | tee g0-lab-output.log
+
+      - name: Preserve results EVEN WHEN a seek case fails
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apolo-g0-b03-${{ matrix.dependency }}-${{ github.run_id }}
+          path: |
+            g0-lab-output.log
+            g0-lab-environment.txt
+            g0-lab-dependency.patch
+            g0-flac-fixtures-sha256.txt
+            g0-ape-fixtures-sha256.txt
+            g0-lossy-fixtures-sha256.txt
+            g0-lab.xcresult
+          if-no-files-found: warn
+          retention-days: 14
