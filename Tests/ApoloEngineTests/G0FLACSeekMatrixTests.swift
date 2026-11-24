@@ -1380,6 +1380,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     /// before the Swift whole-frame discard. No production flags changed.
     private func nativePCMSequenceR9(
         url: URL, targetTick: Int64?,
+        sessionConfiguration: URLSessionConfiguration = .default,
+        onOpened: (() -> Void)? = nil,
         expectedRate: Int32 = 44100, expectedChannels: Int = 2,
         retryAnchors: [Int64] = [],
         onPrimePacket: ((Int) -> Void)? = nil,
@@ -1387,7 +1389,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         onSeek: ((Int32, UInt64) -> Void)? = nil,
         onFrame: ((UnsafeMutablePointer<AVFrame>) throws -> Void)? = nil
     ) throws -> (code: Int32, pcm: NativePCMSequenceR9) {
-        let source = try OpenedSource.open(url: url)
+        let source = try OpenedSource.open(url: url, sessionConfiguration: sessionConfiguration)
+        // Keep the HTTP transport alive until after avformat_close_input.
+        defer { source.close() }
+        onOpened?()
         var ownedFormat = source.takeFormatContext()
         defer { avformat_close_input(&ownedFormat) }
         guard let context = ownedFormat,
@@ -2645,6 +2650,260 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
     }
 
+    /// R15A: actual production HTTPStream/HTTPTransport/AVIO and linked
+    /// demuxer, with a deterministic URLProtocol endpoint. No sockets,
+    /// physical network bytes, external CDN or timing benchmark.
+    func testG0B03HTTPTransportRecoveryObservation() throws {
+        let inputs: [(tag: String, rate: Int32, channels: Int,
+                      samples: Int64, targets: [Int64])] = [
+            ("025", 44100, 2, 11025, [2756, 9922, 11024]),
+            ("r13_stereo96_s24_b8192_short", 96000, 2, 24000, [1, 8191, 23999]),
+            ("r13_stereo192_s24_b8192", 192000, 2, 384000, [192000, 345600, 383999]),
+            ("r13_stereo44_s16_b4608_long", 44100, 2, 1323000, [661500, 1190700, 1322999])
+        ]
+        var attempted = 0
+        var exact = 0
+        var rejected = 0
+        var incomplete = 0
+        var errors = 0
+        var multiWindowCases = 0
+        for item in inputs {
+            for table in [false, true] {
+                let local = try fixture(item.tag, withSeektable: table)
+                let bytes = try Data(contentsOf: local)
+                // Bound the HTTP200 experiment; production itself has no cap.
+                guard bytes.count > 0, bytes.count <= 8 * 1024 * 1024
+                else { throw MatrixError.invalidFixture }
+                if item.samples == 1323000 || item.rate == 192000 {
+                    XCTAssertGreaterThan(bytes.count, 1 << 20)
+                }
+                let linear = try nativePCMSequenceR9(
+                    url: local, targetTick: nil,
+                    expectedRate: item.rate, expectedChannels: item.channels
+                )
+                let reference = linear.pcm
+                guard linear.code == 0, reference.firstTick == 0,
+                      reference.endTick == item.samples, reference.stride > 0,
+                      reference.data.count == Int(item.samples) * reference.stride
+                else { throw MatrixError.invalidFixture }
+                for target in item.targets {
+                    for range in [true, false] {
+                        attempted += 1
+                        G0R15URLProtocol.state.configure(payload: bytes, range: range)
+                        defer { G0R15URLProtocol.state.configure(payload: Data(), range: true) }
+                        let config = URLSessionConfiguration.ephemeral
+                        config.protocolClasses = [G0R15URLProtocol.self]
+                        let url = URL(string: "https://g0-r15.invalid/fixture.flac")!
+                        let label = "tag=\(item.tag) table=\(table) targetTick=\(target) "
+                            + "mode=\(range ? "range206" : "full200") fileBytes=\(bytes.count)"
+                        var anchors: [Int64] = []
+                        for offset: Int64 in [0, Int64(item.rate) / 8, Int64(item.rate) / 2] {
+                            let a = max(0, target - offset)
+                            if !anchors.contains(a) { anchors.append(a) }
+                        }
+                        var codes: [Int32] = []
+                        var openRequests = -1
+                        var openBytes = -1
+                        var seekRequests: [Int] = []
+                        var seekBytes: [Int] = []
+                        var rawEnd: Int64?
+                        var firstKept: Int64?
+                        var keptEnd: Int64?
+                        var firstRequests = -1
+                        var firstBytes = -1
+                        var comparedBytes = 0
+                        var mismatches = 0
+                        var discarded = 0
+                        var packets = 0
+                        var payloadBytes = 0
+                        let started = DispatchTime.now().uptimeNanoseconds
+                        var firstNS: UInt64?
+                        do {
+                            let result = try nativePCMSequenceR9(
+                                url: url, targetTick: target,
+                                sessionConfiguration: config,
+                                onOpened: {
+                                    let snapshot = G0R15URLProtocol.state.snapshot()
+                                    openRequests = snapshot.count
+                                    openBytes = snapshot.reduce(0) { $0 + $1.bytes }
+                                },
+                                expectedRate: item.rate, expectedChannels: item.channels,
+                                retryAnchors: Array(anchors.dropFirst()),
+                                onPacket: { size in
+                                    packets += 1
+                                    payloadBytes += size
+                                },
+                                onSeek: { code, _ in
+                                    codes.append(code)
+                                    let snapshot = G0R15URLProtocol.state.snapshot()
+                                    seekRequests.append(snapshot.count)
+                                    seekBytes.append(snapshot.reduce(0) { $0 + $1.bytes })
+                                },
+                                onFrame: { frame in
+                                    var one = NativePCMSequenceR9()
+                                    try one.append(
+                                        frame, expectedRate: item.rate,
+                                        expectedChannels: item.channels
+                                    )
+                                    guard let start = one.firstTick, let end = one.endTick,
+                                          end <= item.samples, rawEnd == nil || rawEnd == start,
+                                          one.stride == reference.stride,
+                                          one.sampleFormat == reference.sampleFormat
+                                    else { throw MatrixError.invalidFixture }
+                                    rawEnd = end
+                                    if end <= target {
+                                        discarded += Int(end - start)
+                                        return
+                                    }
+                                    let kept = max(start, target)
+                                    discarded += Int(kept - start)
+                                    guard keptEnd == nil || keptEnd == kept
+                                    else { throw MatrixError.invalidTimestamp }
+                                    if firstKept == nil {
+                                        firstKept = kept
+                                        let snapshot = G0R15URLProtocol.state.snapshot()
+                                        firstRequests = snapshot.count
+                                        firstBytes = snapshot.reduce(0) { $0 + $1.bytes }
+                                        firstNS = DispatchTime.now().uptimeNanoseconds - started
+                                    }
+                                    keptEnd = end
+                                    let actual = one.data.dropFirst(Int(kept - start) * one.stride)
+                                    let a = Int(kept) * reference.stride
+                                    let b = Int(end) * reference.stride
+                                    comparedBytes += actual.count
+                                    if !actual.elementsEqual(reference.data[a..<b]) { mismatches += 1 }
+                                }
+                            )
+                            guard !codes.isEmpty, codes.count <= anchors.count,
+                                  codes.last == result.code,
+                                  codes.dropLast().allSatisfy({ $0 == -1 })
+                            else { throw MatrixError.invalidFixture }
+                            let events = G0R15URLProtocol.state.snapshot()
+                            let bodyBytes = events.reduce(0) { $0 + $1.bytes }
+                            let starts = Set(events.map { $0.start })
+                            let intervals = events.filter { $0.bytes > 0 }
+                                .sorted { $0.start < $1.start }
+                            var uniqueBytes = 0
+                            var coveredEnd = 0
+                            for e in intervals {
+                                let end = e.start + e.bytes
+                                uniqueBytes += max(0, end - max(coveredEnd, e.start))
+                                coveredEnd = max(coveredEnd, end)
+                            }
+                            if range && starts.count > 1 && bytes.count > (1 << 20) {
+                                multiWindowCases += 1
+                            }
+                            let transportValid = !events.isEmpty
+                                && events.allSatisfy { e in
+                                    e.status == (range ? 206 : 200)
+                                        && e.start >= 0 && e.start + e.bytes <= bytes.count
+                                        && e.bytes > 0
+                                        && (!range || e.bytes <= 1 << 20)
+                                }
+                                && (range || (events.count == 1 && bodyBytes == bytes.count))
+                            let full = result.code == 0 && firstKept == target
+                                && keptEnd == item.samples
+                                && comparedBytes == Int(item.samples - target) * reference.stride
+                                && mismatches == 0 && transportValid
+                            if result.code < 0 { rejected += 1 }
+                            else if full { exact += 1 }
+                            else { incomplete += 1 }
+                            let path = events.map { "\($0.requestStart):\($0.start):\($0.status):\($0.bytes)" }
+                                .joined(separator: ",")
+                            print(
+                                "G0_B03_R15_CASE \(label) "
+                                    + "codes=\(codes.map(String.init).joined(separator: ",")) "
+                                    + "finalCode=\(result.code) requests=\(events.count) "
+                                    + "bodyBytes=\(bodyBytes) uniqueBytes=\(uniqueBytes) "
+                                    + "overlapBytes=\(bodyBytes - uniqueBytes) distinctStarts=\(starts.count) "
+                                    + "openRequests=\(openRequests) openBytes=\(openBytes) "
+                                    + "seekRequests=\(seekRequests.map(String.init).joined(separator: ",")) "
+                                    + "seekBytes=\(seekBytes.map(String.init).joined(separator: ",")) "
+                                    + "firstRequests=\(firstRequests) firstBytes=\(firstBytes) "
+                                    + "firstKept=\(firstKept.map(String.init) ?? "none") "
+                                    + "keptEnd=\(keptEnd.map(String.init) ?? "none") "
+                                    + "discardedSamples=\(discarded) packets=\(packets) "
+                                    + "payloadBytes=\(payloadBytes) comparedBytes=\(comparedBytes) "
+                                    + "mismatches=\(mismatches) transportValid=\(transportValid) complete=\(full)"
+                            )
+                            print("G0_B03_R15_REQUESTS \(label) path=\(path)")
+                            let totalNS = DispatchTime.now().uptimeNanoseconds - started
+                            print(
+                                "G0_B03_R15_TIMING \(label) "
+                                    + "firstKeptNS=\(firstNS.map(String.init) ?? "none") totalNS=\(totalNS)"
+                            )
+                        } catch {
+                            errors += 1
+                            let events = G0R15URLProtocol.state.snapshot()
+                            print("G0_B03_R15_CASE \(label) setupOrDecodeError=\(error) requests=\(events.count)")
+                        }
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R15_SUMMARY attempted=\(attempted) exact=\(exact) "
+                + "rejected=\(rejected) incomplete=\(incomplete) errors=\(errors) "
+                + "multiWindowCases=\(multiWindowCases)"
+        )
+        XCTAssertEqual(attempted, 48)
+        XCTAssertEqual(exact + rejected + incomplete + errors, attempted)
+        // Transport/decode failures are observations; do not hide them.
+    }
+
+    /// Exercise the actual HTTPTransport AVIO callback error/EOF boundary
+    /// without involving a demuxer. A mock endpoint, not a network test.
+    func testG0B03HTTPAVIOFaultObservation() throws {
+        let data = Data([11, 22, 33, 44, 55, 66, 77, 88])
+        let cases: [(name: String, failures: Int, status: Int, malformed: Bool)] = [
+            ("clean", 0, 0, false),
+            ("retry503", 1, 503, false),
+            ("persistent503", 3, 503, false),
+            ("forbidden403", 1, 403, false),
+            ("badContentRange", 0, 0, true)
+        ]
+        var observed = 0
+        for item in cases {
+            G0R15URLProtocol.state.configure(
+                payload: data, range: true, failures: item.failures,
+                failureStatus: item.status, malformed: item.malformed
+            )
+            defer { G0R15URLProtocol.state.configure(payload: Data(), range: true) }
+            let config = URLSessionConfiguration.ephemeral
+            config.protocolClasses = [G0R15URLProtocol.self]
+            let stream = HTTPStream(
+                url: URL(string: "https://g0-r15.invalid/fault")!,
+                headers: [:], configuration: config
+            )
+            guard let transport = HTTPTransport(stream: stream),
+                  let context = transport.context
+            else { throw MatrixError.invalidFixture }
+            defer { transport.close() }
+            var buffer = [UInt8](repeating: 0, count: data.count)
+            let first = buffer.withUnsafeMutableBufferPointer {
+                avio_read(context, $0.baseAddress!, Int32(data.count))
+            }
+            var tail: UInt8 = 0
+            let next = avio_read(context, &tail, 1)
+            let events = G0R15URLProtocol.state.snapshot()
+            let success = item.name == "clean" || item.name == "retry503"
+            let wantedRequests = item.name == "retry503" ? 2 : item.name == "persistent503" ? 3 : 1
+            let correct = events.count == wantedRequests && (success
+                ? first == Int32(data.count) && Data(buffer) == data
+                    && next == -541_478_725 && !stream.hasError
+                : first == -5 && next == -5 && stream.hasError)
+            if correct { observed += 1 }
+            print(
+                "G0_B03_R15_FAULT name=\(item.name) first=\(first) next=\(next) "
+                    + "hasError=\(stream.hasError) requests=\(events.count) "
+                    + "statuses=\(events.map { String($0.status) }.joined(separator: ",")) "
+                    + "correct=\(correct)"
+            )
+        }
+        print("G0_B03_R15_FAULT_SUMMARY attempted=5 correct=\(observed)")
+        XCTAssertEqual(observed, 5)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
@@ -2723,4 +2982,111 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 + "inspect G0_B03 lines. No production fixes are allowed in this PR."
         )
     }
+}
+
+
+/// Serialized fixture state for the R15A URLProtocol endpoint. Each
+/// case has a fresh URLSession; the laboratory runs tests serially.
+private final class G0R15EndpointState: @unchecked Sendable {
+    struct Event {
+        let requestStart: Int
+        let start: Int
+        let status: Int
+        let bytes: Int
+    }
+    struct Reply {
+        let status: Int
+        let headers: [String: String]
+        let body: Data
+    }
+    private let lock = NSLock()
+    private var payload = Data()
+    private var range = true
+    private var failures = 0
+    private var failureStatus = 0
+    private var malformed = false
+    private var events: [Event] = []
+
+    func configure(payload: Data, range: Bool, failures: Int = 0,
+                   failureStatus: Int = 0, malformed: Bool = false) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.payload = payload
+        self.range = range
+        self.failures = failures
+        self.failureStatus = failureStatus
+        self.malformed = malformed
+        events = []
+    }
+
+    func snapshot() -> [Event] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    func reply(for request: URLRequest) -> Reply {
+        lock.lock()
+        defer { lock.unlock() }
+        let header = request.value(forHTTPHeaderField: "Range") ?? ""
+        let parts = header.hasPrefix("bytes=")
+            ? header.dropFirst(6).split(separator: "-") : []
+        let start = parts.count == 2 ? Int(parts[0]) ?? -1 : -1
+        let requestedEnd = parts.count == 2 ? Int(parts[1]) ?? -1 : -1
+        var status = 200
+        var responseStart = 0
+        var body = payload
+        var headers = ["Accept-Ranges": range ? "bytes" : "none"]
+        if failures > 0 {
+            failures -= 1
+            status = failureStatus
+            body = Data()
+        } else if range {
+            if start < 0 || start >= payload.count || requestedEnd < start {
+                status = 416
+                body = Data()
+                headers["Content-Range"] = "bytes */\(payload.count)"
+            } else {
+                status = 206
+                responseStart = start
+                let end = min(requestedEnd, payload.count - 1)
+                body = payload.subdata(in: start..<(end + 1))
+                let reportedStart = malformed ? start + 1 : start
+                headers["Content-Range"] = "bytes \(reportedStart)-\(end)/\(payload.count)"
+            }
+        }
+        headers["Content-Length"] = String(body.count)
+        events.append(Event(requestStart: start, start: responseStart, status: status, bytes: body.count))
+        return Reply(status: status, headers: headers, body: body)
+    }
+}
+
+private final class G0R15URLProtocol: URLProtocol, @unchecked Sendable {
+    static let state = G0R15EndpointState()
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "g0-r15.invalid"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+        let reply = Self.state.reply(for: request)
+        guard let response = HTTPURLResponse(
+            url: url, statusCode: reply.status,
+            httpVersion: "HTTP/1.1", headerFields: reply.headers
+        ) else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if !reply.body.isEmpty { client?.urlProtocol(self, didLoad: reply.body) }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
 }
