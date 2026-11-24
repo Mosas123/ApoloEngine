@@ -4033,6 +4033,181 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(errors, 0)
     }
 
+    // R16D is a bounded high-cycle lifecycle soak, not hours of
+    // uninterrupted playback. The exact same workload repeats in blocks.
+    // Observe both immediate and settled RSS after all owners close, with
+    // warmup excluded from measured totals. No arbitrary leak threshold.
+    func testG0B03LifecycleSoakResourceObservation() throws {
+        let specs: [(String, String, Int32, Int, Int64, Int64, Bool)] = [
+            ("local44", "025", 44100, 2, 11025, 2756, false),
+            ("localSurround48", "r13_surround48_s24_b4096", 48000, 6, 72000, 36000, false),
+            ("httpShort44", "025", 44100, 2, 11025, 9922, true),
+            ("http44", "200", 44100, 2, 88200, 78336, true)
+        ]
+        var inputs: [R16CInput] = []
+        for (id, tag, rate, channels, total, target, remote) in specs {
+            let local = try fixture(tag, withSeektable: false)
+            let payload = try Data(contentsOf: local)
+            let linear = try nativePCMSequenceR9(url: local, targetTick: nil,
+                expectedRate: rate, expectedChannels: channels)
+            let ref = linear.pcm
+            guard linear.code == 0, ref.firstTick == 0, ref.endTick == total,
+                  ref.channels == channels, ref.stride > 0,
+                  ref.data.count == Int(total) * ref.stride,
+                  let format = ref.sampleFormat,
+                  !payload.isEmpty, payload.count <= 8 * 1024 * 1024
+            else { throw MatrixError.invalidFixture }
+            inputs.append(R16CInput(id: id, url: local, payload: payload,
+                rate: rate, channels: channels, total: total, target: target,
+                stride: ref.stride, sampleFormat: format, reference: ref.data,
+                remote: remote, retry503: false))
+        }
+
+        func percentile(_ values: [UInt64], _ p: Double) -> String {
+            let ordered = values.sorted()
+            guard !ordered.isEmpty else { return "none" }
+            return String(ordered[max(0, min(ordered.count - 1,
+                Int(ceil(Double(ordered.count) * p)) - 1))])
+        }
+        func difference(_ a: UInt64?, _ b: UInt64?) -> String {
+            guard let a, let b, a <= UInt64(Int64.max), b <= UInt64(Int64.max)
+            else { return "none" }
+            return String(Int64(b) - Int64(a))
+        }
+        func cpuDelta(_ a: ResourceSnapshotR16, _ b: ResourceSnapshotR16) -> String {
+            guard let x = a.cpuUS, let y = b.cpuUS, y >= x else { return "none" }
+            return String(y - x)
+        }
+
+        let repetitions = 6
+        let measuredBlocks = 10
+        let settleSeconds = 1.0
+        var measured = 0
+        var exact = 0
+        var warm = 0
+        var warmExact = 0
+        var errors = 0
+        var missingBlocks = 0
+        var measuredRequests = 0
+        var measuredBody = 0
+        var measuredPCM = 0
+        var measuredRecoveries = 0
+        var profileTimes: [String: [UInt64]] = [:]
+        var profileFirsts: [String: [UInt64]] = [:]
+        var profileExact: [String: Int] = [:]
+        var profileRequests: [String: Int] = [:]
+        var profileBody: [String: Int] = [:]
+        var profilePCM: [String: Int] = [:]
+        var settled: [UInt64] = []
+        var afterWarmup: ResourceSnapshotR16?
+        let started = DispatchTime.now().uptimeNanoseconds
+        let initial = resourceSnapshotR16()
+        print("G0_B03_R16D_START profiles=\(inputs.count) measuredBlocks=\(measuredBlocks) cyclesPerBlock=\(repetitions * inputs.count) settleSeconds=\(settleSeconds) residentBytes=\(initial.residentBytes.map(String.init) ?? "none") maxRSSDarwin=\(initial.maxRSS.map(String.init) ?? "none")")
+
+        for block in 0...measuredBlocks {
+            let warmup = block == 0
+            let before = resourceSnapshotR16()
+            let blockStarted = DispatchTime.now().uptimeNanoseconds
+            var blockExact = 0
+            var blockRequests = 0
+            var blockBody = 0
+            var blockPCM = 0
+            var blockRecovered = 0
+            var blockErrors = 0
+            var blockTimes: [UInt64] = []
+            var blockFirsts: [UInt64] = []
+
+            for rep in 0..<repetitions {
+                // Rotate and reverse deterministically in every block,
+                // independent of timing. Keep per-profile work identical.
+                let offset = rep % inputs.count
+                let rotated = Array(inputs[offset...]) + Array(inputs[..<offset])
+                let order = rep.isMultiple(of: 2) ? rotated : Array(rotated.reversed())
+                for input in order {
+                    // Shared R16C worker creates and closes a new context,
+                    // session and (remote only) listener each time; no
+                    // shared endpoint, faults or barrier in this soak.
+                    let result = Self.runR16CWorker(input, gate: nil)
+                    if warmup { warm += 1 } else { measured += 1 }
+                    if result.complete {
+                        blockExact += 1
+                        if warmup { warmExact += 1 }
+                        else {
+                            exact += 1
+                            profileExact[input.id, default: 0] += 1
+                            let elapsed = result.closedNS - result.startedNS
+                            profileTimes[input.id, default: []].append(elapsed)
+                            blockTimes.append(elapsed)
+                            if let first = result.firstNS {
+                                profileFirsts[input.id, default: []].append(first)
+                                blockFirsts.append(first)
+                            }
+                        }
+                    } else {
+                        // Keep failures visible and retain later cycles;
+                        // each next owner is independent of the failed one.
+                        print("G0_B03_R16D_FAILURE block=\(block) rep=\(rep) owner=\(input.id) codes=\(result.codes.map(String.init).joined(separator: ",")) first=\(result.first.map(String.init) ?? "none") end=\(result.end.map(String.init) ?? "none") compared=\(result.compared) mismatches=\(result.mismatches) requests=\(result.requests) statuses=\(result.statuses.map(String.init).joined(separator: ",")) error=\(result.error ?? "none")")
+                    }
+                    if result.error != nil { errors += 1; blockErrors += 1 }
+                    let recovered = result.complete && result.codes.count > 1
+                    if recovered { blockRecovered += 1 }
+                    blockRequests += result.requests
+                    blockBody += result.bodyBytes
+                    blockPCM += result.compared
+                    if !warmup {
+                        profileRequests[input.id, default: 0] += result.requests
+                        profileBody[input.id, default: 0] += result.bodyBytes
+                        profilePCM[input.id, default: 0] += result.compared
+                    }
+                }
+            }
+
+            let elapsed = DispatchTime.now().uptimeNanoseconds - blockStarted
+            let immediate = resourceSnapshotR16()
+            // All synchronous workers have returned. Allow asynchronous
+            // Foundation/Network cleanup a fixed quiet interval; not a
+            // guarantee that every OS cache or allocation is reclaimed.
+            Thread.sleep(forTimeInterval: settleSeconds)
+            let quiet = resourceSnapshotR16()
+            if before.cpuUS == nil || immediate.cpuUS == nil || quiet.cpuUS == nil
+                || before.residentBytes == nil || immediate.residentBytes == nil
+                || quiet.residentBytes == nil || quiet.maxRSS == nil {
+                missingBlocks += 1
+            }
+            if warmup {
+                afterWarmup = quiet
+            } else {
+                if let resident = quiet.residentBytes { settled.append(resident) }
+                measuredRequests += blockRequests
+                measuredBody += blockBody
+                measuredPCM += blockPCM
+                measuredRecoveries += blockRecovered
+            }
+            let base = afterWarmup?.residentBytes
+            print("G0_B03_R16D_BLOCK block=\(block) phase=\(warmup ? "warmup" : "measured") cycles=\(repetitions * inputs.count) exact=\(blockExact) errors=\(blockErrors) recovered=\(blockRecovered) requests=\(blockRequests) bodyBytes=\(blockBody) comparedPCMBytes=\(blockPCM)")
+            print("G0_B03_R16D_RESOURCE block=\(block) residentBefore=\(before.residentBytes.map(String.init) ?? "none") residentImmediate=\(immediate.residentBytes.map(String.init) ?? "none") residentSettled=\(quiet.residentBytes.map(String.init) ?? "none") settledDeltaFromWarmup=\(difference(base, quiet.residentBytes)) maxRSSDarwin=\(quiet.maxRSS.map(String.init) ?? "none") cpuWorkUS=\(cpuDelta(before, immediate)) cpuSettleUS=\(cpuDelta(immediate, quiet)) workNS=\(elapsed) totalN=\(blockTimes.count) totalP50NS=\(percentile(blockTimes, 0.50)) totalP95NS=\(percentile(blockTimes, 0.95)) firstN=\(blockFirsts.count) firstP50NS=\(percentile(blockFirsts, 0.50)) firstP95NS=\(percentile(blockFirsts, 0.95))")
+        }
+
+        let beforeFinalIdle = resourceSnapshotR16()
+        Thread.sleep(forTimeInterval: 3)
+        let final = resourceSnapshotR16()
+        for input in inputs {
+            let t = profileTimes[input.id, default: []]
+            let f = profileFirsts[input.id, default: []]
+            print("G0_B03_R16D_PROFILE owner=\(input.id) exact=\(profileExact[input.id, default: 0]) requests=\(profileRequests[input.id, default: 0]) bodyBytes=\(profileBody[input.id, default: 0]) comparedPCMBytes=\(profilePCM[input.id, default: 0]) totalN=\(t.count) totalP50NS=\(percentile(t, 0.50)) totalP95NS=\(percentile(t, 0.95)) firstN=\(f.count) firstP50NS=\(percentile(f, 0.50)) firstP95NS=\(percentile(f, 0.95))")
+            XCTAssertEqual(profileExact[input.id, default: 0], repetitions * measuredBlocks)
+        }
+        print("G0_B03_R16D_FINAL residentAfterWarmup=\(afterWarmup?.residentBytes.map(String.init) ?? "none") residentSettledMin=\(settled.min().map(String.init) ?? "none") residentSettledMax=\(settled.max().map(String.init) ?? "none") settledN=\(settled.count) residentBeforeFinalIdle=\(beforeFinalIdle.residentBytes.map(String.init) ?? "none") residentAfterFinalIdle=\(final.residentBytes.map(String.init) ?? "none") deltaFromWarmup=\(difference(afterWarmup?.residentBytes, final.residentBytes)) maxRSSDarwin=\(final.maxRSS.map(String.init) ?? "none") totalCPUUS=\(cpuDelta(initial, final)) elapsedNS=\(DispatchTime.now().uptimeNanoseconds - started)")
+        print("G0_B03_R16D_SUMMARY measured=\(measured) exact=\(exact) warm=\(warm) warmExact=\(warmExact) errors=\(errors) resourceMissingBlocks=\(missingBlocks) recovered=\(measuredRecoveries) requests=\(measuredRequests) bodyBytes=\(measuredBody) comparedPCMBytes=\(measuredPCM)")
+        XCTAssertEqual(warm, 24)
+        XCTAssertEqual(warmExact, 24)
+        XCTAssertEqual(measured, 240)
+        XCTAssertEqual(exact, 240)
+        XCTAssertEqual(errors, 0)
+        // Resource gaps, growth, timing outliers are observations, not a
+        // pass/fail performance target. Physical playback remains untested.
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
