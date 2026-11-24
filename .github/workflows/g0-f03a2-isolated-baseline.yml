@@ -1,0 +1,129 @@
+name: G0 F03A.2 isolated baseline
+
+on:
+  pull_request:
+    branches: [diag/g0-lab-benchmarks-20261123]
+    paths: [".github/workflows/g0-f03a2-isolated-baseline.yml"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  baseline:
+    if: github.head_ref == 'diag/f03a2-baseline-isolated-20261124'
+    name: F03A.2 only / FFmpegBuild (iOS Simulator)
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - name: Checkout exact tested diagnostic commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 52255a6a236d564903fc95b776aebeeaf91321c1
+          persist-credentials: false
+
+      - name: Retrieve original paired fixtures without regeneration
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-b03-fixtures-45431343241
+          run-id: 45431343241
+          github-token: ${{ github.token }}
+          path: .
+
+      - name: Verify exact F03A.2 encoded and reference bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c g0-lossy-fixtures-sha256.txt
+          shasum -a 256 -c <<'SHA256'
+          0d29650d7da838112fad9f5b50fbbbff7df785ae04d328f6754c022d2bd41188  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_49152.m4a
+          09b6a80f5b47328b3183f0cccd3321114a54c45351b8070cab23f01afd3ccacd  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_49152.f32
+          8ee4760271f35dd349a513893de761d1f5205c4ff6f9786fdab690da05e8f4f0  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_1_49152.m4a
+          f218b0b8cbf330414a6140c46efa30d2dcd04d69fd8e7231bafd7703b32ff622  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_1_49152.f32
+          0d462b161b5452560f2a7413b505e27c7a4e59e872dc691e424a8a7be6ab3f7a  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48000.opus
+          107d3b66ebd43ed06e4ce5b09a8dea02e6cad5006e3712336dfb1360b065761e  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48000.f32
+          b58baab92c57500e8faf488ebe7b5d065bb71cba65c216c512441623ef2c6434  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48000.opus
+          4745f4c21509015b20ac30d3e97d6587a318c3b33ad2ffdbfbd5b5942821ac3b  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48000.f32
+          14e9e00a4e9e0d62e1a4e1316d61122287d4c9e388f5b6563d0e53524a560a1c  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_2_48017.m4a
+          5c28de5eb4bf742012dcfd37c6721d63875fd914657c804b92e2c1a919bc4227  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_2_48017.f32
+          7f4fa1bef155b2976aec441903605612cd05c0f4bb89308fe73ed8ba82f88455  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_48123.aac
+          ca88e82597596d967bbbadd0f908608ede74c2c47cc1016dbf0920441d0f902c  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_48123.f32
+          63a4e20f1450a78df607be9a140d9fdf93c0047b821c49aa40f7bfbfa9e76f65  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48017.opus
+          e67887f15a6b8c40a4eb8a8cec76072d17d0c48bfd52f4245eafe99421aadbb7  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48017.f32
+          37c7661cf826f65eab7bfaad19cf00aa04561cdac1dc2e059b82827ecb3a6380  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48239.opus
+          196c797ba875f6ba7583f43a368bb95f08688a0e45446d691c369d0f03d2419f  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48239.f32
+          e7d7550d41552035a82cb804415dd872ce4bd80bc87049f82a1ddd9ec55e81af  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48019.mp4
+          f2915fb8ee604dd61b303a96313123750ddaebad126c233d59cebd993792d987  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48019.f32
+          0d6835e742cb299ed962f7f72663b647b2903ec9ed12a066fae8127b75aedbdb  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48031.webm
+          b34a8ec65857a0804d1fa718a16a37dd3c2bcdff8fe341bed59b21d322fb1ca3  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48031.f32
+          SHA256
+          python3 scripts/g0_generate_lossy_matrix.py verify Tests/ApoloEngineTests/Fixtures/G0Lossy
+
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+
+      - name: Pin the previously observed baseline revision in runner only
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "52255a6a236d564903fc95b776aebeeaf91321c1"
+          python3 scripts/g0_select_dependency.py baseline
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+          git diff -- Package.swift | tee g0-f03a2-dependency.patch
+          {
+            git rev-parse HEAD
+            echo 'fixture artifact: 14939512097 / run 45431343241'
+            echo 'baseline revision: c12701ebf9b51fab0940948dd630c22f041fcfe9'
+            uname -a
+            xcodebuild -version
+            swift --version
+            cat g0-lossy-fixtures-sha256.txt
+          } | tee g0-f03a2-environment.txt
+
+      - name: Run only existing F03A.2 test
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        shell: bash
+        run: |
+          set -eo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 \
+            | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          echo "Simulator=$NAME" | tee -a g0-f03a2-environment.txt
+          xcodebuild test \
+            -scheme ApoloEngine \
+            -destination "platform=iOS Simulator,name=$NAME" \
+            -derivedDataPath .build/G0F03A2 \
+            -resultBundlePath "$GITHUB_WORKSPACE/g0-f03a2.xcresult" \
+            -only-testing:ApoloEngineTests/G0FLACSeekMatrixTests/testG0F03A2PacketTimeBaseCompatibility \
+            -parallel-testing-enabled NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 120 \
+            -maximum-test-execution-time-allowance 300 \
+            2>&1 | tee g0-f03a2-output.log
+
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03a2-baseline-${{ github.run_id }}
+          path: |
+            g0-f03a2-output.log
+            g0-f03a2-environment.txt
+            g0-f03a2-dependency.patch
+            g0-lossy-fixtures-sha256.txt
+            g0-f03a2.xcresult
+          if-no-files-found: warn
+          retention-days: 14
