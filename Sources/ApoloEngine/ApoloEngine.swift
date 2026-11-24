@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AetherLibavcodec
 
 /// Music and streaming engine.
 ///
@@ -162,6 +163,11 @@ public final class ApoloEngine {
     /// No source URL, cookies, authorization headers or track identifiers.
     public func setDiagnosticHandler(_ handler: (@Sendable (String) -> Void)?) {
         diagnosticEvents.setHandler(handler)
+        // Experimental build provenance; emit only when a logger is installed.
+        if let handler {
+            let linkedVersion = avcodec_version()
+            handler("build.identity v=1 candidate=ApoloFFmpeg-A1 expectedRevision=0760ac161498ced0c63d6057abf52cd3432c5086 linkedAvcodecVersion=\(linkedVersion)")
+        }
     }
 
     /// All queued libavcodec callbacks carry the source epoch. This prevents
