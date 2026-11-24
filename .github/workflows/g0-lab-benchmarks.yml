@@ -25,14 +25,33 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'diag/g0-lab-')
     name: Generate paired FLAC seek fixtures once
     runs-on: ubuntu-24.04
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6.0.2
 
-      - name: Install fixture generators (not libraries under test)
+      - name: Check or install fixture generators (not libraries under test)
+        timeout-minutes: 8
+        shell: bash
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg flac
+          set -euo pipefail
+          packages=()
+          if ! command -v ffmpeg >/dev/null; then
+            packages+=(ffmpeg)
+          fi
+          if ! command -v flac >/dev/null || ! command -v metaflac >/dev/null; then
+            packages+=(flac)
+          fi
+          if (( ${#packages[@]} > 0 )); then
+            printf 'Missing generator packages: %s\n' "${packages[*]}"
+            # Bound network operations and expose package-manager errors.
+            sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+            sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y --no-install-recommends "${packages[@]}"
+          else
+            echo "Using preinstalled fixture generators; skipping apt."
+          fi
+          ffmpeg -version
+          flac --version
+          metaflac --version
 
       - name: Create one fixed input set for BOTH iOS configurations
         run: |
