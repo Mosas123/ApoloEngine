@@ -3477,6 +3477,286 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         // No RSS or timing threshold implies a leak or speedup.
     }
 
+    // R16B deliberately keeps one format/codec/AVIO/packet/frame owner
+    // alive across alternating seeks after partial decode and drained EOF.
+    // No context reopen and no production changes. Verify every requested
+    // interval against actual independent linear native PCM.
+    func testG0B03RepeatedSeekSameContextObservation() throws {
+        let fixtures: [(tag: String, total: Int64)] = [("025", 11025), ("200", 88200)]
+        var measured = 0
+        var warm = 0
+        var exact = 0
+        var warmExact = 0
+        var errors = 0
+        var rejected = 0
+        var incomplete = 0
+        var contexts = 0
+        var resourceMissing = 0
+
+        func percentile(_ values: [UInt64], _ p: Double) -> String {
+            let ordered = values.sorted()
+            guard !ordered.isEmpty else { return "none" }
+            return String(ordered[max(0, min(ordered.count - 1,
+                Int(ceil(Double(ordered.count) * p)) - 1))])
+        }
+
+        for item in fixtures {
+            let local = try fixture(item.tag, withSeektable: false)
+            let payload = try Data(contentsOf: local)
+            let linear = try nativePCMSequenceR9(url: local, targetTick: nil)
+            let reference = linear.pcm
+            guard linear.code == 0, reference.firstTick == 0,
+                  reference.endTick == item.total, reference.stride == 4,
+                  reference.data.count == Int(item.total) * reference.stride,
+                  payload.count <= 8 * 1024 * 1024
+            else { throw MatrixError.invalidFixture }
+
+            // Explicitly alternate direction and repeated targets, frame
+            // boundaries, EOF, last sample and recovery after partial reads.
+            let operations: [(Int64, Bool)] = [
+                (0, false), (item.total * 9 / 10, true),
+                (1, false), (item.total, true),
+                (item.total - 1, true), (4608, false),
+                (4607, false), (4607, true)
+            ]
+            for profile in ["local", "loopback206"] {
+                let remote = profile == "loopback206"
+                let endpoint = G0R15EndpointState()
+                endpoint.configure(payload: payload, range: true)
+                let server = try G0R15LoopbackServer(endpoint: endpoint)
+                defer { server.stop() }
+                let url = remote ? server.url : local
+                let label = "tag=\(item.tag) profile=\(profile)"
+                let beforeOpen = resourceSnapshotR16()
+                let openStarted = DispatchTime.now().uptimeNanoseconds
+                var times: [UInt64] = []
+                var firstTimes: [UInt64] = []
+                var seekTimes: [UInt64] = []
+                var cpuTimes: [UInt64] = []
+                var profileExact = 0
+                var profileWarm = 0
+
+                // The helper's scope guarantees reverse-order release;
+                // the transport remains alive until after format close.
+                func runContext() throws {
+                    let source = try OpenedSource.open(url: url, sessionConfiguration: .ephemeral)
+                    defer { source.close() }
+                    var ownedFormat = source.takeFormatContext()
+                    defer { avformat_close_input(&ownedFormat) }
+                    guard let context = ownedFormat,
+                          context.pointee.nb_streams == 1,
+                          let stream = context.pointee.streams[0],
+                          stream.pointee.time_base.num == 1,
+                          stream.pointee.time_base.den == 44100,
+                          let parameters = stream.pointee.codecpar,
+                          parameters.pointee.codec_id == AV_CODEC_ID_FLAC,
+                          parameters.pointee.sample_rate == 44100,
+                          parameters.pointee.ch_layout.nb_channels == 2,
+                          let codec = avcodec_find_decoder(parameters.pointee.codec_id),
+                          let decoder = avcodec_alloc_context3(codec)
+                    else { throw MatrixError.missingStream }
+                    var ownedDecoder: UnsafeMutablePointer<AVCodecContext>? = decoder
+                    defer { avcodec_free_context(&ownedDecoder) }
+                    guard avcodec_parameters_to_context(decoder, parameters) >= 0,
+                          avcodec_open2(decoder, codec, nil) >= 0
+                    else { throw MatrixError.invalidFixture }
+                    var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+                    var ownedFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+                    defer {
+                        av_frame_free(&ownedFrame)
+                        av_packet_free(&ownedPacket)
+                    }
+                    guard let packet = ownedPacket, let frame = ownedFrame
+                    else { throw MatrixError.missingPacket }
+                    contexts += 1
+                    let eof: Int32 = -541_478_725
+                    let again = -Int32(EAGAIN)
+
+                    // Drain after every packet. Partial operation stops
+                    // reading packets only after draining available frames.
+                    func drain(_ observe: (UnsafeMutablePointer<AVFrame>) throws -> Void) throws -> Int32 {
+                        for _ in 0..<2048 {
+                            let rc = avcodec_receive_frame(decoder, frame)
+                            if rc == again || rc == eof { return rc }
+                            guard rc >= 0 else { throw MatrixError.invalidFixture }
+                            defer { av_frame_unref(frame) }
+                            try observe(frame)
+                        }
+                        throw MatrixError.invalidFixture
+                    }
+                    var primed = false
+                    for _ in 0..<512 {
+                        guard av_read_frame(context, packet) >= 0
+                        else { throw MatrixError.missingPCM }
+                        defer { av_packet_unref(packet) }
+                        guard packet.pointee.stream_index == 0 else { continue }
+                        guard avcodec_send_packet(decoder, packet) >= 0
+                        else { throw MatrixError.invalidFixture }
+                        _ = try drain { _ in primed = true }
+                        if primed { break }
+                    }
+                    guard primed else { throw MatrixError.missingPCM }
+                    print("G0_B03_R16B_OPEN \(label) openPrimeNS=\(DispatchTime.now().uptimeNanoseconds - openStarted) requests=\(endpoint.snapshot().count)")
+
+                    var prior = "primed"
+                    for index in 0..<24 {
+                        let warmup = index < 4
+                        let op = operations[index % operations.count]
+                        let target = op.0
+                        let full = op.1
+                        let expectedEnd = full ? item.total : min(item.total, target + 256)
+                        let caseLabel = "\(label) index=\(index) phase=\(warmup ? "warmup" : "measured") prior=\(prior) target=\(target) mode=\(full ? "eof" : "partial")"
+                        if warmup { warm += 1 } else { measured += 1 }
+                        let before = resourceSnapshotR16()
+                        let requestBefore = endpoint.snapshot().count
+                        let started = DispatchTime.now().uptimeNanoseconds
+                        var anchors: [Int64] = []
+                        for offset: Int64 in [0, 5512, 22050] {
+                            let a = max(0, target - offset)
+                            if !anchors.contains(a) { anchors.append(a) }
+                        }
+                        var codes: [Int32] = []
+                        var seekNS: UInt64 = 0
+                        var code: Int32 = -1
+                        var rawFirst: Int64?
+                        var rawEnd: Int64?
+                        var first: Int64?
+                        var keptEnd: Int64?
+                        var firstNS: UInt64?
+                        var compared = 0
+                        var mismatches = 0
+                        var packets = 0
+                        var payloadBytes = 0
+                        var terminal = false
+                        do {
+                            try autoreleasepool {
+                                for anchor in anchors {
+                                    let seekStart = DispatchTime.now().uptimeNanoseconds
+                                    code = avformat_seek_file(context, 0, Int64.min, anchor,
+                                        Int64.max, AVSEEK_FLAG_BACKWARD)
+                                    seekNS += DispatchTime.now().uptimeNanoseconds - seekStart
+                                    codes.append(code)
+                                    if code != -1 { break }
+                                }
+                                guard code >= 0 else { return }
+                                avformat_flush(context)
+                                avcodec_flush_buffers(decoder)
+
+                                func observe(_ frame: UnsafeMutablePointer<AVFrame>) throws {
+                                    var one = NativePCMSequenceR9()
+                                    try one.append(frame)
+                                    guard let start = one.firstTick, let end = one.endTick,
+                                          end <= item.total, rawEnd == nil || rawEnd == start,
+                                          one.stride == reference.stride,
+                                          one.sampleFormat == reference.sampleFormat
+                                    else { throw MatrixError.invalidFixture }
+                                    if rawFirst == nil { rawFirst = start }
+                                    rawEnd = end
+                                    let a = max(start, target)
+                                    let b = min(end, expectedEnd)
+                                    if b <= a { return }
+                                    guard keptEnd == nil || keptEnd == a
+                                    else { throw MatrixError.invalidTimestamp }
+                                    if first == nil {
+                                        first = a
+                                        firstNS = DispatchTime.now().uptimeNanoseconds - started
+                                    }
+                                    keptEnd = b
+                                    let actual = one.data[(Int(a - start) * one.stride)..<(Int(b - start) * one.stride)]
+                                    let expected = reference.data[(Int(a) * one.stride)..<(Int(b) * one.stride)]
+                                    compared += actual.count
+                                    if !actual.elementsEqual(expected) { mismatches += 1 }
+                                }
+
+                                for _ in 0..<2048 {
+                                    if !full && keptEnd == expectedEnd { break }
+                                    let rc = av_read_frame(context, packet)
+                                    if rc == eof {
+                                        let sent = avcodec_send_packet(decoder, nil)
+                                        guard sent >= 0 || sent == eof,
+                                              try drain(observe) == eof
+                                        else { throw MatrixError.invalidFixture }
+                                        terminal = true
+                                        break
+                                    }
+                                    guard rc >= 0 else { throw MatrixError.invalidFixture }
+                                    defer { av_packet_unref(packet) }
+                                    guard packet.pointee.stream_index == 0 else { continue }
+                                    packets += 1
+                                    payloadBytes += Int(packet.pointee.size)
+                                    guard avcodec_send_packet(decoder, packet) >= 0
+                                    else { throw MatrixError.invalidFixture }
+                                    _ = try drain(observe)
+                                }
+                            }
+                            let elapsed = DispatchTime.now().uptimeNanoseconds - started
+                            let after = resourceSnapshotR16()
+                            let newEvents = endpoint.snapshot().dropFirst(requestBefore)
+                            let transportOK = remote
+                                ? newEvents.allSatisfy { $0.status == 206 }
+                                : newEvents.isEmpty
+                            let bytes = newEvents.reduce(0) { $0 + $1.bytes }
+                            let emptyEOF = target == item.total && terminal
+                                && rawFirst != nil && rawEnd == item.total
+                                && first == nil && keptEnd == nil && compared == 0
+                            let coverage = target < item.total && first == target
+                                && keptEnd == expectedEnd
+                                && compared == Int(expectedEnd - target) * reference.stride
+                            let complete = code == 0 && (emptyEOF || coverage)
+                                && mismatches == 0 && transportOK
+                                && (!full || (terminal && rawEnd == item.total))
+                                && !codes.isEmpty && codes.last == 0
+                                && codes.count <= anchors.count && codes.dropLast().allSatisfy { $0 == -1 }
+                            var deltaCPU: UInt64?
+                            if let a = before.cpuUS, let b = after.cpuUS, b >= a { deltaCPU = UInt64(b - a) }
+                            if complete {
+                                if warmup { warmExact += 1; profileWarm += 1 }
+                                else {
+                                    exact += 1; profileExact += 1
+                                    times.append(elapsed); seekTimes.append(seekNS)
+                                    if let firstNS { firstTimes.append(firstNS) }
+                                    if let deltaCPU { cpuTimes.append(deltaCPU) }
+                                }
+                            } else if code < 0 { rejected += 1 }
+                            else { incomplete += 1 }
+                            if !warmup && (deltaCPU == nil || before.residentBytes == nil || after.residentBytes == nil) {
+                                resourceMissing += 1
+                            }
+                            print("G0_B03_R16B_CASE \(caseLabel) codes=\(codes.map(String.init).joined(separator: ",")) finalCode=\(code) first=\(first.map(String.init) ?? "none") keptEnd=\(keptEnd.map(String.init) ?? "none") rawEnd=\(rawEnd.map(String.init) ?? "none") terminal=\(terminal) comparedBytes=\(compared) mismatches=\(mismatches) packets=\(packets) payloadBytes=\(payloadBytes) requests=\(newEvents.count) bodyBytes=\(bytes) complete=\(complete)")
+                            print("G0_B03_R16B_TIMING \(caseLabel) seekNS=\(seekNS) firstPCMNS=\(firstNS.map(String.init) ?? "none") totalNS=\(elapsed) cpuUS=\(deltaCPU.map(String.init) ?? "none") residentBefore=\(before.residentBytes.map(String.init) ?? "none") residentAfter=\(after.residentBytes.map(String.init) ?? "none")")
+                            prior = code < 0 ? "rejected" : (terminal ? "drainedEOF" : "partial")
+                        } catch {
+                            errors += 1
+                            print("G0_B03_R16B_CASE \(caseLabel) setupOrDecodeError=\(error)")
+                            // Unexpected decoder errors leave state unknown;
+                            // end this owner safely rather than hiding it.
+                            break
+                        }
+                    }
+                    print("G0_B03_R16B_PRECLOSE \(label) residentBytes=\(resourceSnapshotR16().residentBytes.map(String.init) ?? "none")")
+                }
+
+                do {
+                    try runContext()
+                } catch {
+                    errors += 1
+                    print("G0_B03_R16B_CONTEXT \(label) setupError=\(error)")
+                }
+                let afterClose = resourceSnapshotR16()
+                let allEvents = endpoint.snapshot()
+                print("G0_B03_R16B_PROFILE \(label) measuredExact=\(profileExact) warmExact=\(profileWarm) requests=\(allEvents.count) bodyBytes=\(allEvents.reduce(0) { $0 + $1.bytes }) residentBeforeOpen=\(beforeOpen.residentBytes.map(String.init) ?? "none") residentAfterClose=\(afterClose.residentBytes.map(String.init) ?? "none") maxRSSDarwin=\(afterClose.maxRSS.map(String.init) ?? "none") totalN=\(times.count) totalP50NS=\(percentile(times, 0.50)) totalP95NS=\(percentile(times, 0.95)) seekN=\(seekTimes.count) seekP50NS=\(percentile(seekTimes, 0.50)) seekP95NS=\(percentile(seekTimes, 0.95)) firstN=\(firstTimes.count) firstP50NS=\(percentile(firstTimes, 0.50)) firstP95NS=\(percentile(firstTimes, 0.95)) cpuN=\(cpuTimes.count) cpuP50US=\(percentile(cpuTimes, 0.50)) cpuP95US=\(percentile(cpuTimes, 0.95))")
+            }
+        }
+        print("G0_B03_R16B_SUMMARY contexts=\(contexts) measured=\(measured) exact=\(exact) warm=\(warm) warmExact=\(warmExact) rejected=\(rejected) incomplete=\(incomplete) errors=\(errors) resourceMissing=\(resourceMissing)")
+        XCTAssertEqual(contexts, 4)
+        XCTAssertEqual(measured, 80)
+        XCTAssertEqual(warm, 16)
+        XCTAssertEqual(exact, 80)
+        XCTAssertEqual(warmExact, 16)
+        XCTAssertEqual(rejected + incomplete + errors, 0)
+        // No performance or RSS threshold; no device or leak certification.
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
