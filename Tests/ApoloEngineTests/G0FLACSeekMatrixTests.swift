@@ -4579,6 +4579,111 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(errors, 0)
     }
 
+    // F02B: independent APE encoder/decoder on fixture runner, separate
+    // original PCM oracle in Swift. Two workloads (level and duration
+    // vary together); no production encoder dependency.
+    func testG0F02BIndependentAPEFidelity() throws {
+        let profiles: [(rate: Int, channels: Int, bits: Int)] = [
+            (44100, 1, 16), (44100, 2, 24),
+            (48000, 2, 16), (48000, 1, 24),
+            (96000, 2, 24), (192000, 2, 24)
+        ]
+        let workloads = [(level: 2000, frames: 8193), (level: 4000, frames: 80001)]
+        let codec = "ape"
+        let ext = "ape"
+        var attempted = 0
+        var rawExact = 0
+        var engineExact = 0
+        var errors = 0
+        func difference(_ actual: [Float], _ expected: [Float]) -> (Int, Float) {
+            guard actual.count == expected.count else { return (-1, .infinity) }
+            var unequal = 0
+            var maxError: Float = 0
+            for (a, b) in zip(actual, expected) {
+                if a.bitPattern != b.bitPattern { unequal += 1 }
+                maxError = max(maxError, abs(a - b))
+            }
+            return (unequal, maxError)
+        }
+
+        for p in profiles {
+            for workload in workloads {
+                let frames = workload.frames
+                let expected = makeF01PCMContainer(aiff: false, rate: p.rate,
+                    channels: p.channels, bits: p.bits, frames: frames).1
+                attempted += 1
+                let label = "codec=\(codec) container=\(ext) rate=\(p.rate) channels=\(p.channels) bits=\(p.bits) compression=\(workload.level) sourceFrames=\(frames)"
+                let name = "f02b_ape_\(p.rate)_\(p.channels)_\(p.bits)_\(workload.level)_\(frames)"
+                guard let url = Bundle.module.url(forResource: name,
+                    withExtension: ext, subdirectory: "Fixtures/G0APE")
+                else {
+                    errors += 1
+                    print("G0_F02B_MISSING \(label)")
+                    continue
+                }
+                do {
+                    let raw = try rawF01PCM(url: url, rate: Int32(p.rate),
+                        channels: p.channels, bits: p.bits, expectedFrames: frames,
+                        expectedCodec: codec)
+                    let diff = difference(raw.values, expected)
+                    let exact = raw.first == 0 && raw.end == Int64(frames) && diff.0 == 0
+                    if exact { rawExact += 1 }
+                    print("G0_F02B_RAW \(label) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") format=\(raw.format.map(String.init) ?? "none") values=\(raw.values.count) different=\(diff.0) maxAbsError=\(diff.1) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F02B_RAW \(label) error=\(error)")
+                }
+
+                do {
+                    let source = try OpenedSource.open(url: url)
+                    defer { source.close() }
+                    guard source.info.audioTracks.first?.codec == codec
+                    else { throw MatrixError.invalidFixture }
+                    let decoder = AudioDecoder()
+                    decoder.limiterEnabled = false
+                    try decoder.adopt(source)
+                    defer { decoder.close() }
+                    var sequence = PCMSequenceR8()
+                    var reachedEOF = false
+                    var asbdValid = true
+                    for _ in 0..<2048 {
+                        guard let sample = try decoder.readNextBuffer() else {
+                            reachedEOF = true
+                            break
+                        }
+                        guard let desc = CMSampleBufferGetFormatDescription(sample),
+                              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                        else { throw MatrixError.invalidFixture }
+                        let shape = asbd.pointee
+                        asbdValid = asbdValid && shape.mSampleRate == Double(p.rate)
+                            && shape.mChannelsPerFrame == UInt32(p.channels)
+                            && shape.mFormatID == kAudioFormatLinearPCM
+                            && shape.mBitsPerChannel == 32
+                            && shape.mBytesPerFrame == UInt32(p.channels * 4)
+                            && (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+                        try sequence.append(sample, rate: Int32(p.rate))
+                        guard sequence.frameCount <= frames else { throw MatrixError.invalidFixture }
+                    }
+                    let diff = difference(sequence.samples, expected)
+                    let exact = reachedEOF && asbdValid && sequence.firstTick == 0
+                        && sequence.nextTick == Int64(frames)
+                        && sequence.channels == p.channels && diff.0 == 0
+                    if exact { engineExact += 1 }
+                    print("G0_F02B_ENGINE \(label) first=\(sequence.firstTick.map(String.init) ?? "none") end=\(sequence.nextTick.map(String.init) ?? "none") frames=\(sequence.frameCount) values=\(sequence.samples.count) different=\(diff.0) maxAbsError=\(diff.1) asbdValid=\(asbdValid) eof=\(reachedEOF) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F02B_ENGINE \(label) error=\(error)")
+                }
+            }
+        }
+        print("G0_F02B_SUMMARY attempted=\(attempted) rawExact=\(rawExact) engineExact=\(engineExact) errors=\(errors)")
+        XCTAssertEqual(attempted, 12)
+        XCTAssertEqual(rawExact, 12)
+        XCTAssertEqual(engineExact, 12)
+        XCTAssertEqual(errors, 0)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
