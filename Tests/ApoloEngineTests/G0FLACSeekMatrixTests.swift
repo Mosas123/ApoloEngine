@@ -2175,9 +2175,9 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 + "eofExact=\(eofExact) rejected=\(rejected) "
                 + "incomplete=\(incomplete) setupErrors=\(setupErrors)"
         )
-        // 4 fixtures x (10 unique targets each, plus 4 extra) x
+        // (4 fixtures x 11 unique targets + 4 extra) x
         // 2 table variants x 2 policies. Zero is shared by both sets.
-        XCTAssertEqual(attempted, 176)
+        XCTAssertEqual(attempted, 192)
         XCTAssertEqual(setupErrors, 0, "R12 observation incomplete")
         XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
     }
