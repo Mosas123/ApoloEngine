@@ -347,4 +347,117 @@ final class G0F04SWRTests: XCTestCase {
         XCTAssertEqual(aliasControls, 6)
         XCTAssertEqual(errors, 0)
     }
+
+    // F04E: default SWR transfer response, not an audio quality certification.
+    // Coherent single tones at multiples of 25 Hz, 200 ms source, central
+    // 160 ms measurement (four cycles per 25 Hz); exclude both filter edges.
+    private func spectralProjection(_ pcm: [Float], rate: Int32, hz: Int,
+                                    start: Int, end: Int) -> (sin: Double, cos: Double) {
+        var s = 0.0, c = 0.0
+        let omega = 2 * Double.pi * Double(hz) / Double(rate)
+        for i in start..<end {
+            let x = Double(pcm[i]), angle = omega * Double(i)
+            s += x * sin(angle)
+            c += x * cos(angle)
+        }
+        let scale = 2.0 / Double(end-start)
+        return (s*scale,c*scale)
+    }
+
+    func testG0F04EDefaultSpectralSweep() throws {
+        let rates: [Int32] = [44100,48000,96000,192000]
+        let passFractions = [0.025,0.10,0.25,0.50,0.75,0.85,0.90,0.95,0.975,0.99]
+        let nearStop = [1.005,1.01,1.025,1.05,1.075]
+        let amplitude = 0.4
+        func grid(_ hz: Double) -> Int { Int((hz/25).rounded())*25 }
+        func db(_ ratio: Double) -> Double { 20*log10(max(ratio,1e-15)) }
+        var planned = 0, observed = 0, passCount = 0, stopCount = 0
+        var errors = 0, scalars = 0, lowBandWorstDB = 0.0
+        var maxResidualDB = -300.0
+        for inputRate in rates {
+            for outputRate in rates where inputRate != outputRate {
+                let inNyq = Int(inputRate)/2, outNyq = Int(outputRate)/2
+                let edge = min(inNyq,outNyq)
+                let pass = Set(passFractions.map { grid(Double(edge)*$0) }).sorted()
+                var stop: [Int] = []
+                if inputRate > outputRate {
+                    let candidates = nearStop.map { grid(Double(outNyq)*$0) } + [
+                        grid(Double(inNyq+outNyq)/2), grid(Double(inNyq)*0.995)
+                    ]
+                    stop = Set(candidates.filter { $0 > outNyq && $0 < inNyq }).sorted()
+                }
+                for hz in pass+stop {
+                    planned += 1
+                    let isStop = hz > outNyq
+                    let label = "in=\(inputRate) out=\(outputRate) toneHz=\(hz) band=\(isStop ? "stop" : "pass") edgeFraction=\(Double(hz)/Double(edge))"
+                    do {
+                        let frames = Int(inputRate)/5
+                        let pcm = (0..<frames).map {
+                            Float(amplitude*sin(2*Double.pi*Double(hz)*Double($0)/Double(inputRate)))
+                        }
+                        let result = try convertRate(pcm,inputRate:inputRate,outputRate:outputRate,channels:1,split:true)
+                        let nominal = Int(outputRate)/5
+                        let start = Int(outputRate)/50
+                        let end = nominal-start
+                        guard abs(result.pcm.count-nominal)<=1, end<=result.pcm.count,
+                              hz>0, hz<inNyq, start<end else { throw LabError.bound }
+                        // Fold the source tone into output Nyquist. At DC or
+                        // Nyquist the ordinary two-sided projection is singular;
+                        // retain broadband RMS and mark tone metrics unavailable.
+                        let remainder = hz % Int(outputRate)
+                        let folded = min(remainder,Int(outputRate)-remainder)
+                        let validTone = folded>0 && folded<outNyq
+                        let fit = validTone ? spectralProjection(result.pcm,rate:outputRate,hz:folded,start:start,end:end) : (sin:0.0,cos:0.0)
+                        let gain = hypot(fit.sin,fit.cos)/amplitude
+                        let toneDB = validTone ? db(gain) : -300
+                        var squares = 0.0, residual = 0.0
+                        let omega = 2*Double.pi*Double(folded)/Double(outputRate)
+                        for i in start..<end {
+                            let x=Double(result.pcm[i])
+                            squares += x*x
+                            let error=x-fit.sin*sin(omega*Double(i))-fit.cos*cos(omega*Double(i))
+                            residual += error*error
+                        }
+                        let rmsDB = db(sqrt(squares/Double(end-start))/(amplitude/sqrt(2.0)))
+                        let residualDB = db(sqrt(residual/Double(end-start))/(amplitude/sqrt(2.0)))
+                        // First and higher image candidates k*inputRate ± f
+                        // within output Nyquist; report the strongest projection.
+                        var imageHz = 0, imageDB = -300.0
+                        if outputRate > inputRate {
+                            var images = Set<Int>()
+                            for k in 1...(outNyq/Int(inputRate)+1) {
+                                for candidate in [k*Int(inputRate)-hz,k*Int(inputRate)+hz] {
+                                    if candidate>0 && candidate<outNyq && candidate != folded { images.insert(candidate) }
+                                }
+                            }
+                            for f in images.sorted() {
+                                let p=spectralProjection(result.pcm,rate:outputRate,hz:f,start:start,end:end)
+                                let level=db(hypot(p.sin,p.cos)/amplitude)
+                                if level>imageDB { imageDB=level; imageHz=f }
+                            }
+                        }
+                        guard rmsDB.isFinite,residualDB.isFinite,toneDB.isFinite,imageDB.isFinite else { throw LabError.conversion }
+                        if isStop { stopCount += 1 } else {
+                            passCount += 1
+                            if Double(hz)/Double(edge)<=0.75 { lowBandWorstDB=max(lowBandWorstDB,abs(toneDB)) }
+                            maxResidualDB=max(maxResidualDB,residualDB)
+                        }
+                        observed += 1; scalars += result.pcm.count
+                        let phase = validTone ? atan2(fit.cos,fit.sin) : 0
+                        print("G0_F04E_CASE \(label) inputFrames=\(frames) outputFrames=\(result.pcm.count) measuredFrames=\(end-start) foldedHz=\(folded) toneValid=\(validTone) toneDB=\(toneDB) rmsDB=\(rmsDB) residualDB=\(residualDB) phaseRad=\(phase) imageHz=\(imageHz) imageDB=\(imageDB) tail=\(result.tail) pcmSHA256=\(hash(result.pcm))")
+                    } catch {
+                        errors += 1
+                        print("G0_F04E_ERROR \(label) error=\(error)")
+                    }
+                }
+            }
+        }
+        print("G0_F04E_SUMMARY planned=\(planned) observed=\(observed) pass=\(passCount) stop=\(stopCount) outputValues=\(scalars) lowBandWorstAbsDB=\(lowBandWorstDB) maxPassResidualDB=\(maxResidualDB) errors=\(errors)")
+        XCTAssertEqual(passCount,120)
+        XCTAssertGreaterThanOrEqual(stopCount,36)
+        XCTAssertEqual(observed,planned)
+        XCTAssertEqual(errors,0)
+        // No invented spectral pass/fail limits. Report actual transition
+        // width, alias and imaging measurements for later policy decisions.
+    }
 }
