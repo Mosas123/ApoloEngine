@@ -143,13 +143,13 @@ final class G0F04OriginTests: XCTestCase {
 
     func testG0F04D4RealBridgeOrigin() throws {
         let cases: [(String,Int64,[Int64])] = [
-            ("zero",0,[]), ("origin",12345,[]), ("gap",0,[2400]),
-            ("originGap",12345,[2400])
+            ("zero",0,[]), ("origin",12336,[]), ("gap",0,[2400]),
+            ("originGap",12336,[2400])
         ]
         let offsets = [0.0,1.25,0.0007]
         var attempted = 0, observed = 0, pcmExact = 0, clockExact = 0, quantized = 0, errors = 0, values = 0
         for (name,origin,gaps) in cases {
-            let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "nut", subdirectory: "Fixtures/G0F04D4"))
+            let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: "mka", subdirectory: "Fixtures/G0F04D4"))
             let raw = try native(url)
             let refURL = try XCTUnwrap(Bundle.module.url(forResource: "source", withExtension: "s16", subdirectory: "Fixtures/G0F04D4"))
             let bytes = try Data(contentsOf: refURL)
