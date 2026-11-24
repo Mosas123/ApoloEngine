@@ -1323,15 +1323,18 @@ final class G0FLACSeekMatrixTests: XCTestCase {
 
         var stride: Int { channels * bytesPerSample }
 
-        mutating func append(_ frame: UnsafeMutablePointer<AVFrame>) throws {
+        mutating func append(
+            _ frame: UnsafeMutablePointer<AVFrame>,
+            expectedRate: Int32 = 44100, expectedChannels: Int = 2
+        ) throws {
             let value = frame.pointee
             let start = value.pts
             let count = Int(value.nb_samples)
             let format = AVSampleFormat(rawValue: value.format)
             let width = Int(av_get_bytes_per_sample(format))
             let channelCount = Int(value.ch_layout.nb_channels)
-            guard start >= 0, count > 0, value.sample_rate == 44100,
-                  channelCount == 2, width > 0,
+            guard start >= 0, count > 0, value.sample_rate == expectedRate,
+                  channelCount == expectedChannels, width > 0,
                   let planes = value.extended_data,
                   endTick == nil || endTick == start,
                   sampleFormat == nil || sampleFormat == value.format,
@@ -1376,6 +1379,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     /// before the Swift whole-frame discard. No production flags changed.
     private func nativePCMSequenceR9(
         url: URL, targetTick: Int64?,
+        expectedRate: Int32 = 44100, expectedChannels: Int = 2,
         retryAnchors: [Int64] = [],
         onPrimePacket: ((Int) -> Void)? = nil,
         onPacket: ((Int) -> Void)? = nil,
@@ -1389,8 +1393,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
               context.pointee.nb_streams == 1,
               let stream = context.pointee.streams[0],
               stream.pointee.time_base.num == 1,
-              stream.pointee.time_base.den == 44100,
+              stream.pointee.time_base.den == expectedRate,
               let parameters = stream.pointee.codecpar,
+              parameters.pointee.sample_rate == expectedRate,
+              Int(parameters.pointee.ch_layout.nb_channels) == expectedChannels,
               parameters.pointee.codec_id == AV_CODEC_ID_FLAC,
               let codec = avcodec_find_decoder(parameters.pointee.codec_id),
               let allocated = avcodec_alloc_context3(codec)
@@ -1421,7 +1427,10 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 if streaming, let onFrame {
                     try onFrame(frame)
                 } else {
-                    try output.append(frame)
+                    try output.append(
+                        frame, expectedRate: expectedRate,
+                        expectedChannels: expectedChannels
+                    )
                 }
             }
             throw MatrixError.invalidFixture
@@ -2179,6 +2188,181 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         // 2 table variants x 2 policies. Zero is shared by both sets.
         XCTAssertEqual(attempted, 192)
         XCTAssertEqual(setupErrors, 0, "R12 observation incomplete")
+        XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
+    }
+
+    /// R13 extends native FLAC coverage; all previous tests keep their
+    /// original 44.1 kHz stereo defaults. No production changes.
+    func testG0B03ExpandedFLACRecoveryObservation() throws {
+        let inputs: [(tag: String, rate: Int32, channels: Int,
+                      bits: Int, block: Int64, samples: Int64)] = [
+            ("mono48_s16_b1024", 48000, 1, 16, 1024, 24000),
+            ("surround48_s24_b4096", 48000, 6, 24, 4096, 72000),
+            ("stereo96_s24_b4096", 96000, 2, 24, 4096, 192000),
+            ("stereo192_s24_b8192", 192000, 2, 24, 8192, 384000),
+            ("stereo44_s16_b4608_long", 44100, 2, 16, 4608, 1323000),
+            ("stereo96_s24_b8192_short", 96000, 2, 24, 8192, 24000)
+        ]
+        var attempted = 0
+        var exact = 0
+        var eofExact = 0
+        var rejected = 0
+        var incomplete = 0
+        var setupErrors = 0
+        for item in inputs {
+            let targets: [Int64] = [
+                0, 1, item.block - 1, item.block, item.block + 1,
+                item.samples / 2, item.samples * 9 / 10,
+                item.samples - 2, item.samples - 1, item.samples
+            ]
+            for table in [false, true] {
+                let url = try fixture("r13_\(item.tag)", withSeektable: table)
+                let linear = try nativePCMSequenceR9(
+                    url: url, targetTick: nil,
+                    expectedRate: item.rate, expectedChannels: item.channels
+                )
+                let reference = linear.pcm
+                let expectedWidth = item.bits == 16 ? 2 : 4
+                guard linear.code == 0, reference.firstTick == 0,
+                      reference.endTick == item.samples,
+                      reference.channels == item.channels,
+                      reference.bytesPerSample == expectedWidth,
+                      reference.data.count == Int(item.samples) * reference.stride
+                else { throw MatrixError.invalidFixture }
+                let expectedFormat = item.bits == 16
+                    ? AV_SAMPLE_FMT_S16.rawValue : AV_SAMPLE_FMT_S32.rawValue
+                let expectedPlanar = item.bits == 16
+                    ? AV_SAMPLE_FMT_S16P.rawValue : AV_SAMPLE_FMT_S32P.rawValue
+                guard reference.sampleFormat == expectedFormat
+                        || reference.sampleFormat == expectedPlanar
+                else { throw MatrixError.invalidFixture }
+                let expectedStarts = stride(
+                    from: Int64(0), to: item.samples, by: Int(item.block)
+                ).map { $0 }
+                guard reference.frameStarts == expectedStarts
+                else { throw MatrixError.invalidFixture }
+                print(
+                    "G0_B03_R13_REFERENCE tag=\(item.tag) table=\(table) "
+                        + "rate=\(item.rate) channels=\(item.channels) bits=\(item.bits) "
+                        + "block=\(item.block) samples=\(item.samples) "
+                        + "decodedFrames=\(reference.frameStarts.count) "
+                        + "format=\(reference.sampleFormat ?? -1) stride=\(reference.stride)"
+                )
+                for target in targets {
+                    attempted += 1
+                    let label = "tag=\(item.tag) table=\(table) targetTick=\(target)"
+                    var anchors: [Int64] = []
+                    for offset: Int64 in [0, Int64(item.rate) / 8, Int64(item.rate) / 2] {
+                        let a = max(0, target - offset)
+                        if !anchors.contains(a) { anchors.append(a) }
+                    }
+                    var codes: [Int32] = []
+                    var rawFirst: Int64?
+                    var rawEnd: Int64?
+                    var keptFirst: Int64?
+                    var keptEnd: Int64?
+                    var comparedBytes = 0
+                    var mismatches = 0
+                    var discarded = 0
+                    var packets = 0
+                    var payloadBytes = 0
+                    var firstKeptPackets: Int?
+                    var firstKeptBytes: Int?
+                    do {
+                        let result = try nativePCMSequenceR9(
+                            url: url, targetTick: target,
+                            expectedRate: item.rate, expectedChannels: item.channels,
+                            retryAnchors: Array(anchors.dropFirst()),
+                            onPacket: { size in
+                                packets += 1
+                                payloadBytes += size
+                            },
+                            onSeek: { code, _ in codes.append(code) },
+                            onFrame: { frame in
+                                var one = NativePCMSequenceR9()
+                                try one.append(
+                                    frame, expectedRate: item.rate,
+                                    expectedChannels: item.channels
+                                )
+                                guard let start = one.firstTick, let end = one.endTick,
+                                      end <= item.samples, rawEnd == nil || rawEnd == start,
+                                      one.stride == reference.stride,
+                                      one.sampleFormat == reference.sampleFormat
+                                else { throw MatrixError.invalidFixture }
+                                if rawFirst == nil { rawFirst = start }
+                                rawEnd = end
+                                if end <= target {
+                                    discarded += Int(end - start)
+                                    return
+                                }
+                                let kept = max(start, target)
+                                discarded += Int(kept - start)
+                                guard keptEnd == nil || keptEnd == kept
+                                else { throw MatrixError.invalidTimestamp }
+                                if keptFirst == nil {
+                                    keptFirst = kept
+                                    firstKeptPackets = packets
+                                    firstKeptBytes = payloadBytes
+                                }
+                                keptEnd = end
+                                let bytes = one.data.dropFirst(Int(kept - start) * one.stride)
+                                let a = Int(kept) * reference.stride
+                                let b = Int(end) * reference.stride
+                                comparedBytes += bytes.count
+                                if !bytes.elementsEqual(reference.data[a..<b]) {
+                                    mismatches += 1
+                                }
+                            }
+                        )
+                        guard !codes.isEmpty, codes.count <= anchors.count,
+                              codes.last == result.code,
+                              codes.dropLast().allSatisfy({ $0 == -1 })
+                        else { throw MatrixError.invalidFixture }
+                        let path = "anchors=\(anchors.prefix(codes.count).map(String.init).joined(separator: ",")) "
+                            + "codes=\(codes.map(String.init).joined(separator: ","))"
+                        if result.code < 0 {
+                            rejected += 1
+                            print("G0_B03_R13_CASE \(label) \(path) finalCode=\(result.code)")
+                            continue
+                        }
+                        let full = target < item.samples
+                            && keptFirst == target && keptEnd == item.samples
+                            && comparedBytes == Int(item.samples - target) * reference.stride
+                            && mismatches == 0
+                        let emptyEOF = target == item.samples
+                            && rawFirst != nil && rawEnd == item.samples
+                            && keptFirst == nil && keptEnd == nil
+                            && comparedBytes == 0 && mismatches == 0
+                        if full { exact += 1 }
+                        else if emptyEOF { eofExact += 1 }
+                        else { incomplete += 1 }
+                        print(
+                            "G0_B03_R13_CASE \(label) \(path) finalCode=0 "
+                                + "rawFirst=\(rawFirst.map(String.init) ?? "none") "
+                                + "rawEnd=\(rawEnd.map(String.init) ?? "none") "
+                                + "firstKept=\(keptFirst.map(String.init) ?? "none") "
+                                + "keptEnd=\(keptEnd.map(String.init) ?? "none") "
+                                + "discardedSamples=\(discarded) packets=\(packets) "
+                                + "payloadBytes=\(payloadBytes) "
+                                + "firstKeptPackets=\(firstKeptPackets.map(String.init) ?? "none") "
+                                + "firstKeptBytes=\(firstKeptBytes.map(String.init) ?? "none") "
+                                + "comparedBytes=\(comparedBytes) mismatchedFrames=\(mismatches) "
+                                + "complete=\(full) eofExact=\(emptyEOF)"
+                        )
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R13_CASE \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R13_SUMMARY attempted=\(attempted) exact=\(exact) "
+                + "eofExact=\(eofExact) rejected=\(rejected) "
+                + "incomplete=\(incomplete) setupErrors=\(setupErrors)"
+        )
+        XCTAssertEqual(attempted, 120)
+        XCTAssertEqual(setupErrors, 0, "R13 observation incomplete")
         XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
     }
 
