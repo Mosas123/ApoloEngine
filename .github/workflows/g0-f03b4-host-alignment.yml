@@ -1,0 +1,220 @@
+name: G0 F03B.4 host alignment and independent decoder observations
+
+on:
+  pull_request:
+    branches: [diag/g0-lab-benchmarks-20261123]
+    paths: [".github/workflows/g0-f03b4-host-alignment.yml"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  host:
+    if: github.head_ref == 'diag/f03b4-host-alignment-20261124'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact original diagnostic commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 75cba3068bb7a31420b66c251a805200aac9284d
+          persist-credentials: false
+      - name: Retrieve exact F03B.1 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f03b-fixtures-45451919833
+          run-id: 45451919833
+          github-token: ${{ github.token }}
+          path: .
+      - name: Verify original fixture bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c g0-f03b-fixtures-sha256.txt
+          sha256sum --strict -c <<'SHA256'
+          32d9d4ddf7fb5c0d5675d98ad5c69973b030debe6cc6b6143d2a9d4d47374168  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.mp3
+          8a52187554de34d23837eb19daff605a61bf2d239aad39d40db07d87851797e2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.f32
+          e9913e24c8576258ba4e714d29a67410d80d8ab5b5b5f13007de4236a75b66f2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.mp3
+          4e9b38fb54bf1019463f2da2c611751749709652fb7fa97aa2d93881e4afe7ca  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.f32
+          1b439d875bde4cc4fd2528458ce19d582c8d0d0a5ffa4a0a13bc94ee208e40dd  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.mp3
+          8949413c93eae20fd82d87f25b627b9843c6bd975462d5a248d0718ed452c50c  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.f32
+          617acd252d9d9d955ffc5a0f5a974768487cae68a612827c61b332081e4ef298  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.ogg
+          0e9881018a4cc5edd52e206396fd35b4ad940d7655e6428173e999f74e3586ba  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.f32
+          fe5da5c7e078d7c9764017508e35345968e76002f442f1b3e95c12034753da23  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.ogg
+          1cf5260d1502c6692927f67cf9fcf5b5aa80ef730b4a5f97d6b8ecfca6768f70  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.f32
+          7ee4178bc126c4342545a6a7c978da1bcaed30f38d55c4926b739d4eb385aed9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.ogg
+          2ed1fcc78a1798779a89ba4cd2d93d21c505e6a0006f2406fda464afea37b9b4  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.f32
+          3d1904be1e11bc74562133aa04fe63ebc8e60750456acc3727ee4012a15e0a99  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.mpc
+          d512ae61fae214f198512b80f8e5777a9a7704525b442fbc5008fe5c2ee15b68  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.f32
+          aaefac307e26c20bb07d5917b3b5b79a113bad632518cac758b9951a8ab40009  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.mpc
+          f9dc3c6b9bcc2b1bf3aeb4892e43e0b8f511c3c52cc7233c9e71c983d911a5d9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.f32
+          SHA256
+      - name: Install host tools from Ubuntu signed repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg mpg123 vorbis-tools musepack-tools
+          dpkg-query -W ffmpeg mpg123 vorbis-tools musepack-tools
+          command -v ffprobe
+      - name: Measure original source alignment and independent decoded lengths
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee g0-f03b4.log
+          import hashlib,json,math,pathlib,shutil,struct,subprocess,sys,tempfile,wave
+          from fractions import Fraction
+          sys.path.insert(0,"scripts")
+          from g0_generate_lossy_matrix import source_pcm
+          root=pathlib.Path("Tests/ApoloEngineTests/Fixtures/G0F03B")
+          out=pathlib.Path("g0-f03b4")
+          out.mkdir(exist_ok=True)
+          manifest=json.loads((root/"manifest.json").read_text())
+          entries=manifest["files"]
+          assert len(entries)==8 and len({e["fixture"] for e in entries})==8
+          def sha(b): return hashlib.sha256(b).hexdigest()
+          tools={}
+          for name in ("ffprobe","mpg123","oggdec","mpcdec"):
+              p=shutil.which(name)
+              tools[name]={"path":p,"sha256":sha(pathlib.Path(p).read_bytes()) if p else None}
+          provenance={"tools":tools,"packages":subprocess.check_output(["dpkg-query","-W","ffmpeg","mpg123","vorbis-tools","musepack-tools"],text=True),"ffprobe_version":subprocess.check_output(["ffprobe","-version"],text=True)}
+          (out/"provenance.json").write_text(json.dumps(provenance,sort_keys=True,indent=2))
+          # Positive shift means source frame i is compared with decoded frame i+shift.
+          # Full search on a fixed subsampled source grid including both faded edges.
+          # Zero outside reference bounds. Refine best separated candidates on all samples.
+          def alignment(src, ref, channels, limit=2048):
+              n = len(src) // channels
+              m = len(ref) // channels
+              frames = sorted(set(range(0, n, 97)) | set(range(0, min(n, 2048), 11)) |
+                              set(range(max(0, n-2048), n, 11)))
+              def error(shift, indices):
+                  total = 0.0
+                  for i in indices:
+                      j = i + shift
+                      for c in range(channels):
+                          a = src[i*channels+c]
+                          b = ref[j*channels+c] if 0 <= j < m else 0.0
+                          total += (a-b)**2
+                  return total/(len(indices)*channels)
+              ranked = sorted((error(s, frames), s) for s in range(-limit, limit+1))
+              candidates = []
+              for _, s in ranked:
+                  if all(abs(s-x)>2 for x in candidates):
+                      candidates.append(s)
+                  if len(candidates)==8:
+                      break
+              refine = {0}
+              for s in candidates:
+                  refine.update(range(max(-limit,s-2),min(limit,s+2)+1))
+              full = sorted((error(s, range(n)), s) for s in refine)
+              best, shift = full[0]
+              alt = next(((v,s) for v,s in full if abs(s-shift)>2), None)
+              return {"lag_frames":shift, "rms":math.sqrt(best),
+                      "zero_lag_rms":math.sqrt(error(0,range(n))),
+                      "alternate_lag":alt[1] if alt else None,
+                      "alternate_rms":math.sqrt(alt[0]) if alt else None,
+                      "search_bound":limit, "at_bound":abs(shift)==limit,
+                      "coarse_points":len(frames), "refined_candidates":len(refine)}
+          
+          # Check sign and exact recovery on an aperiodic deterministic control.
+          control = [((i*7919 % 997)-498)/512 for i in range(2048)]
+          assert alignment(control, [0.0]*123+control+[0.0]*17, 1, 256)["lag_frames"]==123
+          assert alignment(control, control, 1, 256)["lag_frames"]==0
+          
+
+          assert alignment(control,control[123:],1,256)["lag_frames"]==-123
+          # Ogg page granule positions are raw container values. Record rather than
+          # assume they directly identify removed PCM samples.
+          def ogg_pages(data):
+              pages=[]; pos=0
+              while pos<len(data):
+                  assert len(pages)<4096 and pos+27<=len(data) and data[pos:pos+4]==b"OggS"
+                  assert data[pos+4]==0
+                  flags=data[pos+5]; granule,serial,seq=struct.unpack_from("<qII",data,pos+6)
+                  segments=data[pos+26]; begin=pos+27
+                  assert begin+segments<=len(data)
+                  end=begin+segments+sum(data[begin:begin+segments])
+                  assert pos<end<=len(data)
+                  pages.append({"flags":flags,"granule":granule,"serial":serial,"sequence":seq,"segments":segments})
+                  pos=end
+              return pages
+          def describe(src,ref,ch):
+              n=len(src)//ch; m=len(ref)//ch
+              a=alignment(src,ref,ch)
+              lag=a["lag_frames"]
+              a.update({"source_frames":n,"decoded_frames":m,"delta":m-n,
+                        "estimated_leading_excess":max(0,lag),
+                        "estimated_leading_deficit":max(0,-lag),
+                        "estimated_trailing_excess":max(0,m-n-lag),
+                        "estimated_trailing_deficit":max(0,n+lag-m)})
+              return a
+          # Separate implementations, not Float32 bit-exact references. WAV output
+          # may quantize or clip; report count and alignment only, not fidelity PASS.
+          def independent(e,path,src):
+              name=e["fixture"]; ch=e["channels"]; rate=e["rate"]
+              tool={"mp3":"mpg123","vorbis":"oggdec","musepack8":"mpcdec"}[e["codec"]]
+              if not tools[tool]["path"]:
+                  return {"status":"unavailable","tool":tool}
+              with tempfile.TemporaryDirectory() as tmp:
+                  wav=pathlib.Path(tmp)/"independent.wav"
+                  args={"mpg123":["mpg123","-q","-w",str(wav),str(path)],
+                        "oggdec":["oggdec","-Q","-o",str(wav),str(path)],
+                        "mpcdec":["mpcdec",str(path),str(wav)]}[tool]
+                  try:
+                      r=subprocess.run(args,capture_output=True,text=True,errors="replace",timeout=45)
+                      (out/(name+"-independent.log")).write_text(r.stdout+"\n"+r.stderr)
+                      if r.returncode!=0 or not wav.is_file():
+                          return {"status":"command_failed","tool":tool,"returncode":r.returncode}
+                      with wave.open(str(wav),"rb") as w:
+                          width=w.getsampwidth(); count=w.getnframes()
+                          assert w.getnchannels()==ch and w.getframerate()==rate
+                          assert width in (2,4) and 0<count<=e["source_frames"]+8192
+                          data=w.readframes(count)
+                          assert len(data)==count*ch*width
+                      values=[v[0]/(32768 if width==2 else 2147483648) for v in struct.iter_unpack("<h" if width==2 else "<i",data)]
+                      return {"status":"observed","tool":tool,"sample_width":width,
+                              "pcm_sha256":sha(data),"alignment":describe(src,values,ch)}
+                  except (OSError,ValueError,AssertionError,EOFError,wave.Error,subprocess.TimeoutExpired) as ex:
+                      return {"status":"error","tool":tool,"error":str(ex)}
+          records=[]
+          for e in entries:
+              name=e["fixture"]; ch=e["channels"]; rate=e["rate"]; n=e["source_frames"]
+              path=root/e["file"]; raw=source_pcm(rate,ch,n); f32=(root/e["reference"]).read_bytes()
+              assert sha(raw)==e["source_pcm_sha256"] and sha(path.read_bytes())==e["encoded_sha256"] and sha(f32)==e["reference_sha256"]
+              src=[v[0]/32768 for v in struct.iter_unpack("<h",raw)]
+              ref=[v[0] for v in struct.iter_unpack("<f",f32)]
+              assert len(src)==n*ch and len(ref)==e["reference_frames"]*ch and all(math.isfinite(x) for x in ref)
+              probe=json.loads(subprocess.check_output(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-show_format","-show_packets","-of","json",str(path)],timeout=30))
+              assert len(probe["streams"])==1 and 0<len(probe["packets"])<2048
+              stream=probe["streams"][0]; packets=probe["packets"]; tb=Fraction(stream["time_base"])
+              side=[{"index":i,"pts":p.get("pts"),**s} for i,p in enumerate(packets) for s in p.get("side_data_list",[]) if s.get("side_data_type")=="Skip Samples"]
+              durations=[int(p["duration"]) for p in packets if p.get("duration") not in (None,"N/A")]
+              rec={"fixture":name,"codec":e["codec"],"rate":rate,"channels":ch,
+                   "host_alignment":describe(src,ref,ch),"independent":independent(e,path,src),
+                   "stream_time_base":str(tb),"stream_start_pts":stream.get("start_pts"),"stream_duration_ts":stream.get("duration_ts"),
+                   "initial_padding_reported":stream.get("initial_padding"),"trailing_padding_reported":stream.get("trailing_padding"),
+                   "packet_count":len(packets),"packet_duration_count":len(durations),"packet_duration_sum_samples":str(sum(durations)*tb*rate),
+                   "first_packet":{k:packets[0].get(k) for k in ("pts","dts","duration")},
+                   "last_packet":{k:packets[-1].get(k) for k in ("pts","dts","duration")},
+                   "skip_discard":side,"ogg_pages":ogg_pages(path.read_bytes()) if e["container"]=="ogg" else []}
+              records.append(rec)
+              (out/(name+"-ffprobe.json")).write_text(json.dumps(probe,sort_keys=True,indent=2))
+              print("G0_F03B4_CASE "+json.dumps(rec,sort_keys=True),flush=True)
+          assert len(records)==8
+          observed=sum(r["independent"]["status"]=="observed" for r in records)
+          (out/"summary.json").write_text(json.dumps(records,sort_keys=True,indent=2))
+          print(f"G0_F03B4_SUMMARY hostObserved=8 independentObserved={observed} independentPending={8-observed} syntheticControls=3; no trimming or acoustic claim")
+          assert observed==8, "Independent decoder observations incomplete; preserve partial evidence."
+          PY
+      - name: Preserve host and independent decoder evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03b4-host-${{ github.run_id }}
+          path: |
+            g0-f03b4/
+            g0-f03b4.log
+            g0-f03b-fixtures-sha256.txt
+          if-no-files-found: warn
+          retention-days: 14
