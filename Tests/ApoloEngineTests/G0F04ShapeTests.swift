@@ -105,7 +105,11 @@ final class G0F04ShapeTests: XCTestCase {
         if changed {
             rejectedOrExact = rc == -0x636e6701 && outStale.pointee.nb_samples == 0
         } else {
-            rejectedOrExact = rc == 0 && (try extract(outStale, expected: refB.count)).elementsEqual(refB)
+            if rc == 0 {
+                rejectedOrExact = exact(try extract(outStale, expected: refB.count), refB)
+            } else {
+                rejectedOrExact = false
+            }
         }
         // Independent fresh context with the next frame's full metadata.
         // This is a control, not an engine reconfiguration implementation.
