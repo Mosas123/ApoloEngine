@@ -1,0 +1,200 @@
+name: G0 F03A.4 host alignment and container evidence
+
+on:
+  pull_request:
+    branches: [diag/g0-lab-benchmarks-20261123]
+    paths: [".github/workflows/g0-f03a4-host-alignment.yml"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  host:
+    if: github.head_ref == 'diag/f03a4-host-alignment-20261124'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact original diagnostic commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 75cba3068bb7a31420b66c251a805200aac9284d
+          persist-credentials: false
+      - name: Retrieve original paired fixture artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-b03-fixtures-45443743526
+          run-id: 45443743526
+          github-token: ${{ github.token }}
+          path: .
+      - name: Verify original hashes and deterministic source
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c g0-lossy-fixtures-sha256.txt
+          sha256sum --strict -c <<'SHA256'
+          0d29650d7da838112fad9f5b50fbbbff7df785ae04d328f6754c022d2bd41188  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_49152.m4a
+          09b6a80f5b47328b3183f0cccd3321114a54c45351b8070cab23f01afd3ccacd  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_49152.f32
+          8ee4760271f35dd349a513893de761d1f5205c4ff6f9786fdab690da05e8f4f0  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_1_49152.m4a
+          f218b0b8cbf330414a6140c46efa30d2dcd04d69fd8e7231bafd7703b32ff622  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_1_49152.f32
+          0d462b161b5452560f2a7413b505e27c7a4e59e872dc691e424a8a7be6ab3f7a  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48000.opus
+          107d3b66ebd43ed06e4ce5b09a8dea02e6cad5006e3712336dfb1360b065761e  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48000.f32
+          b58baab92c57500e8faf488ebe7b5d065bb71cba65c216c512441623ef2c6434  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48000.opus
+          4745f4c21509015b20ac30d3e97d6587a318c3b33ad2ffdbfbd5b5942821ac3b  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48000.f32
+          14e9e00a4e9e0d62e1a4e1316d61122287d4c9e388f5b6563d0e53524a560a1c  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_2_48017.m4a
+          5c28de5eb4bf742012dcfd37c6721d63875fd914657c804b92e2c1a919bc4227  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_48000_2_48017.f32
+          7f4fa1bef155b2976aec441903605612cd05c0f4bb89308fe73ed8ba82f88455  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_48123.aac
+          ca88e82597596d967bbbadd0f908608ede74c2c47cc1016dbf0920441d0f902c  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_aac_44100_2_48123.f32
+          63a4e20f1450a78df607be9a140d9fdf93c0047b821c49aa40f7bfbfa9e76f65  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48017.opus
+          e67887f15a6b8c40a4eb8a8cec76072d17d0c48bfd52f4245eafe99421aadbb7  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_1_48017.f32
+          37c7661cf826f65eab7bfaad19cf00aa04561cdac1dc2e059b82827ecb3a6380  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48239.opus
+          196c797ba875f6ba7583f43a368bb95f08688a0e45446d691c369d0f03d2419f  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48239.f32
+          e7d7550d41552035a82cb804415dd872ce4bd80bc87049f82a1ddd9ec55e81af  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48019.mp4
+          f2915fb8ee604dd61b303a96313123750ddaebad126c233d59cebd993792d987  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48019.f32
+          0d6835e742cb299ed962f7f72663b647b2903ec9ed12a066fae8127b75aedbdb  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48031.webm
+          b34a8ec65857a0804d1fa718a16a37dd3c2bcdff8fe341bed59b21d322fb1ca3  Tests/ApoloEngineTests/Fixtures/G0Lossy/f03a_opus_48000_2_48031.f32
+          SHA256
+          python3 scripts/g0_generate_lossy_matrix.py verify Tests/ApoloEngineTests/Fixtures/G0Lossy
+          command -v ffprobe
+      - name: Observe source-reference alignment and container metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee g0-f03a4.log
+          import hashlib, json, math, pathlib, struct, subprocess, sys
+          from fractions import Fraction
+          sys.path.insert(0, "scripts")
+          from g0_generate_lossy_matrix import CASES, source_pcm, stem
+          
+          root = pathlib.Path("Tests/ApoloEngineTests/Fixtures/G0Lossy")
+          out = pathlib.Path("g0-f03a4")
+          out.mkdir(exist_ok=True)
+          version = subprocess.check_output(["ffprobe", "-version"], text=True, timeout=15)
+          (out / "ffprobe-version.txt").write_text(version)
+          
+          # Positive shift means source frame i is compared with decoded frame i+shift.
+          # Full search on a fixed subsampled source grid including both faded edges.
+          # Zero outside reference bounds. Refine best separated candidates on all samples.
+          def alignment(src, ref, channels, limit=2048):
+              n = len(src) // channels
+              m = len(ref) // channels
+              frames = sorted(set(range(0, n, 97)) | set(range(0, min(n, 2048), 11)) |
+                              set(range(max(0, n-2048), n, 11)))
+              def error(shift, indices):
+                  total = 0.0
+                  for i in indices:
+                      j = i + shift
+                      for c in range(channels):
+                          a = src[i*channels+c]
+                          b = ref[j*channels+c] if 0 <= j < m else 0.0
+                          total += (a-b)**2
+                  return total/(len(indices)*channels)
+              ranked = sorted((error(s, frames), s) for s in range(-limit, limit+1))
+              candidates = []
+              for _, s in ranked:
+                  if all(abs(s-x)>2 for x in candidates):
+                      candidates.append(s)
+                  if len(candidates)==8:
+                      break
+              refine = {0}
+              for s in candidates:
+                  refine.update(range(max(-limit,s-2),min(limit,s+2)+1))
+              full = sorted((error(s, range(n)), s) for s in refine)
+              best, shift = full[0]
+              alt = next(((v,s) for v,s in full if abs(s-shift)>2), None)
+              return {"lag_frames":shift, "rms":math.sqrt(best),
+                      "zero_lag_rms":math.sqrt(error(0,range(n))),
+                      "alternate_lag":alt[1] if alt else None,
+                      "alternate_rms":math.sqrt(alt[0]) if alt else None,
+                      "search_bound":limit, "at_bound":abs(shift)==limit,
+                      "coarse_points":len(frames), "refined_candidates":len(refine)}
+          
+          # Check sign and exact recovery on an aperiodic deterministic control.
+          control = [((i*7919 % 997)-498)/512 for i in range(2048)]
+          assert alignment(control, [0.0]*123+control+[0.0]*17, 1, 256)["lag_frames"]==123
+          assert alignment(control, control, 1, 256)["lag_frames"]==0
+          
+          # Read only bounded ISO BMFF box headers. elst values are raw container units,
+          # not automatically sample counts. Do not treat absent edit list as no priming.
+          def edits(data):
+              found=[]
+              def scan(start,end,path,depth):
+                  assert depth<=5
+                  p=start
+                  while p<end:
+                      assert end-p>=8
+                      size,typ=struct.unpack_from(">I4s",data,p)
+                      h=8
+                      if size==1:
+                          assert end-p>=16
+                          size=struct.unpack_from(">Q",data,p+8)[0]; h=16
+                      if size==0: size=end-p
+                      assert h<=size<=end-p
+                      label=typ.decode("ascii",errors="replace")
+                      a=p+h; b=p+size
+                      if typ in (b"moov",b"trak",b"edts"):
+                          scan(a,b,path+"/"+label,depth+1)
+                      if typ==b"elst":
+                          assert b-a>=8
+                          ver=data[a]; count=struct.unpack_from(">I",data,a+4)[0]
+                          assert ver in (0,1) and count<=128
+                          fmt=">Iihh" if ver==0 else ">Qqhh"
+                          width=struct.calcsize(fmt)
+                          assert a+8+count*width<=b
+                          entries=[struct.unpack_from(fmt,data,a+8+i*width) for i in range(count)]
+                          found.append({"path":path+"/elst","version":ver,"entries":entries})
+                      p=b
+              scan(0,len(data),"",0)
+              return found
+          
+          records=[]
+          for case in CASES:
+              codec,ext,rate,ch,n,bitrate=case
+              name=stem(*case)
+              path=root/(name+"."+ext)
+              raw=source_pcm(rate,ch,n)
+              src=[v[0]/32768 for v in struct.iter_unpack("<h",raw)]
+              ref=[v[0] for v in struct.iter_unpack("<f",(root/(name+".f32")).read_bytes())]
+              assert len(src)==n*ch and len(ref)%ch==0
+              assert all(math.isfinite(x) for x in ref)
+              probe=json.loads(subprocess.check_output(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-show_format","-show_packets","-of","json",str(path)],timeout=30))
+              assert len(probe["streams"])==1
+              stream=probe["streams"][0]; packets=probe["packets"]
+              assert 0<len(packets)<2048
+              tb=Fraction(stream["time_base"])
+              side=[{"index":i,"pts":p.get("pts"),**s} for i,p in enumerate(packets) for s in p.get("side_data_list",[]) if s.get("side_data_type")=="Skip Samples"]
+              durations=[int(p["duration"]) for p in packets if p.get("duration") not in (None,"N/A")]
+              align=alignment(src,ref,ch)
+              m=len(ref)//ch
+              rec={"fixture":name,"container":ext,"source_frames":n,"decoded_frames":m,
+                   "excess":m-n,"stream_time_base":str(tb),
+                   "stream_start_pts":stream.get("start_pts"),"stream_duration_ts":stream.get("duration_ts"),
+                   "stream_duration":stream.get("duration"),"format_duration":probe["format"].get("duration"),
+                   "initial_padding_reported":stream.get("initial_padding"),"trailing_padding_reported":stream.get("trailing_padding"),
+                   "packet_count":len(packets),"packet_duration_count":len(durations),
+                   "packet_duration_sum_samples":str(sum(durations)*tb*rate),
+                   "first_packet":{k:packets[0].get(k) for k in ("pts","dts","duration")},
+                   "last_packet":{k:packets[-1].get(k) for k in ("pts","dts","duration")},
+                   "skip_discard_side_data":side,
+                   "skip_sum":sum(int(s.get("skip_samples",0)) for s in side),
+                   "discard_sum":sum(int(s.get("discard_padding",0)) for s in side),
+                   "edit_lists":edits(path.read_bytes()) if ext in ("m4a","mp4") else [],
+                   "alignment":align}
+              records.append(rec)
+              (out/(name+"-ffprobe.json")).write_text(json.dumps(probe,sort_keys=True,indent=2))
+              print("G0_F03A4_CASE "+json.dumps(rec,sort_keys=True),flush=True)
+          assert len(records)==10 and sum(r["excess"]>0 for r in records)==3
+          (out/"summary.json").write_text(json.dumps(records,sort_keys=True,indent=2))
+          print("G0_F03A4_SUMMARY observed=10 excessCases=3 syntheticControls=2; host only; no trimming or acoustic claim")
+          PY
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03a4-host-${{ github.run_id }}
+          path: |
+            g0-f03a4/
+            g0-f03a4.log
+            g0-lossy-fixtures-sha256.txt
+          if-no-files-found: warn
+          retention-days: 14
