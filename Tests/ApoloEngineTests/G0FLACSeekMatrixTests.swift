@@ -4208,6 +4208,270 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         // pass/fail performance target. Physical playback remains untested.
     }
 
+    // G0 fidelity expansion F01: independent integer PCM oracle, written
+    // directly as RIFF/WAV (LE) and AIFF (BE). No FFmpeg CLI/reference
+    // decoder used to generate the expected samples. Sequential decode
+    // only; no seek ramp, optional limiter disabled in this lab.
+    private func makeF01PCMContainer(
+        aiff: Bool, rate: Int, channels: Int, bits: Int, frames: Int
+    ) -> (Data, [Float]) {
+        let width = bits / 8
+        let scale = Int32(1 << (bits - 1))
+        var payload = Data(capacity: frames * channels * width)
+        var expected: [Float] = []
+        expected.reserveCapacity(frames * channels)
+        for i in 0..<frames {
+            for c in 0..<channels {
+                // Distinct per-channel patterns, low bits, signed extrema
+                // and zero. Exact powers-of-two scaling to Float32.
+                let pattern = (i * (131 + c * 17) + c * 7919) % Int(scale / 2)
+                var value = Int32(pattern) - scale / 4
+                if bits == 24 { value = value * 3 + Int32((i + c) % 7) }
+                switch i {
+                case 0: value = -scale
+                case 1: value = scale - 1
+                case 2: value = 0
+                case 3: value = c == 0 ? 1 : -1
+                default: break
+                }
+                expected.append(Float(value) / Float(scale))
+                let raw = UInt32(bitPattern: value)
+                for byte in 0..<width {
+                    let shift = (aiff ? width - byte - 1 : byte) * 8
+                    payload.append(UInt8(truncatingIfNeeded: raw >> shift))
+                }
+            }
+        }
+        var data = Data()
+        func tag(_ value: String) { data.append(contentsOf: value.utf8) }
+        func u16(_ value: UInt16) {
+            var v = aiff ? value.bigEndian : value.littleEndian
+            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
+        }
+        func u32(_ value: UInt32) {
+            var v = aiff ? value.bigEndian : value.littleEndian
+            withUnsafeBytes(of: &v) { data.append(contentsOf: $0) }
+        }
+        if aiff {
+            // AIFF COMM sample rate: positive IEEE 80-bit extended.
+            let r = UInt64(rate)
+            let exponent = 63 - r.leadingZeroBitCount
+            let mantissa = r << (63 - exponent)
+            tag("FORM"); u32(UInt32(46 + payload.count + payload.count % 2))
+            tag("AIFFCOMM"); u32(18)
+            u16(UInt16(channels)); u32(UInt32(frames)); u16(UInt16(bits))
+            u16(UInt16(16383 + exponent))
+            u32(UInt32(truncatingIfNeeded: mantissa >> 32))
+            u32(UInt32(truncatingIfNeeded: mantissa))
+            tag("SSND"); u32(UInt32(8 + payload.count)); u32(0); u32(0)
+        } else {
+            tag("RIFF"); u32(UInt32(36 + payload.count + payload.count % 2))
+            tag("WAVEfmt "); u32(16); u16(1); u16(UInt16(channels))
+            u32(UInt32(rate)); u32(UInt32(rate * channels * width))
+            u16(UInt16(channels * width)); u16(UInt16(bits))
+            tag("data"); u32(UInt32(payload.count))
+        }
+        data.append(payload)
+        if !payload.count.isMultiple(of: 2) { data.append(0) }
+        return (data, expected)
+    }
+
+    // Read actual native AVFrames before SWR, using the same linked
+    // FFmpeg distribution. Normalize only exact S16/S32 integers; reject
+    // unexpected formats. Compare separately from production AudioDecoder.
+    private func rawF01PCM(
+        url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int
+    ) throws -> (values: [Float], first: Int64?, end: Int64?, format: Int32?) {
+        let source = try OpenedSource.open(url: url)
+        defer { source.close() }
+        var owned = source.takeFormatContext()
+        defer { avformat_close_input(&owned) }
+        guard let context = owned, context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0],
+              let params = stream.pointee.codecpar,
+              params.pointee.sample_rate == rate,
+              Int(params.pointee.ch_layout.nb_channels) == channels,
+              stream.pointee.time_base.num > 0, stream.pointee.time_base.den > 0,
+              let codec = avcodec_find_decoder(params.pointee.codec_id),
+              let decoder = avcodec_alloc_context3(codec)
+        else { throw MatrixError.missingStream }
+        var ownedCodec: UnsafeMutablePointer<AVCodecContext>? = decoder
+        defer { avcodec_free_context(&ownedCodec) }
+        guard avcodec_parameters_to_context(decoder, params) >= 0,
+              avcodec_open2(decoder, codec, nil) >= 0
+        else { throw MatrixError.invalidFixture }
+        var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        var ownedFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
+        defer { av_frame_free(&ownedFrame); av_packet_free(&ownedPacket) }
+        guard let packet = ownedPacket, let frame = ownedFrame
+        else { throw MatrixError.missingPacket }
+        var output: [Float] = []
+        output.reserveCapacity(expectedFrames * channels)
+        var first: Int64?
+        var end: Int64?
+        var format: Int32?
+        let eof: Int32 = -541_478_725
+        let again = -Int32(EAGAIN)
+
+        func drain() throws -> Int32 {
+            for _ in 0..<2048 {
+                let rc = avcodec_receive_frame(decoder, frame)
+                if rc == eof || rc == again { return rc }
+                guard rc >= 0 else { throw MatrixError.invalidFixture }
+                defer { av_frame_unref(frame) }
+                let value = frame.pointee
+                let fmt = AVSampleFormat(rawValue: value.format)
+                let width = Int(av_get_bytes_per_sample(fmt))
+                let planar = av_sample_fmt_is_planar(fmt) != 0
+                let expectedFormat = bits == 16
+                    ? (planar ? AV_SAMPLE_FMT_S16P : AV_SAMPLE_FMT_S16)
+                    : (planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32)
+                let count = Int(value.nb_samples)
+                guard fmt == expectedFormat, width == (bits == 16 ? 2 : 4),
+                      value.sample_rate == rate, Int(value.ch_layout.nb_channels) == channels,
+                      count > 0, output.count + count * channels <= expectedFrames * channels,
+                      value.pts != Int64.min, let planes = value.extended_data,
+                      format == nil || format == value.format
+                else { throw MatrixError.invalidFixture }
+                let tick = av_rescale_q(value.pts, stream.pointee.time_base,
+                    AVRational(num: 1, den: rate))
+                guard end == nil || end == tick else { throw MatrixError.invalidTimestamp }
+                if first == nil { first = tick }
+                end = tick + Int64(count)
+                format = value.format
+                for i in 0..<count {
+                    for c in 0..<channels {
+                        guard let plane = planes[planar ? c : 0]
+                        else { throw MatrixError.invalidFixture }
+                        let index = (planar ? i : i * channels + c) * width
+                        // AVFrame PCM is native-endian; both Apple lab
+                        // slices are little-endian. Copy unaligned bytes.
+                        let bytes = UnsafeRawPointer(plane.advanced(by: index))
+                        if width == 2 {
+                            let x = bytes.loadUnaligned(as: Int16.self)
+                            output.append(Float(x) / 32768)
+                        } else {
+                            let x = bytes.loadUnaligned(as: Int32.self)
+                            output.append(Float(x) / 2147483648)
+                        }
+                    }
+                }
+            }
+            throw MatrixError.invalidFixture
+        }
+        for _ in 0..<2048 {
+            let rc = av_read_frame(context, packet)
+            if rc == eof {
+                let sent = avcodec_send_packet(decoder, nil)
+                guard sent >= 0 || sent == eof, try drain() == eof
+                else { throw MatrixError.invalidFixture }
+                return (output, first, end, format)
+            }
+            guard rc >= 0 else { throw MatrixError.invalidFixture }
+            defer { av_packet_unref(packet) }
+            guard packet.pointee.stream_index == 0 else { continue }
+            guard avcodec_send_packet(decoder, packet) >= 0
+            else { throw MatrixError.invalidFixture }
+            _ = try drain()
+        }
+        throw MatrixError.invalidFixture
+    }
+
+    func testG0F01IndependentPCMContainerFidelity() throws {
+        let profiles: [(rate: Int, channels: Int, bits: Int)] = [
+            (44100, 1, 16), (44100, 2, 24),
+            (48000, 2, 16), (48000, 1, 24),
+            (96000, 2, 24), (192000, 2, 24)
+        ]
+        // Odd frame count exercises AIFF/RIFF odd chunk padding for mono24.
+        let frames = 8193
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("g0-f01-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var attempted = 0
+        var rawExact = 0
+        var engineExact = 0
+        var errors = 0
+        func difference(_ actual: [Float], _ expected: [Float]) -> (Int, Float) {
+            guard actual.count == expected.count else { return (-1, .infinity) }
+            var unequal = 0
+            var maxError: Float = 0
+            for (a, b) in zip(actual, expected) {
+                if a.bitPattern != b.bitPattern { unequal += 1 }
+                maxError = max(maxError, abs(a - b))
+            }
+            return (unequal, maxError)
+        }
+
+        for p in profiles {
+            for aiff in [false, true] {
+                attempted += 1
+                let kind = aiff ? "aiff" : "wav"
+                let label = "container=\(kind) rate=\(p.rate) channels=\(p.channels) bits=\(p.bits)"
+                let fixture = makeF01PCMContainer(aiff: aiff, rate: p.rate,
+                    channels: p.channels, bits: p.bits, frames: frames)
+                let url = root.appendingPathComponent("\(kind)-\(p.rate)-\(p.channels)-\(p.bits).\(kind)")
+                try fixture.0.write(to: url)
+                do {
+                    let raw = try rawF01PCM(url: url, rate: Int32(p.rate),
+                        channels: p.channels, bits: p.bits, expectedFrames: frames)
+                    let diff = difference(raw.values, fixture.1)
+                    let exact = raw.first == 0 && raw.end == Int64(frames) && diff.0 == 0
+                    if exact { rawExact += 1 }
+                    print("G0_F01_RAW \(label) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") format=\(raw.format.map(String.init) ?? "none") values=\(raw.values.count) different=\(diff.0) maxAbsError=\(diff.1) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F01_RAW \(label) error=\(error)")
+                }
+
+                do {
+                    let decoder = AudioDecoder()
+                    decoder.limiterEnabled = false
+                    try decoder.open(url: url, httpHeaders: [:])
+                    defer { decoder.close() }
+                    var sequence = PCMSequenceR8()
+                    var reachedEOF = false
+                    var asbdValid = true
+                    for _ in 0..<2048 {
+                        guard let sample = try decoder.readNextBuffer() else {
+                            reachedEOF = true
+                            break
+                        }
+                        guard let desc = CMSampleBufferGetFormatDescription(sample),
+                              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                        else { throw MatrixError.invalidFixture }
+                        let shape = asbd.pointee
+                        asbdValid = asbdValid && shape.mSampleRate == Double(p.rate)
+                            && shape.mChannelsPerFrame == UInt32(p.channels)
+                            && shape.mFormatID == kAudioFormatLinearPCM
+                            && shape.mBitsPerChannel == 32
+                            && shape.mBytesPerFrame == UInt32(p.channels * 4)
+                            && (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+                        try sequence.append(sample, rate: Int32(p.rate))
+                        guard sequence.frameCount <= frames else { throw MatrixError.invalidFixture }
+                    }
+                    let diff = difference(sequence.samples, fixture.1)
+                    let exact = reachedEOF && asbdValid && sequence.firstTick == 0
+                        && sequence.nextTick == Int64(frames)
+                        && sequence.channels == p.channels && diff.0 == 0
+                    if exact { engineExact += 1 }
+                    print("G0_F01_ENGINE \(label) first=\(sequence.firstTick.map(String.init) ?? "none") end=\(sequence.nextTick.map(String.init) ?? "none") frames=\(sequence.frameCount) values=\(sequence.samples.count) different=\(diff.0) maxAbsError=\(diff.1) asbdValid=\(asbdValid) eof=\(reachedEOF) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F01_ENGINE \(label) error=\(error)")
+                }
+            }
+        }
+        print("G0_F01_SUMMARY attempted=\(attempted) rawExact=\(rawExact) engineExact=\(engineExact) errors=\(errors)")
+        XCTAssertEqual(attempted, 12)
+        XCTAssertEqual(rawExact, 12)
+        XCTAssertEqual(engineExact, 12)
+        XCTAssertEqual(errors, 0)
+        // A failed exact comparison is evidence, not a production fix.
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
