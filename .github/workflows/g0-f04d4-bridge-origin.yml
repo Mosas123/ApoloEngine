@@ -20,7 +20,7 @@ jobs:
           set -euo pipefail
           sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
           sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg
-      - name: Generate exact PCM NUT origin and gap fixtures
+      - name: Generate exact PCM Matroska origin and gap fixtures
         shell: bash
         run: |
           set -euo pipefail
@@ -36,16 +36,16 @@ jobs:
           source=root/"source.s16"
           source.write_bytes(b"".join(struct.pack("<hh",(i*113)%30001-15000,(i*997)%28001-14000) for i in range(16391)))
           manifest={"ffmpeg_version":run([ff,"-version"]).decode(),"ffprobe_version":run([probe,"-version"]).decode(),"packages":run(["dpkg-query","-W","ffmpeg"]).decode(),"exe_sha256":{x:sha(pathlib.Path(x)) for x in (ff,probe)},"source_sha256":sha(source),"fixtures":{}}
-          for name,origin,gap in [("zero",0,0),("origin",12345,0),("gap",0,2400),("originGap",12345,2400)]:
-              dest=root/(name+".nut")
-              filtergraph=f"asetnsamples=n=1024:p=0,asetpts=PTS+{origin}+{gap}*gte(N\\,8192)"
-              run([ff,"-v","error","-y","-f","s16le","-ar","48000","-ac","2","-i",str(source),"-af",filtergraph,"-c:a","pcm_s16le","-map_metadata","-1","-avoid_negative_ts","disabled","-f","nut",str(dest)])
+          for name,origin,gap in [("zero",0,0),("origin",12336,0),("gap",0,2400),("originGap",12336,2400)]:
+              dest=root/(name+".mka")
+              filtergraph=f"asetnsamples=n=960:p=0,asetpts=PTS+{origin}+{gap}*gte(N\\,7680)"
+              run([ff,"-v","error","-y","-f","s16le","-ar","48000","-ac","2","-i",str(source),"-af",filtergraph,"-c:a","pcm_s16le","-map_metadata","-1","-avoid_negative_ts","disabled","-f","matroska",str(dest)])
               info=json.loads(run([probe,"-v","error","-select_streams","a:0","-show_streams","-show_frames","-of","json",str(dest)]))
               stream=info["streams"][0]; frames=info["frames"]
-              assert stream["time_base"]=="1/48000",(name,stream["time_base"])
+              assert stream["time_base"]=="1/1000",(name,stream["time_base"])
               assert sum(f["nb_samples"] for f in frames)==16391
-              assert frames[0]["pts"]==origin,(name,frames[0]["pts"],origin)
-              gaps=[b["pts"]-a["pts"]-a["nb_samples"] for a,b in zip(frames,frames[1:]) if b["pts"]!=a["pts"]+a["nb_samples"]]
+              assert frames[0]["pts"]*48==origin,(name,frames[0]["pts"],origin)
+              gaps=[(b["pts"]-a["pts"])*48-a["nb_samples"] for a,b in zip(frames,frames[1:]) if (b["pts"]-a["pts"])*48!=a["nb_samples"]]
               assert gaps==([gap] if gap else []),(name,gaps)
               decoded=run([ff,"-v","error","-i",str(dest),"-f","s16le","-c:a","pcm_s16le","-"])
               assert decoded==source.read_bytes()
@@ -53,7 +53,7 @@ jobs:
               print("G0_F04D4_FIXTURE",name,sha(dest),"origin",origin,"gaps",gaps)
           (root/"manifest.json").write_text(json.dumps(manifest,indent=2))
           PY
-          (cd G0F04D4 && sha256sum *.nut source.s16 manifest.json > SHA256SUMS)
+          (cd G0F04D4 && sha256sum *.mka source.s16 manifest.json > SHA256SUMS)
       - name: Preserve exact fixtures
         uses: actions/upload-artifact@v4
         with:
