@@ -7,6 +7,7 @@ import CoreMedia
 import Darwin
 import Dispatch
 import Foundation
+import Network
 import XCTest
 @testable import ApoloEngine
 
@@ -2904,6 +2905,226 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(observed, 5)
     }
 
+    /// R15B1: isolate the production byte-cache from demuxer seeks.
+    /// Repeat the same reads directly and via the real buffered AVIO.
+    /// Compare deterministic URLProtocol and an actual HTTP loopback socket.
+    func testG0B03HTTPWindowIsolationObservation() throws {
+        let window = 1 << 20
+        let cases: [(name: String, size: Int, ops: [(Int, Int)])] = [
+            ("tail", 129894, [(0, 1), (128870, 32768), (128870, 32768),
+                              (128870, 1024), (129894, 1)]),
+            ("crossWindow", 2 * window + 12345,
+                [(0, 1), (window - 1024, 32768), (window - 1024, 32768),
+                 (window, 32768), (2 * window + 12345, 1)]),
+            ("alternate", 2 * window + 12345,
+                [(0, 1), (window + 64, 4096), (64, 4096),
+                 (window + 64, 4096), (window + 64, 4096)])
+        ]
+        var attempted = 0
+        var exact = 0
+        var errors = 0
+        for item in cases {
+            let payload = Data((0..<item.size).map { UInt8(truncatingIfNeeded: ($0 &* 31) ^ ($0 >> 8)) })
+            for socket in [false, true] {
+                for avio in [false, true] {
+                    attempted += 1
+                    let endpoint = G0R15URLProtocol.state
+                    endpoint.configure(payload: payload, range: true)
+                    let label = "scenario=\(item.name) endpoint=\(socket ? "loopback" : "mock") "
+                        + "layer=\(avio ? "avio" : "stream") fileBytes=\(item.size)"
+                    do {
+                        let server = socket ? try G0R15LoopbackServer(endpoint: endpoint) : nil
+                        defer { server?.stop() }
+                        let config = URLSessionConfiguration.ephemeral
+                        if !socket { config.protocolClasses = [G0R15URLProtocol.self] }
+                        let url = server?.url ?? URL(string: "https://g0-r15.invalid/window")!
+                        let stream = HTTPStream(url: url, headers: [:], configuration: config)
+                        let transport = avio ? HTTPTransport(stream: stream) : nil
+                        defer { transport?.close() }
+                        if avio && transport?.context == nil { throw MatrixError.invalidFixture }
+                        var correct = true
+                        for (index, op) in item.ops.enumerated() {
+                            let (offset, count) = op
+                            let before = endpoint.snapshot()
+                            let started = DispatchTime.now().uptimeNanoseconds
+                            let seek: Int64
+                            if let context = transport?.context {
+                                seek = avio_seek(context, Int64(offset), 0)
+                            } else {
+                                seek = stream.seek(offset: Int64(offset), whence: 0)
+                            }
+                            let afterSeek = endpoint.snapshot()
+                            var output = [UInt8](repeating: 0, count: count)
+                            let read: Int
+                            if seek != Int64(offset) {
+                                read = -1
+                            } else if let context = transport?.context {
+                                read = output.withUnsafeMutableBufferPointer {
+                                    Int(avio_read(context, $0.baseAddress!, Int32(count)))
+                                }
+                            } else {
+                                read = output.withUnsafeMutableBufferPointer {
+                                    stream.read(into: $0.baseAddress!, count: count)
+                                }
+                            }
+                            let after = endpoint.snapshot()
+                            let expected = min(count, item.size - offset)
+                            let eof = expected == 0 && (avio ? read == -541_478_725 : read == 0)
+                            let bytesExact = expected > 0 && read == expected
+                                && output.prefix(expected).elementsEqual(payload[offset..<(offset + expected)])
+                            let valid = seek == Int64(offset) && (eof || bytesExact) && !stream.hasError
+                            correct = correct && valid
+                            let newEvents = Array(after.dropFirst(before.count))
+                            let body = newEvents.reduce(0) { $0 + $1.bytes }
+                            let requestPath = newEvents.map { "\($0.requestStart):\($0.status):\($0.bytes)" }
+                                .joined(separator: ",")
+                            print(
+                                "G0_B03_R15B_WINDOW_OP \(label) op=\(index) offset=\(offset) "
+                                    + "requested=\(count) seek=\(seek) read=\(read) expected=\(expected) "
+                                    + "seekRequests=\(afterSeek.count - before.count) "
+                                    + "readRequests=\(after.count - afterSeek.count) "
+                                    + "bodyBytes=\(body) path=\(requestPath.isEmpty ? "none" : requestPath) "
+                                    + "hasError=\(stream.hasError) correct=\(valid)"
+                            )
+                            print("G0_B03_R15B_WINDOW_TIMING \(label) op=\(index) elapsedNS=\(DispatchTime.now().uptimeNanoseconds - started)")
+                        }
+                        let events = endpoint.snapshot()
+                        let total = events.reduce(0) { $0 + $1.bytes }
+                        if correct { exact += 1 }
+                        print("G0_B03_R15B_WINDOW_CASE \(label) requests=\(events.count) bodyBytes=\(total) correct=\(correct)")
+                    } catch {
+                        errors += 1
+                        print("G0_B03_R15B_WINDOW_CASE \(label) setupError=\(error)")
+                    }
+                    endpoint.configure(payload: Data(), range: true)
+                }
+            }
+        }
+        print("G0_B03_R15B_WINDOW_SUMMARY attempted=\(attempted) exact=\(exact) errors=\(errors)")
+        XCTAssertEqual(attempted, 12)
+        // Byte correctness and transport failures remain visible observations.
+    }
+
+    /// R15B2: use real loopback TCP/HTTP, no URLProtocol interception.
+    /// Bounded delay and one transient 503, with native PCM comparison.
+    /// No physical network, TLS, renderer, or concurrent close experiment.
+    func testG0B03LoopbackRecoveryObservation() throws {
+        let inputs: [(tag: String, rate: Int32, samples: Int64, target: Int64)] = [
+            ("r13_stereo96_s24_b8192_short", 96000, 24000, 1),
+            ("r13_stereo44_s16_b4608_long", 44100, 1323000, 661500)
+        ]
+        var attempted = 0
+        var exact = 0
+        var rejected = 0
+        var incomplete = 0
+        var errors = 0
+        for item in inputs {
+            let local = try fixture(item.tag, withSeektable: false)
+            let data = try Data(contentsOf: local)
+            guard data.count <= 8 * 1024 * 1024 else { throw MatrixError.invalidFixture }
+            let linear = try nativePCMSequenceR9(
+                url: local, targetTick: nil, expectedRate: item.rate, expectedChannels: 2
+            )
+            let reference = linear.pcm
+            guard linear.code == 0, reference.firstTick == 0, reference.endTick == item.samples,
+                  reference.stride > 0, reference.data.count == Int(item.samples) * reference.stride
+            else { throw MatrixError.invalidFixture }
+            for profile in ["range", "full", "rangeDelay503"] {
+                attempted += 1
+                let range = profile != "full"
+                let delayed = profile == "rangeDelay503"
+                let label = "tag=\(item.tag) profile=\(profile) targetTick=\(item.target) fileBytes=\(data.count)"
+                let endpoint = G0R15URLProtocol.state
+                endpoint.configure(payload: data, range: range, failures: delayed ? 1 : 0, failureStatus: 503)
+                var anchors: [Int64] = []
+                for offset: Int64 in [0, Int64(item.rate) / 8, Int64(item.rate) / 2] {
+                    let a = max(0, item.target - offset)
+                    if !anchors.contains(a) { anchors.append(a) }
+                }
+                var codes: [Int32] = []
+                var rawEnd: Int64?
+                var keptFirst: Int64?
+                var keptEnd: Int64?
+                var compared = 0
+                var mismatches = 0
+                var openRequests = -1
+                var firstRequests = -1
+                var firstNS: UInt64?
+                let started = DispatchTime.now().uptimeNanoseconds
+                do {
+                    let server = try G0R15LoopbackServer(endpoint: endpoint, delayMS: delayed ? 20 : 0)
+                    defer { server.stop() }
+                    let result = try nativePCMSequenceR9(
+                        url: server.url, targetTick: item.target,
+                        sessionConfiguration: .ephemeral,
+                        onOpened: { openRequests = endpoint.snapshot().count },
+                        expectedRate: item.rate, expectedChannels: 2,
+                        retryAnchors: Array(anchors.dropFirst()),
+                        onSeek: { code, _ in codes.append(code) },
+                        onFrame: { frame in
+                            var one = NativePCMSequenceR9()
+                            try one.append(frame, expectedRate: item.rate, expectedChannels: 2)
+                            guard let start = one.firstTick, let end = one.endTick,
+                                  end <= item.samples, rawEnd == nil || rawEnd == start,
+                                  one.stride == reference.stride, one.sampleFormat == reference.sampleFormat
+                            else { throw MatrixError.invalidFixture }
+                            rawEnd = end
+                            if end <= item.target { return }
+                            let kept = max(start, item.target)
+                            guard keptEnd == nil || keptEnd == kept
+                            else { throw MatrixError.invalidTimestamp }
+                            if keptFirst == nil {
+                                keptFirst = kept
+                                firstRequests = endpoint.snapshot().count
+                                firstNS = DispatchTime.now().uptimeNanoseconds - started
+                            }
+                            keptEnd = end
+                            let actual = one.data.dropFirst(Int(kept - start) * one.stride)
+                            let a = Int(kept) * reference.stride
+                            let b = Int(end) * reference.stride
+                            compared += actual.count
+                            if !actual.elementsEqual(reference.data[a..<b]) { mismatches += 1 }
+                        }
+                    )
+                    let events = endpoint.snapshot()
+                    let success = events.filter { $0.status == (range ? 206 : 200) }
+                    let statusesValid = !success.isEmpty
+                        && events.count == success.count + (delayed ? 1 : 0)
+                        && (!delayed || (events.first?.status == 503 && events.count >= 2
+                            && events[0].requestStart == events[1].requestStart))
+                        && (range || (events.count == 1 && success.first?.bytes == data.count))
+                    let body = events.reduce(0) { $0 + $1.bytes }
+                    let complete = result.code == 0 && keptFirst == item.target && keptEnd == item.samples
+                        && compared == Int(item.samples - item.target) * reference.stride
+                        && mismatches == 0 && statusesValid
+                        && !codes.isEmpty && codes.last == result.code
+                        && codes.count <= anchors.count && codes.dropLast().allSatisfy { $0 == -1 }
+                    if result.code < 0 { rejected += 1 }
+                    else if complete { exact += 1 }
+                    else { incomplete += 1 }
+                    print(
+                        "G0_B03_R15B_LOOP_CASE \(label) codes=\(codes.map(String.init).joined(separator: ",")) "
+                            + "finalCode=\(result.code) requests=\(events.count) bodyBytes=\(body) "
+                            + "openRequests=\(openRequests) firstRequests=\(firstRequests) "
+                            + "firstKept=\(keptFirst.map(String.init) ?? "none") "
+                            + "keptEnd=\(keptEnd.map(String.init) ?? "none") comparedBytes=\(compared) "
+                            + "mismatches=\(mismatches) statusesValid=\(statusesValid) complete=\(complete)"
+                    )
+                    let path = events.map { "\($0.requestStart):\($0.start):\($0.status):\($0.bytes)" }.joined(separator: ",")
+                    print("G0_B03_R15B_LOOP_REQUESTS \(label) path=\(path)")
+                    print("G0_B03_R15B_LOOP_TIMING \(label) firstKeptNS=\(firstNS.map(String.init) ?? "none") totalNS=\(DispatchTime.now().uptimeNanoseconds - started)")
+                } catch {
+                    errors += 1
+                    print("G0_B03_R15B_LOOP_CASE \(label) setupOrDecodeError=\(error) requests=\(endpoint.snapshot().count)")
+                }
+                endpoint.configure(payload: Data(), range: true)
+            }
+        }
+        print("G0_B03_R15B_LOOP_SUMMARY attempted=\(attempted) exact=\(exact) rejected=\(rejected) incomplete=\(incomplete) errors=\(errors)")
+        XCTAssertEqual(attempted, 6)
+        XCTAssertEqual(exact + rejected + incomplete + errors, attempted)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
@@ -3089,4 +3310,96 @@ private final class G0R15URLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func stopLoading() {}
+}
+
+
+/// Test-only HTTP/1.1 server bound exclusively to IPv4 loopback. One
+/// request per connection, bounded header, no external endpoints or TLS.
+/// Response body metrics are bytes selected by the server, not TCP counters.
+private final class G0R15LoopbackServer: @unchecked Sendable {
+    private let listener: NWListener
+    let url: URL
+
+    init(endpoint: G0R15EndpointState, delayMS: Int = 0) throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        let listener = try NWListener(using: parameters)
+        let queue = DispatchQueue(label: "apolo.g0.r15.loopback")
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready, .failed, .cancelled: ready.signal()
+            default: break
+            }
+        }
+        listener.newConnectionHandler = { connection in
+            connection.start(queue: queue)
+            Self.receive(connection, endpoint: endpoint, delayMS: delayMS, queue: queue, accumulated: Data())
+        }
+        listener.start(queue: queue)
+        guard ready.wait(timeout: .now() + 5) == .success,
+              let port = listener.port, port.rawValue != 0,
+              let url = URL(string: "http://127.0.0.1:\(port.rawValue)/fixture.flac")
+        else {
+            listener.cancel()
+            throw URLError(.cannotConnectToHost)
+        }
+        self.listener = listener
+        self.url = url
+    }
+
+    func stop() { listener.cancel() }
+    deinit { listener.cancel() }
+
+    private static func receive(
+        _ connection: NWConnection, endpoint: G0R15EndpointState,
+        delayMS: Int, queue: DispatchQueue, accumulated: Data
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 4096) {
+            data, _, complete, error in
+            var header = accumulated
+            if let data { header.append(data) }
+            guard error == nil, header.count <= 16384 else { connection.cancel(); return }
+            if let end = header.range(of: Data("\r\n\r\n".utf8)) {
+                guard let text = String(data: header.prefix(upTo: end.lowerBound), encoding: .utf8)
+                else { connection.cancel(); return }
+                let lines = text.components(separatedBy: "\r\n")
+                guard let first = lines.first, first.hasPrefix("GET /fixture.flac ")
+                else { connection.cancel(); return }
+                var request = URLRequest(url: URL(string: "http://127.0.0.1/fixture.flac")!)
+                for line in lines.dropFirst() {
+                    let parts = line.split(separator: ":", maxSplits: 1)
+                    if parts.count == 2 && parts[0].lowercased() == "range" {
+                        request.setValue(parts[1].trimmingCharacters(in: .whitespaces), forHTTPHeaderField: "Range")
+                    }
+                }
+                let reply = endpoint.reply(for: request)
+                let reason: String
+                switch reply.status {
+                case 200: reason = "OK"
+                case 206: reason = "Partial Content"
+                case 416: reason = "Range Not Satisfiable"
+                case 503: reason = "Service Unavailable"
+                default: reason = "Error"
+                }
+                var response = "HTTP/1.1 \(reply.status) \(reason)\r\nConnection: close\r\nContent-Type: application/octet-stream\r\n"
+                for key in reply.headers.keys.sorted() {
+                    response += "\(key): \(reply.headers[key]!)\r\n"
+                }
+                response += "\r\n"
+                var bytes = Data(response.utf8)
+                bytes.append(reply.body)
+                let packet = bytes
+                queue.asyncAfter(deadline: .now() + .milliseconds(delayMS)) {
+                    connection.send(content: packet, completion: .contentProcessed { _ in
+                        connection.cancel()
+                    })
+                }
+            } else if complete {
+                connection.cancel()
+            } else {
+                Self.receive(connection, endpoint: endpoint, delayMS: delayMS, queue: queue, accumulated: header)
+            }
+        }
+    }
 }
