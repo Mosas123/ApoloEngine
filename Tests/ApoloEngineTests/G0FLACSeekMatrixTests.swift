@@ -4283,9 +4283,20 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int,
         expectedCodec: String? = nil
     ) throws -> (values: [Float], first: Int64?, end: Int64?, format: Int32?) {
+        // F02B.1: trace the original strict path. No timestamp synthesis,
+        // decoder parameter change or relaxed acceptance in this probe.
+        let traceAPE = expectedCodec == "ape"
+        func trace(_ message: @autoclosure () -> String) {
+            if traceAPE {
+                print("G0_F02B1_TRACE fixture=\(url.lastPathComponent) \(message())")
+            }
+        }
+        trace("stage=open")
         let source = try OpenedSource.open(url: url)
+        trace("stage=source codec=\(source.info.audioTracks.first?.codec ?? "none")")
         defer { source.close() }
         if let expectedCodec, source.info.audioTracks.first?.codec != expectedCodec {
+            trace("stage=reject reason=codecIdentity")
             throw MatrixError.invalidFixture
         }
         var owned = source.takeFormatContext()
@@ -4298,17 +4309,27 @@ final class G0FLACSeekMatrixTests: XCTestCase {
               stream.pointee.time_base.num > 0, stream.pointee.time_base.den > 0,
               let codec = avcodec_find_decoder(params.pointee.codec_id),
               let decoder = avcodec_alloc_context3(codec)
-        else { throw MatrixError.missingStream }
+        else {
+            trace("stage=reject reason=streamOrCodecSetup")
+            throw MatrixError.missingStream
+        }
+        trace("stage=stream rate=\(params.pointee.sample_rate) channels=\(params.pointee.ch_layout.nb_channels) timeBase=\(stream.pointee.time_base.num)/\(stream.pointee.time_base.den) codecID=\(params.pointee.codec_id.rawValue)")
         var ownedCodec: UnsafeMutablePointer<AVCodecContext>? = decoder
         defer { avcodec_free_context(&ownedCodec) }
-        guard avcodec_parameters_to_context(decoder, params) >= 0,
-              avcodec_open2(decoder, codec, nil) >= 0
-        else { throw MatrixError.invalidFixture }
+        let copied = avcodec_parameters_to_context(decoder, params)
+        trace("stage=parameters code=\(copied)")
+        guard copied >= 0 else { throw MatrixError.invalidFixture }
+        let opened = avcodec_open2(decoder, codec, nil)
+        trace("stage=codecOpen code=\(opened) sampleFormat=\(decoder.pointee.sample_fmt.rawValue) packetTimeBase=\(decoder.pointee.pkt_timebase.num)/\(decoder.pointee.pkt_timebase.den)")
+        guard opened >= 0 else { throw MatrixError.invalidFixture }
         var ownedPacket: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
         var ownedFrame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         defer { av_frame_free(&ownedFrame); av_packet_free(&ownedPacket) }
         guard let packet = ownedPacket, let frame = ownedFrame
-        else { throw MatrixError.missingPacket }
+        else {
+            trace("stage=reject reason=allocation")
+            throw MatrixError.missingPacket
+        }
         var output: [Float] = []
         output.reserveCapacity(expectedFrames * channels)
         var first: Int64?
@@ -4316,12 +4337,25 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         var format: Int32?
         let eof: Int32 = -541_478_725
         let again = -Int32(EAGAIN)
+        var packetCount = 0
+        var frameCount = 0
+        var missingPTS = 0
+        var reachedEOF = false
+        defer {
+            trace("stage=terminal packets=\(packetCount) framesObserved=\(frameCount) missingPTS=\(missingPTS) acceptedValues=\(output.count) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") eof=\(reachedEOF)")
+        }
 
         func drain() throws -> Int32 {
             for _ in 0..<2048 {
                 let rc = avcodec_receive_frame(decoder, frame)
+                if rc < 0 {
+                    trace("stage=receive code=\(rc) packets=\(packetCount) frames=\(frameCount)")
+                }
                 if rc == eof || rc == again { return rc }
-                guard rc >= 0 else { throw MatrixError.invalidFixture }
+                guard rc >= 0 else {
+                    trace("stage=reject reason=receiveError code=\(rc)")
+                    throw MatrixError.invalidFixture
+                }
                 defer { av_frame_unref(frame) }
                 let value = frame.pointee
                 let fmt = AVSampleFormat(rawValue: value.format)
@@ -4331,22 +4365,39 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                     ? (planar ? AV_SAMPLE_FMT_S16P : AV_SAMPLE_FMT_S16)
                     : (planar ? AV_SAMPLE_FMT_S32P : AV_SAMPLE_FMT_S32)
                 let count = Int(value.nb_samples)
-                guard fmt == expectedFormat, width == (bits == 16 ? 2 : 4),
-                      value.sample_rate == rate, Int(value.ch_layout.nb_channels) == channels,
-                      count > 0, output.count + count * channels <= expectedFrames * channels,
-                      value.pts != Int64.min, let planes = value.extended_data,
-                      format == nil || format == value.format
-                else { throw MatrixError.invalidFixture }
+                frameCount += 1
+                if value.pts == Int64.min { missingPTS += 1 }
+                trace("stage=frame index=\(frameCount) packet=\(packetCount) pts=\(value.pts) bestEffort=\(value.best_effort_timestamp) duration=\(value.duration) format=\(value.format) expectedFormat=\(expectedFormat.rawValue) width=\(width) planar=\(planar) rate=\(value.sample_rate) channels=\(value.ch_layout.nb_channels) samples=\(count) cursor=\(output.count / channels) expectedFrames=\(expectedFrames) planesPresent=\(value.extended_data != nil)")
+                var failures: [String] = []
+                if fmt != expectedFormat { failures.append("sampleFormat") }
+                if width != (bits == 16 ? 2 : 4) { failures.append("sampleWidth") }
+                if value.sample_rate != rate { failures.append("sampleRate") }
+                if Int(value.ch_layout.nb_channels) != channels { failures.append("channels") }
+                if count <= 0 { failures.append("emptyFrame") }
+                if output.count + count * channels > expectedFrames * channels { failures.append("sampleBounds") }
+                if value.pts == Int64.min { failures.append("missingPTS") }
+                if value.extended_data == nil { failures.append("missingPlanes") }
+                if let format, format != value.format { failures.append("formatChanged") }
+                guard failures.isEmpty, let planes = value.extended_data else {
+                    trace("stage=reject reason=\(failures.joined(separator: ",")) frame=\(frameCount)")
+                    throw MatrixError.invalidFixture
+                }
                 let tick = av_rescale_q(value.pts, stream.pointee.time_base,
                     AVRational(num: 1, den: rate))
-                guard end == nil || end == tick else { throw MatrixError.invalidTimestamp }
+                guard end == nil || end == tick else {
+                    trace("stage=reject reason=timestampDiscontinuity tick=\(tick) expected=\(end.map(String.init) ?? "none")")
+                    throw MatrixError.invalidTimestamp
+                }
                 if first == nil { first = tick }
                 end = tick + Int64(count)
                 format = value.format
                 for i in 0..<count {
                     for c in 0..<channels {
                         guard let plane = planes[planar ? c : 0]
-                        else { throw MatrixError.invalidFixture }
+                        else {
+                            trace("stage=reject reason=nullPlane channel=\(c)")
+                            throw MatrixError.invalidFixture
+                        }
                         let index = (planar ? i : i * channels + c) * width
                         // AVFrame PCM is native-endian; both Apple lab
                         // slices are little-endian. Copy unaligned bytes.
@@ -4367,15 +4418,33 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             let rc = av_read_frame(context, packet)
             if rc == eof {
                 let sent = avcodec_send_packet(decoder, nil)
-                guard sent >= 0 || sent == eof, try drain() == eof
-                else { throw MatrixError.invalidFixture }
+                trace("stage=flushSend code=\(sent)")
+                guard sent >= 0 || sent == eof else {
+                    trace("stage=reject reason=flushSend")
+                    throw MatrixError.invalidFixture
+                }
+                let drained = try drain()
+                guard drained == eof else {
+                    trace("stage=reject reason=flushReceive code=\(drained)")
+                    throw MatrixError.invalidFixture
+                }
+                reachedEOF = true
                 return (output, first, end, format)
             }
-            guard rc >= 0 else { throw MatrixError.invalidFixture }
+            guard rc >= 0 else {
+                trace("stage=reject reason=read code=\(rc)")
+                throw MatrixError.invalidFixture
+            }
             defer { av_packet_unref(packet) }
             guard packet.pointee.stream_index == 0 else { continue }
-            guard avcodec_send_packet(decoder, packet) >= 0
-            else { throw MatrixError.invalidFixture }
+            packetCount += 1
+            trace("stage=packet index=\(packetCount) pts=\(packet.pointee.pts) dts=\(packet.pointee.dts) duration=\(packet.pointee.duration) size=\(packet.pointee.size)")
+            let sent = avcodec_send_packet(decoder, packet)
+            trace("stage=send code=\(sent)")
+            guard sent >= 0 else {
+                trace("stage=reject reason=send code=\(sent)")
+                throw MatrixError.invalidFixture
+            }
             _ = try drain()
         }
         throw MatrixError.invalidFixture
