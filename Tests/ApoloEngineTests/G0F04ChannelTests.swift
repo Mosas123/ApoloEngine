@@ -213,4 +213,151 @@ final class G0F04ChannelTests: XCTestCase {
         // Semantic label/order and source-rematrix observations are deliberately
         // not equated to PCM bridge success. Review them independently.
     }
+
+    // Explicit labels are a diagnostic alternative, not a change to AudioDecoder.
+    // Mono is special; for multichannel use distinct lateral/rear identities.
+    private func explicitLabels(_ channels: [String]) throws -> [UInt32] {
+        let mapping: [String: UInt32] = [
+            "FL": kAudioChannelLabel_Left, "FR": kAudioChannelLabel_Right,
+            "FC": kAudioChannelLabel_Center, "LFE": kAudioChannelLabel_LFEScreen,
+            "BL": kAudioChannelLabel_RearSurroundLeft, "BR": kAudioChannelLabel_RearSurroundRight,
+            "SL": kAudioChannelLabel_LeftSurround, "SR": kAudioChannelLabel_RightSurround,
+            "BC": kAudioChannelLabel_CenterSurround,
+            "FLC": kAudioChannelLabel_LeftCenter, "FRC": kAudioChannelLabel_RightCenter
+        ]
+        if channels == ["FC"] { return [kAudioChannelLabel_Mono] }
+        return try channels.map {
+            guard let label = mapping[$0] else { throw LabError.layout }
+            return label
+        }
+    }
+
+    private func descriptionRoundTrip(_ labels: [UInt32]) throws -> [UInt32] {
+        guard !labels.isEmpty,
+              let offset = MemoryLayout<AudioChannelLayout>.offset(of: \.mChannelDescriptions)
+        else { throw LabError.layout }
+        let size = offset + labels.count * MemoryLayout<AudioChannelDescription>.stride
+        let storage = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioChannelLayout>.alignment)
+        defer { storage.deallocate() }
+        storage.initializeMemory(as: UInt8.self, repeating: 0, count: size)
+        let layout = storage.assumingMemoryBound(to: AudioChannelLayout.self)
+        layout.pointee.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions
+        layout.pointee.mNumberChannelDescriptions = UInt32(labels.count)
+        let entries = storage.advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
+        for (i, label) in labels.enumerated() {
+            var entry = AudioChannelDescription()
+            entry.mChannelLabel = label
+            entries[i] = entry
+        }
+        var asbd = AudioStreamBasicDescription(mSampleRate: 48000,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(labels.count * 4), mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(labels.count * 4), mChannelsPerFrame: UInt32(labels.count),
+            mBitsPerChannel: 32, mReserved: 0)
+        var description: CMAudioFormatDescription?
+        let status = CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+            asbd: &asbd, layoutSize: size, layout: layout, magicCookieSize: 0,
+            magicCookie: nil, extensions: nil, formatDescriptionOut: &description)
+        guard status == noErr, let description else { throw LabError.coreMedia }
+        var actualSize = 0
+        guard let actual = CMAudioFormatDescriptionGetChannelLayout(description, sizeOut: &actualSize)
+        else { throw LabError.layout }
+        if actual.pointee.mChannelLayoutTag != kAudioChannelLayoutTag_UseChannelDescriptions {
+            return try appleLabels(actual.pointee.mChannelLayoutTag, channels: labels.count)
+        }
+        guard actualSize >= size, actual.pointee.mNumberChannelDescriptions == UInt32(labels.count)
+        else { throw LabError.layout }
+        let actualEntries = UnsafeRawPointer(actual).advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
+        return (0..<labels.count).map { actualEntries[$0].mChannelLabel }
+    }
+
+    func testG0F04C1PreserveLayoutControls() throws {
+        let cases: [(String, UInt32, Int)] = [
+            ("mono",0x4,1), ("stereo",0x3,2), ("2.1",0xb,3), ("3.0",0x7,3),
+            ("4.0",0x107,4), ("quad",0x33,4),
+            ("5.0-back",0x37,5), ("5.0-side",0x607,5),
+            ("5.1-back",0x3f,6), ("5.1-side",0x60f,6),
+            ("6.1",0x70f,7), ("6.1-back",0x13f,7),
+            ("7.1",0x63f,8), ("7.1-wide-back",0xff,8)
+        ]
+        let slot = 257
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("g0-f04c1-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var attempted = 0, preserved = 0, labelsExact = 0, errors = 0, manyToOne = 0, permutations = 0
+        var compared = 0, labelErrors = 0, sourceLabelsSame = 0
+        for (name, mask, ch) in cases {
+            attempted += 1
+            do {
+                var input = AVChannelLayout(), selected = AVChannelLayout(), control = AVChannelLayout()
+                defer { av_channel_layout_uninit(&input); av_channel_layout_uninit(&selected); av_channel_layout_uninit(&control) }
+                guard av_channel_layout_from_mask(&input, UInt64(mask)) >= 0,
+                      av_channel_layout_copy(&control, &input) >= 0,
+                      input.nb_channels == Int32(ch) else { throw LabError.layout }
+                AudioDecoder.makeResamplerOutputLayout(channels: Int32(ch), into: &selected)
+                let inNames = names(&input), outNames = names(&selected)
+                let frames = slot * ch
+                var pcm = [Int16](repeating: 0, count: frames * ch)
+                for c in 0..<ch {
+                    for i in 0..<slot {
+                        pcm[(c * slot + i) * ch + c] = Int16(8192 + (i % 7) * 512)
+                    }
+                }
+                let oracle = pcm.map { Float($0) / 32768 }
+                let raw = try reference(pcm, channels: ch, input: &input, output: &selected)
+                let kept = try reference(pcm, channels: ch, input: &input, output: &control)
+                let exact = kept.count == oracle.count && zip(kept, oracle).allSatisfy { $0.0.bitPattern == $0.1.bitPattern }
+                if exact { preserved += 1; compared += kept.count }
+                var routes: [String] = [], incoming = [Int](repeating: 0, count: ch)
+                var unit = true
+                for c in 0..<ch {
+                    let f = c * slot + 128
+                    let divisor = Float(pcm[f * ch + c]) / 32768
+                    var targets: [String] = []
+                    for o in 0..<ch {
+                        let v = raw[f * ch + o] / divisor
+                        if abs(v) > 1e-6 {
+                            incoming[o] += 1
+                            unit = unit && abs(v - 1) < 1e-6
+                            targets.append("\(outNames[o]):\(v)")
+                        }
+                    }
+                    unit = unit && targets.count == 1
+                    routes.append("\(inNames[c])->\(targets.joined(separator: "+"))")
+                }
+                let mixed = incoming.contains(where: { $0 > 1 })
+                let bijection = unit && incoming.allSatisfy { $0 == 1 }
+                if mixed { manyToOne += 1 }
+                if bijection { permutations += 1 }
+                let file = fixture(mask: mask, channels: ch, frames: frames, pcm: pcm)
+                let url = root.appendingPathComponent(name + ".wav")
+                try file.write(to: url)
+                let actual = try engine(url, channels: ch, frames: frames)
+                let actualLabels = try appleLabels(actual.tag, channels: ch)
+                let expected = try explicitLabels(inNames)
+                let semanticSame = actualLabels == expected
+                if semanticSame { sourceLabelsSame += 1 }
+                var roundTrip = "unavailable", roundTripExact = false
+                do {
+                    let result = try descriptionRoundTrip(expected)
+                    roundTrip = result.map(String.init).joined(separator: ",")
+                    roundTripExact = result == expected
+                    if roundTripExact { labelsExact += 1 }
+                } catch {
+                    labelErrors += 1
+                }
+                print("G0_F04C1_CASE name=\(name) channels=\(ch) routes=\(routes.joined(separator: ";")) incoming=\(incoming.map(String.init).joined(separator: ",")) manyToOne=\(mixed) bijection=\(bijection) preservedPCM=\(exact) sourceLabels=\(expected.map(String.init).joined(separator: ",")) currentAppleLabels=\(actualLabels.map(String.init).joined(separator: ",")) currentLabelsEqual=\(semanticSame) explicitRoundTrip=\(roundTrip) explicitExact=\(roundTripExact) pcmSHA256=\(hash(kept))")
+            } catch {
+                errors += 1
+                print("G0_F04C1_ERROR name=\(name) error=\(error)")
+            }
+        }
+        print("G0_F04C1_SUMMARY attempted=\(attempted) preserved=\(preserved) explicitExact=\(labelsExact) labelErrors=\(labelErrors) manyToOne=\(manyToOne) bijections=\(permutations) currentLabelsEqual=\(sourceLabelsSame) comparedValues=\(compared) errors=\(errors)")
+        XCTAssertEqual(attempted, 14)
+        XCTAssertEqual(preserved, 14)
+        XCTAssertEqual(errors, 0)
+        // Explicit description acceptance and spatial semantics are observations.
+        // No claim that this format will be accepted by a physical renderer.
+    }
 }
