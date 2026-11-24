@@ -148,7 +148,8 @@ final class G0F04SWRTests: XCTestCase {
 
     func testG0F04ASameRateNumericIdentity() throws {
         var attempted = 0, exact = 0, errors = 0, values = 0
-        for rate: Int32 in [44100, 48000, 96000, 192000] {
+        let rates: [Int32] = [44100, 48000, 96000, 192000]
+        for rate in rates {
             for channels in [1, 2, 6, 8] {
                 for kind in Kind.allCases {
                     for planar in [false, true] {
