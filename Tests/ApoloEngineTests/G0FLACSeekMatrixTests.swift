@@ -1376,6 +1376,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     /// before the Swift whole-frame discard. No production flags changed.
     private func nativePCMSequenceR9(
         url: URL, targetTick: Int64?,
+        retryAnchors: [Int64] = [],
+        onPrimePacket: ((Int) -> Void)? = nil,
         onPacket: ((Int) -> Void)? = nil,
         onSeek: ((Int32, UInt64) -> Void)? = nil,
         onFrame: ((UnsafeMutablePointer<AVFrame>) throws -> Void)? = nil
@@ -1433,18 +1435,25 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 else { throw MatrixError.missingPCM }
                 defer { av_packet_unref(packet) }
                 guard packet.pointee.stream_index == 0 else { continue }
+                onPrimePacket?(Int(packet.pointee.size))
                 guard avcodec_send_packet(allocated, packet) >= 0
                 else { throw MatrixError.invalidFixture }
                 _ = try drain(into: &primed)
                 if primed.firstTick != nil { break }
             }
             guard primed.firstTick != nil else { throw MatrixError.missingPCM }
-            let seekStarted = DispatchTime.now().uptimeNanoseconds
-            let code = avformat_seek_file(
-                context, 0, Int64.min, targetTick, Int64.max,
-                AVSEEK_FLAG_BACKWARD
-            )
-            onSeek?(code, DispatchTime.now().uptimeNanoseconds - seekStarted)
+            var code: Int32 = -1
+            for anchor in [targetTick] + retryAnchors {
+                let seekStarted = DispatchTime.now().uptimeNanoseconds
+                code = avformat_seek_file(
+                    context, 0, Int64.min, anchor, Int64.max,
+                    AVSEEK_FLAG_BACKWARD
+                )
+                onSeek?(code, DispatchTime.now().uptimeNanoseconds - seekStarted)
+                // R12 retries only the observed generic -1 rejection.
+                // No flush or decoder reads between failed attempts.
+                if code != -1 { break }
+            }
             if code < 0 { return (code, NativePCMSequenceR9()) }
             avformat_flush(context)
             avcodec_flush_buffers(allocated)
@@ -1978,6 +1987,199 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(attempted, 54)
         XCTAssertEqual(setupErrors, 0, "R11 observation incomplete")
         XCTAssertEqual(rejected + exact + incomplete, attempted)
+    }
+
+    /// R12 compares two finite, sequential recovery policies. Retry
+    /// only -1, in descending anchors, without changing the user target.
+    /// Reuse keeps the failed demuxer state; reopen discards it and primes
+    /// a new context per attempt. No fallback after a successful seek
+    /// with incomplete output: that is separately reported.
+    func testG0B03SequentialSeekRecoveryObservation() throws {
+        let inputs: [(tag: String, samples: Int64, extra: [Int64])] = [
+            ("025", 11025, []), ("050", 22050, []),
+            ("200", 88200, [78336, 80640]),
+            ("1000", 441000, [428544, 430848])
+        ]
+        var attempted = 0
+        var exact = 0
+        var eofExact = 0
+        var rejected = 0
+        var incomplete = 0
+        var setupErrors = 0
+        for item in inputs {
+            // Original R8/R10 ticks plus sample boundaries and EOF.
+            // Include the frame boundary on both sides (S16 fixtures).
+            let seconds = Double(item.samples) / 44100.0
+            let original = [0.0, 0.25, 0.5, 0.9].map {
+                Int64(seconds * $0 / (1.0 / 44100.0))
+            }
+            let targets = Set(original + item.extra + [
+                0, 1, 4607, 4608, 4609,
+                item.samples - 2, item.samples - 1, item.samples
+            ]).sorted()
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                let linear = try nativePCMSequenceR9(url: url, targetTick: nil)
+                let reference = linear.pcm
+                guard linear.code == 0, reference.firstTick == 0,
+                      reference.endTick == item.samples, reference.stride > 0,
+                      reference.data.count == Int(item.samples) * reference.stride
+                else { throw MatrixError.invalidFixture }
+                for target in targets {
+                    // Stable deduplication after clamping; at most 3 seeks.
+                    var anchors: [Int64] = []
+                    for offset: Int64 in [0, 5512, 22050] {
+                        let a = max(Int64(0), target - offset)
+                        if !anchors.contains(a) { anchors.append(a) }
+                    }
+                    for reuse in [true, false] {
+                        attempted += 1
+                        let label = "durationTag=\(item.tag) table=\(table) "
+                            + "targetTick=\(target) policy=\(reuse ? "reuse" : "reopen") "
+                            + "plannedAnchors=\(anchors.map(String.init).joined(separator: ","))"
+                        var codes: [Int32] = []
+                        var seekTimes: [UInt64] = []
+                        var contexts = 0
+                        var primePackets = 0
+                        var primeBytes = 0
+                        var packets = 0
+                        var payloadBytes = 0
+                        var rawFirst: Int64?
+                        var rawEnd: Int64?
+                        var keptFirst: Int64?
+                        var keptEnd: Int64?
+                        var firstKeptPackets: Int?
+                        var firstKeptBytes: Int?
+                        var firstKeptNS: UInt64?
+                        var discarded = 0
+                        var comparedBytes = 0
+                        var mismatched = 0
+                        let started = DispatchTime.now().uptimeNanoseconds
+
+                        func observe(_ frame: UnsafeMutablePointer<AVFrame>) throws {
+                            var one = NativePCMSequenceR9()
+                            try one.append(frame)
+                            guard let start = one.firstTick, let end = one.endTick,
+                                  end <= item.samples, rawEnd == nil || rawEnd == start,
+                                  one.stride == reference.stride,
+                                  one.sampleFormat == reference.sampleFormat
+                            else { throw MatrixError.invalidFixture }
+                            if rawFirst == nil { rawFirst = start }
+                            rawEnd = end
+                            if end <= target {
+                                discarded += Int(end - start)
+                                return
+                            }
+                            let kept = max(start, target)
+                            discarded += Int(kept - start)
+                            guard keptEnd == nil || keptEnd == kept
+                            else { throw MatrixError.invalidTimestamp }
+                            if keptFirst == nil {
+                                keptFirst = kept
+                                firstKeptPackets = primePackets + packets
+                                firstKeptBytes = primeBytes + payloadBytes
+                                firstKeptNS = DispatchTime.now().uptimeNanoseconds - started
+                            }
+                            keptEnd = end
+                            let bytes = one.data.dropFirst(Int(kept - start) * one.stride)
+                            let a = Int(kept) * reference.stride
+                            let b = Int(end) * reference.stride
+                            comparedBytes += bytes.count
+                            if !bytes.elementsEqual(reference.data[a..<b]) {
+                                mismatched += 1
+                            }
+                        }
+
+                        do {
+                            var finalCode: Int32 = -1
+                            let starts = reuse ? [anchors[0]] : anchors
+                            for start in starts {
+                                contexts += 1
+                                let result = try nativePCMSequenceR9(
+                                    url: url, targetTick: start,
+                                    retryAnchors: reuse ? Array(anchors.dropFirst()) : [],
+                                    onPrimePacket: { size in
+                                        primePackets += 1
+                                        primeBytes += size
+                                    },
+                                    onPacket: { size in
+                                        packets += 1
+                                        payloadBytes += size
+                                    },
+                                    onSeek: { code, elapsed in
+                                        codes.append(code)
+                                        seekTimes.append(elapsed)
+                                    },
+                                    onFrame: observe
+                                )
+                                finalCode = result.code
+                                if finalCode != -1 { break }
+                            }
+                            guard !codes.isEmpty, codes.count <= anchors.count,
+                                  codes.last == finalCode,
+                                  codes.dropLast().allSatisfy({ $0 == -1 })
+                            else { throw MatrixError.invalidFixture }
+                            let attemptedAnchors = anchors.prefix(codes.count)
+                                .map(String.init).joined(separator: ",")
+                            let path = "attemptedAnchors=\(attemptedAnchors) "
+                                + "codes=\(codes.map(String.init).joined(separator: ",")) "
+                                + "contexts=\(contexts) primePackets=\(primePackets) primeBytes=\(primeBytes)"
+                            if finalCode < 0 {
+                                rejected += 1
+                                print("G0_B03_R12_CASE \(label) \(path) finalCode=\(finalCode)")
+                            } else {
+                                // EOF is an empty interval, not a claim that
+                                // a native seek to EOF succeeded without a retry.
+                                // Require actual contiguous decode reaching EOF.
+                                let emptyEOF = target == item.samples
+                                    && rawFirst != nil && rawEnd == item.samples
+                                    && keptFirst == nil && keptEnd == nil
+                                    && comparedBytes == 0 && mismatched == 0
+                                let full = target < item.samples
+                                    && keptFirst == target && keptEnd == item.samples
+                                    && comparedBytes == Int(item.samples - target) * reference.stride
+                                    && mismatched == 0
+                                if emptyEOF { eofExact += 1 }
+                                else if full { exact += 1 }
+                                else { incomplete += 1 }
+                                print(
+                                    "G0_B03_R12_CASE \(label) \(path) finalCode=0 "
+                                        + "rawFirst=\(rawFirst.map(String.init) ?? "none") "
+                                        + "rawEnd=\(rawEnd.map(String.init) ?? "none") "
+                                        + "firstKept=\(keptFirst.map(String.init) ?? "none") "
+                                        + "keptEnd=\(keptEnd.map(String.init) ?? "none") "
+                                        + "discardedSamples=\(discarded) packets=\(packets) "
+                                        + "payloadBytes=\(payloadBytes) "
+                                        + "firstKeptPackets=\(firstKeptPackets.map(String.init) ?? "none") "
+                                        + "firstKeptBytes=\(firstKeptBytes.map(String.init) ?? "none") "
+                                        + "comparedBytes=\(comparedBytes) mismatchedFrames=\(mismatched) "
+                                        + "complete=\(full) eofExact=\(emptyEOF)"
+                                )
+                            }
+                            let totalNS = DispatchTime.now().uptimeNanoseconds - started
+                            print(
+                                "G0_B03_R12_TIMING \(label) "
+                                    + "seekNS=\(seekTimes.map(String.init).joined(separator: ",")) "
+                                    + "firstKeptNS=\(firstKeptNS.map(String.init) ?? "none") totalNS=\(totalNS)"
+                            )
+                        } catch {
+                            setupErrors += 1
+                            print("G0_B03_R12_CASE \(label) setupError=\(error)")
+                        }
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R12_SUMMARY attempted=\(attempted) exact=\(exact) "
+                + "eofExact=\(eofExact) rejected=\(rejected) "
+                + "incomplete=\(incomplete) setupErrors=\(setupErrors)"
+        )
+        // 4 fixtures x (10 unique targets each, plus 4 extra) x
+        // 2 table variants x 2 policies. Zero is shared by both sets.
+        XCTAssertEqual(attempted, 176)
+        XCTAssertEqual(setupErrors, 0, "R12 observation incomplete")
+        XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
     }
 
     func testG0B03FLACSeek32Cases() throws {
