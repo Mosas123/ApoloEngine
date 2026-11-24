@@ -5113,6 +5113,185 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(totalValues, 2211846)
     }
 
+    // F03A: native Float32 decode and host differential reference.
+    // No lossy source bit-exact claim, no production changes.
+    private func rawF03A(url: URL, codecName: String, rate: Int32,
+                         channels: Int, maxFrames: Int) throws
+        -> (values: [Float], first: Int64?, end: Int64?, missingPTS: Int, discontinuities: Int) {
+        let source = try OpenedSource.open(url: url)
+        defer { source.close() }
+        guard source.info.audioTracks.first?.codec == codecName else { throw MatrixError.invalidFixture }
+        var owned = source.takeFormatContext()
+        defer { avformat_close_input(&owned) }
+        guard let context = owned, context.pointee.nb_streams == 1,
+              let stream = context.pointee.streams[0], let params = stream.pointee.codecpar,
+              params.pointee.sample_rate == rate, Int(params.pointee.ch_layout.nb_channels) == channels,
+              stream.pointee.time_base.num > 0, stream.pointee.time_base.den > 0,
+              let codec = avcodec_find_decoder(params.pointee.codec_id),
+              let decoder = avcodec_alloc_context3(codec)
+        else { throw MatrixError.missingStream }
+        var ownedCodec: UnsafeMutablePointer<AVCodecContext>? = decoder
+        defer { avcodec_free_context(&ownedCodec) }
+        guard avcodec_parameters_to_context(decoder, params) >= 0,
+              avcodec_open2(decoder, codec, nil) >= 0 else { throw MatrixError.invalidFixture }
+        var ownedPacket = av_packet_alloc()
+        var ownedFrame = av_frame_alloc()
+        defer { av_frame_free(&ownedFrame); av_packet_free(&ownedPacket) }
+        guard let packet = ownedPacket, let frame = ownedFrame else { throw MatrixError.missingPacket }
+        let eof: Int32 = -541_478_725
+        let again = -Int32(EAGAIN)
+        var output: [Float] = []
+        var first: Int64?
+        var end: Int64?
+        var missingPTS = 0
+        var discontinuities = 0
+        func drain() throws -> Int32 {
+            for _ in 0..<2048 {
+                let rc = avcodec_receive_frame(decoder, frame)
+                if rc == eof || rc == again { return rc }
+                guard rc >= 0 else { throw MatrixError.invalidFixture }
+                defer { av_frame_unref(frame) }
+                let v = frame.pointee
+                let fmt = AVSampleFormat(rawValue: v.format)
+                let planar = fmt == AV_SAMPLE_FMT_FLTP
+                let n = Int(v.nb_samples)
+                guard (planar || fmt == AV_SAMPLE_FMT_FLT), v.sample_rate == rate,
+                      Int(v.ch_layout.nb_channels) == channels, n > 0,
+                      output.count + n * channels <= maxFrames * channels,
+                      let planes = v.extended_data else { throw MatrixError.invalidFixture }
+                if v.pts == Int64.min {
+                    missingPTS += 1
+                    if let old = end { end = old + Int64(n) }
+                } else {
+                    let tick = av_rescale_q(v.pts, stream.pointee.time_base, AVRational(num: 1, den: rate))
+                    if let old = end, old != tick { discontinuities += 1 }
+                    if first == nil { first = tick }
+                    end = tick + Int64(n)
+                }
+                for i in 0..<n {
+                    for c in 0..<channels {
+                        guard let plane = planes[planar ? c : 0] else { throw MatrixError.invalidFixture }
+                        let offset = (planar ? i : i * channels + c) * 4
+                        let x = UnsafeRawPointer(plane.advanced(by: offset)).loadUnaligned(as: Float.self)
+                        guard x.isFinite else { throw MatrixError.invalidFixture }
+                        output.append(x)
+                    }
+                }
+            }
+            throw MatrixError.invalidFixture
+        }
+        for _ in 0..<2048 {
+            let rc = av_read_frame(context, packet)
+            if rc == eof {
+                let sent = avcodec_send_packet(decoder, nil)
+                guard sent >= 0 || sent == eof, try drain() == eof else { throw MatrixError.invalidFixture }
+                return (output, first, end, missingPTS, discontinuities)
+            }
+            guard rc >= 0 else { throw MatrixError.invalidFixture }
+            defer { av_packet_unref(packet) }
+            guard packet.pointee.stream_index == 0 else { continue }
+            guard avcodec_send_packet(decoder, packet) >= 0 else { throw MatrixError.invalidFixture }
+            _ = try drain()
+        }
+        throw MatrixError.invalidFixture
+    }
+
+    func testG0F03ALossyAACOpusDifferentialObservation() throws {
+        let cases: [(codec: String, ext: String, rate: Int, channels: Int, frames: Int)] = [
+            ("aac", "m4a", 44100, 2, 49152), ("aac", "m4a", 48000, 1, 49152),
+            ("opus", "opus", 48000, 1, 48000), ("opus", "opus", 48000, 2, 48000)
+        ]
+        var attempted = 0
+        var complete = 0
+        var errors = 0
+        func metrics(_ a: [Float], _ b: [Float]) -> (different: Int, max: Double, rms: Double) {
+            guard a.count == b.count, !a.isEmpty else { return (-1, .infinity, .infinity) }
+            var different = 0
+            var maximum = 0.0
+            var squares = 0.0
+            for (x, y) in zip(a, b) {
+                if x.bitPattern != y.bitPattern { different += 1 }
+                let d = abs(Double(x) - Double(y))
+                maximum = max(maximum, d)
+                squares += d * d
+            }
+            return (different, maximum, sqrt(squares / Double(a.count)))
+        }
+        for p in cases {
+            attempted += 1
+            let name = "f03a_\(p.codec)_\(p.rate)_\(p.channels)_\(p.frames)"
+            do {
+                let url = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: p.ext, subdirectory: "Fixtures/G0Lossy"))
+                let refURL = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: "f32", subdirectory: "Fixtures/G0Lossy"))
+                let data = try Data(contentsOf: refURL)
+                guard data.count % (4 * p.channels) == 0,
+                      data.count > 0 else { throw MatrixError.invalidFixture }
+                let host: [Float] = data.withUnsafeBytes { bytes in
+                    (0..<(bytes.count / 4)).map {
+                        Float(bitPattern: UInt32(littleEndian: bytes.loadUnaligned(fromByteOffset: $0 * 4, as: UInt32.self)))
+                    }
+                }
+                let hostFrames = host.count / p.channels
+                guard host.allSatisfy({ $0.isFinite }), hostFrames >= p.frames,
+                      hostFrames <= p.frames + 2048 else { throw MatrixError.invalidFixture }
+                let raw = try rawF03A(url: url, codecName: p.codec, rate: Int32(p.rate),
+                    channels: p.channels, maxFrames: p.frames + 4096)
+                let rawMetrics = metrics(raw.values, host)
+                print("G0_F03A_RAW fixture=\(name) hostFrames=\(hostFrames) frames=\(raw.values.count / p.channels) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") missingPTS=\(raw.missingPTS) discontinuities=\(raw.discontinuities) hostDifferent=\(rawMetrics.different) hostMax=\(rawMetrics.max) hostRMS=\(rawMetrics.rms) eof=true")
+                let source = try OpenedSource.open(url: url)
+                defer { source.close() }
+                let decoder = AudioDecoder()
+                decoder.limiterEnabled = false
+                try decoder.adopt(source)
+                defer { decoder.close() }
+                var sequence = PCMSequenceR8()
+                var reachedEOF = false
+                var asbdValid = true
+                for _ in 0..<2048 {
+                    guard let sample = try decoder.readNextBuffer() else {
+                        reachedEOF = true
+                        break
+                    }
+                    guard let desc = CMSampleBufferGetFormatDescription(sample),
+                          let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                    else { throw MatrixError.invalidFixture }
+                    let shape = asbd.pointee
+                    asbdValid = asbdValid && shape.mSampleRate == Double(p.rate)
+                        && shape.mChannelsPerFrame == UInt32(p.channels)
+                        && shape.mFormatID == kAudioFormatLinearPCM
+                        && shape.mBitsPerChannel == 32
+                        && shape.mBytesPerFrame == UInt32(p.channels * 4)
+                        && (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                        && (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+                    try sequence.append(sample, rate: Int32(p.rate))
+                    guard sequence.frameCount <= p.frames + 4096 else { throw MatrixError.invalidFixture }
+                }
+                let engineHost = metrics(sequence.samples, host)
+                let bridge = metrics(sequence.samples, raw.values)
+                // Host FFmpeg versions/architecture may differ; host PCM error
+                // metrics are observational, no arbitrary acoustic threshold.
+                // Same linked native decoder vs unprocessed bridge is exact.
+                let ok = reachedEOF && asbdValid && sequence.channels == p.channels
+                    && raw.values.count == host.count && sequence.samples.count == raw.values.count
+                    && raw.missingPTS == 0 && raw.discontinuities == 0
+                    && raw.first == 0 && raw.end == Int64(hostFrames)
+                    && sequence.firstTick == 0 && sequence.nextTick == Int64(hostFrames)
+                    && bridge.different == 0
+                if ok { complete += 1 }
+                print("G0_F03A_ENGINE fixture=\(name) frames=\(sequence.frameCount) first=\(sequence.firstTick.map(String.init) ?? "none") end=\(sequence.nextTick.map(String.init) ?? "none") hostDifferent=\(engineHost.different) hostMax=\(engineHost.max) hostRMS=\(engineHost.rms) bridgeDifferent=\(bridge.different) bridgeMax=\(bridge.max) bridgeRMS=\(bridge.rms) asbdValid=\(asbdValid) eof=\(reachedEOF) complete=\(ok)")
+            } catch {
+                errors += 1
+                print("G0_F03A_ERROR fixture=\(name) error=\(error)")
+            }
+        }
+        print("G0_F03A_SUMMARY attempted=\(attempted) complete=\(complete) errors=\(errors)")
+        XCTAssertEqual(attempted, 4)
+        XCTAssertEqual(complete, 4)
+        XCTAssertEqual(errors, 0)
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
