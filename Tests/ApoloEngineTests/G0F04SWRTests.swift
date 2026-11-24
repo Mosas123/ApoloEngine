@@ -174,4 +174,177 @@ final class G0F04SWRTests: XCTestCase {
         XCTAssertEqual(values, 174760)
         XCTAssertEqual(errors, 0)
     }
+
+    // F04B isolates actual rate conversion from decoding, DSP and rendering.
+    private struct RateResult {
+        let pcm: [Float]
+        let tail: Int
+        let maxDelayInputFrames: Int64
+        let delayBeforeDrain: Int64
+        let delayAfterDrain: Int64
+        let zeroOutputCalls: Int
+        let drainCalls: Int
+    }
+
+    private func convertRate(_ pcm: [Float], inputRate: Int32, outputRate: Int32,
+                             channels: Int, split: Bool) throws -> RateResult {
+        var input = AVChannelLayout()
+        var output = AVChannelLayout()
+        AudioDecoder.makeResamplerOutputLayout(channels: Int32(channels), into: &input)
+        AudioDecoder.makeResamplerOutputLayout(channels: Int32(channels), into: &output)
+        defer {
+            av_channel_layout_uninit(&input)
+            av_channel_layout_uninit(&output)
+        }
+        var context: OpaquePointer?
+        defer { swr_free(&context) }
+        guard swr_alloc_set_opts2(&context, &output, AV_SAMPLE_FMT_FLT, outputRate,
+                                  &input, AV_SAMPLE_FMT_FLT, inputRate, 0, nil) >= 0,
+              let swr = context, swr_init(swr) >= 0
+        else { throw LabError.setup }
+        guard !pcm.isEmpty, pcm.count % channels == 0 else { throw LabError.bound }
+        var actual: [Float] = []
+        var maxDelay: Int64 = 0
+        var zeroCalls = 0
+        func convert(_ source: UnsafePointer<UnsafePointer<UInt8>?>?, _ count: Int32) throws -> Int {
+            let upper = swr_get_out_samples(swr, count)
+            guard upper >= 0, upper <= 65536 else { throw LabError.bound }
+            let capacity = max(1, Int(upper))
+            var chunk = [Float](repeating: 0, count: capacity * channels)
+            let got = chunk.withUnsafeMutableBytes { dst -> Int32 in
+                var ptr: UnsafeMutablePointer<UInt8>? = dst.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                return withUnsafeMutablePointer(to: &ptr) {
+                    swr_convert(swr, $0, Int32(capacity), source, count)
+                }
+            }
+            guard got >= 0, got <= Int32(capacity) else { throw LabError.conversion }
+            actual.append(contentsOf: chunk.prefix(Int(got) * channels))
+            guard actual.count <= 65536 * channels else { throw LabError.bound }
+            let delay = swr_get_delay(swr, Int64(inputRate))
+            guard delay >= 0 else { throw LabError.conversion }
+            maxDelay = max(maxDelay, delay)
+            if count > 0 && got == 0 { zeroCalls += 1 }
+            return Int(got)
+        }
+        let total = pcm.count / channels
+        let sizes = [1, 7, 31, 127, 509, 1024, 3, 257]
+        var cursor = 0, index = 0
+        try pcm.withUnsafeBytes { raw in
+            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            while cursor < total {
+                let count = split ? min(sizes[index % sizes.count], total - cursor) : total
+                var src: UnsafePointer<UInt8>? = base.advanced(by: cursor * channels * 4)
+                _ = try withUnsafePointer(to: &src) { try convert($0, Int32(count)) }
+                cursor += count
+                index += 1
+            }
+        }
+        let before = swr_get_delay(swr, Int64(inputRate))
+        var tail = 0, calls = 0, drained = false
+        for _ in 0..<32 {
+            let n = try convert(nil, 0)
+            calls += 1
+            tail += n
+            if n == 0 { drained = true; break }
+        }
+        guard drained, !actual.isEmpty, actual.allSatisfy({ $0.isFinite })
+        else { throw LabError.bound }
+        return RateResult(pcm: actual, tail: tail, maxDelayInputFrames: maxDelay,
+                          delayBeforeDrain: before,
+                          delayAfterDrain: swr_get_delay(swr, Int64(inputRate)),
+                          zeroOutputCalls: zeroCalls, drainCalls: calls)
+    }
+
+    private func signal(_ t: Double, _ channel: Int) -> Double {
+        0.30 * sin(2 * Double.pi * (997 + 43 * Double(channel)) * t + 0.17 * Double(channel))
+        + 0.12 * cos(2 * Double.pi * (2711 + 61 * Double(channel)) * t)
+    }
+
+    func testG0F04BDifferentRateChunkInvariance() throws {
+        let rates: [Int32] = [44100, 48000, 96000, 192000]
+        let frames = 8193
+        var profiles = 0, accepted = 0, exact = 0, errors = 0, compared = 0
+        var aliasControls = 0
+        for inputRate in rates {
+            for outputRate in rates where inputRate != outputRate {
+                for channels in [1, 2] {
+                    profiles += 1
+                    let label = "in=\(inputRate) out=\(outputRate) channels=\(channels)"
+                    do {
+                        var pcm: [Float] = []
+                        pcm.reserveCapacity(frames * channels)
+                        for i in 0..<frames {
+                            for c in 0..<channels {
+                                pcm.append(Float(signal(Double(i) / Double(inputRate), c)))
+                            }
+                        }
+                        let whole = try convertRate(pcm, inputRate: inputRate, outputRate: outputRate,
+                                                    channels: channels, split: false)
+                        let split = try convertRate(pcm, inputRate: inputRate, outputRate: outputRate,
+                                                    channels: channels, split: true)
+                        let n = whole.pcm.count / channels
+                        let m = split.pcm.count / channels
+                        let idealCeil = Int((Int64(frames) * Int64(outputRate) + Int64(inputRate) - 1) / Int64(inputRate))
+                        guard n == m, n > 512 else {
+                            print("G0_F04B_COUNT \(label) whole=\(n) split=\(m) idealCeil=\(idealCeil)")
+                            throw LabError.conversion
+                        }
+                        var unequal = 0, partitionPeak = 0.0, errorPeak = 0.0, squares = 0.0
+                        var outputPeak = 0.0
+                        for i in whole.pcm.indices {
+                            let a = whole.pcm[i], b = split.pcm[i]
+                            if a.bitPattern != b.bitPattern { unequal += 1 }
+                            partitionPeak = max(partitionPeak, abs(Double(a) - Double(b)))
+                            outputPeak = max(outputPeak, abs(Double(a)), abs(Double(b)))
+                        }
+                        // Interior only: exclude edge extension/transient response.
+                        // Time oracle is independent of SWR and does not fit phase.
+                        for i in 256..<(n - 256) {
+                            for c in 0..<channels {
+                                let reference = signal(Double(i) / Double(outputRate), c)
+                                let error = Double(whole.pcm[i * channels + c]) - reference
+                                squares += error * error
+                                errorPeak = max(errorPeak, abs(error))
+                            }
+                        }
+                        let rms = sqrt(squares / Double((n - 512) * channels))
+                        let ok = abs(n - idealCeil) <= 1 && partitionPeak <= 1e-6
+                            && rms <= 0.002 && errorPeak <= 0.01 && outputPeak <= 1.0
+                        if unequal == 0 { exact += 1 }
+                        if ok { accepted += 1 }
+                        compared += whole.pcm.count
+                        print("G0_F04B_CASE \(label) inputFrames=\(frames) whole=\(n) split=\(m) ceil=\(idealCeil) different=\(unequal) partitionPeak=\(partitionPeak) interiorRMS=\(rms) interiorPeakError=\(errorPeak) outputPeak=\(outputPeak) wholeTail=\(whole.tail) splitTail=\(split.tail) wholeMaxDelayIn=\(whole.maxDelayInputFrames) splitMaxDelayIn=\(split.maxDelayInputFrames) wholeBeforeDrain=\(whole.delayBeforeDrain) splitBeforeDrain=\(split.delayBeforeDrain) wholeAfterDrain=\(whole.delayAfterDrain) splitAfterDrain=\(split.delayAfterDrain) wholeDrainCalls=\(whole.drainCalls) splitDrainCalls=\(split.drainCalls) splitZeroCalls=\(split.zeroOutputCalls) wholeSHA256=\(hash(whole.pcm)) splitSHA256=\(hash(split.pcm)) accepted=\(ok)")
+                    } catch {
+                        errors += 1
+                        print("G0_F04B_ERROR \(label) error=\(error)")
+                    }
+                }
+                if inputRate > outputRate {
+                    // Stopband observations are exploratory, not a conformance
+                    // threshold: near-Nyquist transition width depends on ratio.
+                    let frequency = (Double(inputRate) + Double(outputRate)) / 4
+                    do {
+                        let pcm = (0..<frames).map { Float(0.4 * sin(2 * Double.pi * frequency * Double($0) / Double(inputRate))) }
+                        let result = try convertRate(pcm, inputRate: inputRate, outputRate: outputRate,
+                                                     channels: 1, split: true)
+                        let n = result.pcm.count
+                        guard n > 512 else { throw LabError.bound }
+                        let sum = result.pcm[256..<(n - 256)].reduce(0.0) { $0 + Double($1) * Double($1) }
+                        let rms = sqrt(sum / Double(n - 512))
+                        let attenuation = 20 * log10(max(rms, 1e-30) / (0.4 / sqrt(2.0)))
+                        aliasControls += 1
+                        print("G0_F04B_STOPBAND in=\(inputRate) out=\(outputRate) toneHz=\(frequency) outputFrames=\(n) interiorRMS=\(rms) relativeDB=\(attenuation) tail=\(result.tail) pcmSHA256=\(hash(result.pcm))")
+                    } catch {
+                        errors += 1
+                        print("G0_F04B_ERROR stopband in=\(inputRate) out=\(outputRate) error=\(error)")
+                    }
+                }
+            }
+        }
+        print("G0_F04B_SUMMARY profiles=\(profiles) accepted=\(accepted) exactPartitions=\(exact) comparedValues=\(compared) stopbandControls=\(aliasControls) errors=\(errors)")
+        XCTAssertEqual(profiles, 24)
+        XCTAssertEqual(accepted, 24, "Preserve any rate/count/partition/passband discrepancy as a G0 observation.")
+        XCTAssertEqual(aliasControls, 6)
+        XCTAssertEqual(errors, 0)
+    }
 }
