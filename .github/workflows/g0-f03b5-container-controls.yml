@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   host:
-    if: github.head_ref == 'diag/f03b4-host-alignment-20261124'
+    if: github.head_ref == 'diag/f03b5-container-controls-20261124'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
