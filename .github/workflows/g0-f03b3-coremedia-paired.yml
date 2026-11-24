@@ -1,0 +1,123 @@
+name: G0 F03B.3 paired CoreMedia bridge
+
+on:
+  pull_request:
+    branches: [diag/f03b2-native-paired-20261124]
+    paths: [".github/workflows/g0-f03b3-coremedia-paired.yml", "Tests/ApoloEngineTests/G0F03BNativeTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f03b3-coremedia-paired-20261124'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Retrieve original F03B.1 fixture artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f03b-fixtures-45451919833
+          run-id: 45451919833
+          github-token: ${{ github.token }}
+          path: .
+      - name: Verify all original fixture hashes
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 -c g0-f03b-fixtures-sha256.txt
+          shasum -a 256 -c <<'SHA256'
+          32d9d4ddf7fb5c0d5675d98ad5c69973b030debe6cc6b6143d2a9d4d47374168  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.mp3
+          8a52187554de34d23837eb19daff605a61bf2d239aad39d40db07d87851797e2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.f32
+          e9913e24c8576258ba4e714d29a67410d80d8ab5b5b5f13007de4236a75b66f2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.mp3
+          4e9b38fb54bf1019463f2da2c611751749709652fb7fa97aa2d93881e4afe7ca  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.f32
+          1b439d875bde4cc4fd2528458ce19d582c8d0d0a5ffa4a0a13bc94ee208e40dd  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.mp3
+          8949413c93eae20fd82d87f25b627b9843c6bd975462d5a248d0718ed452c50c  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.f32
+          617acd252d9d9d955ffc5a0f5a974768487cae68a612827c61b332081e4ef298  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.ogg
+          0e9881018a4cc5edd52e206396fd35b4ad940d7655e6428173e999f74e3586ba  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.f32
+          fe5da5c7e078d7c9764017508e35345968e76002f442f1b3e95c12034753da23  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.ogg
+          1cf5260d1502c6692927f67cf9fcf5b5aa80ef730b4a5f97d6b8ecfca6768f70  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.f32
+          7ee4178bc126c4342545a6a7c978da1bcaed30f38d55c4926b739d4eb385aed9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.ogg
+          2ed1fcc78a1798779a89ba4cd2d93d21c505e6a0006f2406fda464afea37b9b4  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.f32
+          3d1904be1e11bc74562133aa04fe63ebc8e60750456acc3727ee4012a15e0a99  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.mpc
+          d512ae61fae214f198512b80f8e5777a9a7704525b442fbc5008fe5c2ee15b68  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.f32
+          aaefac307e26c20bb07d5917b3b5b79a113bad632518cac758b9951a8ab40009  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.mpc
+          f9dc3c6b9bcc2b1bf3aeb4892e43e0b8f511c3c52cc7233c9e71c983d911a5d9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.f32
+          SHA256
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+            cat g0-f03b-fixtures-sha256.txt
+          } | tee g0-f03b3-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f03b3-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F03B3-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f03b3-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F03BNativeTests/testG0F03B3CoreMediaBridgeObservation \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 120 \
+              -maximum-test-execution-time-allowance 300 \
+              2>&1 | tee "g0-f03b3-$variant-output.log"; then
+              echo "G0_F03B3_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F03B3_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03b3-paired-${{ github.run_id }}
+          path: |
+            g0-f03b3-*-output.log
+            g0-f03b3-*-dependency.patch
+            g0-f03b3-environment.txt
+            g0-f03b-fixtures-sha256.txt
+            g0-f03b3-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
