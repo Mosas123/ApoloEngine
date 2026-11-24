@@ -4279,6 +4279,25 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     // Read actual native AVFrames before SWR, using the same linked
     // FFmpeg distribution. Normalize only exact S16/S32 integers; reject
     // unexpected formats. Compare separately from production AudioDecoder.
+    // F02B.4: report only the exact missing-PTS predicate as a typed
+    // observation. All other rejection paths remain hard errors.
+    private struct APEStrictMissingPTS: Error {
+        let packetIndex: Int
+        let frameIndex: Int
+        let missingCount: Int
+        let observedCount: Int
+        let first: Int64?
+        let end: Int64?
+        let rawPTS: Int64
+        let bestEffortPTS: Int64
+        let packetPTS: Int64
+        let rejectedSamples: Int
+        let format: Int32
+        let rate: Int32
+        let channels: Int
+        let prefix: [Float]
+    }
+
     private func rawF01PCM(
         url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int,
         expectedCodec: String? = nil, inferMissingAPEPTS: Bool = false,
@@ -4356,6 +4375,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         var reachedEOF = false
         var verifiedPacketAnchors = 0
         var pendingPacketAnchor: Int64?
+        var currentPacketPTS: Int64 = Int64.min
         defer {
             trace("stage=terminal packets=\(packetCount) framesObserved=\(frameCount) missingPTS=\(missingPTS) observedPTS=\(observedPTS) inferredPTS=\(inferredPTS) observedSamples=\(observedSamples) inferredSamples=\(inferredSamples) verifiedPacketAnchors=\(verifiedPacketAnchors) acceptedValues=\(output.count) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") eof=\(reachedEOF)")
         }
@@ -4397,6 +4417,23 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 if let format, format != value.format { failures.append("formatChanged") }
                 guard failures.isEmpty, let planes = value.extended_data else {
                     trace("stage=reject reason=\(failures.joined(separator: ",")) frame=\(frameCount)")
+                    if traceAPE && !inferMissingAPEPTS && failures == ["missingPTS"],
+                       let planes = value.extended_data {
+                        // A missing timestamp must be the sole reason for
+                        // rejection; check actual channel pointers as well.
+                        for c in 0..<channels {
+                            guard planes[planar ? c : 0] != nil else {
+                                throw MatrixError.invalidFixture
+                            }
+                        }
+                        throw APEStrictMissingPTS(packetIndex: packetCount,
+                            frameIndex: frameCount, missingCount: missingPTS,
+                            observedCount: observedPTS, first: first, end: end,
+                            rawPTS: value.pts, bestEffortPTS: value.best_effort_timestamp,
+                            packetPTS: currentPacketPTS, rejectedSamples: count,
+                            format: value.format, rate: value.sample_rate,
+                            channels: Int(value.ch_layout.nb_channels), prefix: output)
+                    }
                     throw MatrixError.invalidFixture
                 }
                 let tick: Int64
@@ -4501,6 +4538,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             defer { av_packet_unref(packet) }
             guard packet.pointee.stream_index == 0 else { continue }
             packetCount += 1
+            currentPacketPTS = packet.pointee.pts
             trace("stage=packet index=\(packetCount) pts=\(packet.pointee.pts) dts=\(packet.pointee.dts) duration=\(packet.pointee.duration) size=\(packet.pointee.size)")
             let packetStart = output.count / channels
             let packetDuration = packet.pointee.duration
@@ -4747,6 +4785,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         let ext = "ape"
         var attempted = 0
         var rawExact = 0
+        var expectedMissingPTS = 0
+        var unexpectedStrictResults = 0
         var engineExact = 0
         var errors = 0
         func difference(_ actual: [Float], _ expected: [Float]) -> (Int, Float) {
@@ -4782,7 +4822,32 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                     let diff = difference(raw.values, expected)
                     let exact = raw.first == 0 && raw.end == Int64(frames) && diff.0 == 0
                     if exact { rawExact += 1 }
+                    // A changed raw PTS behavior deserves review, not a
+                    // silent pass under the historical observation contract.
+                    unexpectedStrictResults += 1
                     print("G0_F02B_RAW \(label) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") format=\(raw.format.map(String.init) ?? "none") values=\(raw.values.count) different=\(diff.0) maxAbsError=\(diff.1) exact=\(exact)")
+                } catch let observation as APEStrictMissingPTS {
+                    let expectedPrefix = Array(expected.prefix(4608 * p.channels))
+                    let diff = difference(observation.prefix, expectedPrefix)
+                    let expectedFormat = p.bits == 16
+                        ? AV_SAMPLE_FMT_S16P.rawValue : AV_SAMPLE_FMT_S32P.rawValue
+                    let verified = observation.packetIndex == 1
+                        && observation.frameIndex == 2
+                        && observation.missingCount == 1
+                        && observation.observedCount == 1
+                        && observation.first == 0 && observation.end == 4608
+                        && observation.packetPTS == 0
+                        && observation.rawPTS == Int64.min
+                        && observation.bestEffortPTS == Int64.min
+                        && observation.rejectedSamples == min(4608, frames - 4608)
+                        && observation.format == expectedFormat
+                        && observation.rate == Int32(p.rate)
+                        && observation.channels == p.channels
+                        && observation.prefix.count == expectedPrefix.count
+                        && diff.0 == 0
+                    if verified { expectedMissingPTS += 1 }
+                    else { unexpectedStrictResults += 1 }
+                    print("G0_F02B4_STRICT \(label) packet=\(observation.packetIndex) frame=\(observation.frameIndex) pts=\(observation.rawPTS) bestEffort=\(observation.bestEffortPTS) first=\(observation.first.map(String.init) ?? "none") end=\(observation.end.map(String.init) ?? "none") rejectedSamples=\(observation.rejectedSamples) prefixValues=\(observation.prefix.count) different=\(diff.0) maxAbsError=\(diff.1) expectedMissingPTS=\(verified)")
                 } catch {
                     errors += 1
                     print("G0_F02B_RAW \(label) error=\(error)")
@@ -4831,9 +4896,11 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                 }
             }
         }
-        print("G0_F02B_SUMMARY attempted=\(attempted) rawExact=\(rawExact) engineExact=\(engineExact) errors=\(errors)")
+        print("G0_F02B4_SUMMARY attempted=\(attempted) rawExact=\(rawExact) expectedMissingPTS=\(expectedMissingPTS) unexpectedStrictResults=\(unexpectedStrictResults) engineExact=\(engineExact) errors=\(errors)")
         XCTAssertEqual(attempted, 12)
-        XCTAssertEqual(rawExact, 12)
+        XCTAssertEqual(rawExact, 0, "Strict PTS observation is separate from sequential native PCM fidelity")
+        XCTAssertEqual(expectedMissingPTS, 12)
+        XCTAssertEqual(unexpectedStrictResults, 0)
         XCTAssertEqual(engineExact, 12)
         XCTAssertEqual(errors, 0)
     }
