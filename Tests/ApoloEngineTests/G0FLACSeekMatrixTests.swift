@@ -1390,6 +1390,26 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         onSeek: ((Int32, UInt64) -> Void)? = nil,
         onFrame: ((UnsafeMutablePointer<AVFrame>) throws -> Void)? = nil
     ) throws -> (code: Int32, pcm: NativePCMSequenceR9) {
+        try Self.nativePCMSequenceR9Worker(
+            url: url, targetTick: targetTick, sessionConfiguration: sessionConfiguration,
+            onOpened: onOpened, expectedRate: expectedRate, expectedChannels: expectedChannels,
+            retryAnchors: retryAnchors, onPrimePacket: onPrimePacket, onPacket: onPacket,
+            onSeek: onSeek, onFrame: onFrame
+        )
+    }
+
+    // Shared test-only implementation; no XCTest instance crosses worker queues.
+    private static func nativePCMSequenceR9Worker(
+        url: URL, targetTick: Int64?,
+        sessionConfiguration: URLSessionConfiguration = .default,
+        onOpened: (() -> Void)? = nil,
+        expectedRate: Int32 = 44100, expectedChannels: Int = 2,
+        retryAnchors: [Int64] = [],
+        onPrimePacket: ((Int) -> Void)? = nil,
+        onPacket: ((Int) -> Void)? = nil,
+        onSeek: ((Int32, UInt64) -> Void)? = nil,
+        onFrame: ((UnsafeMutablePointer<AVFrame>) throws -> Void)? = nil
+    ) throws -> (code: Int32, pcm: NativePCMSequenceR9) {
         let source = try OpenedSource.open(url: url, sessionConfiguration: sessionConfiguration)
         // Keep the HTTP transport alive until after avformat_close_input.
         defer { source.close() }
@@ -3755,6 +3775,262 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(warmExact, 16)
         XCTAssertEqual(rejected + incomplete + errors, 0)
         // No performance or RSS threshold; no device or leak certification.
+    }
+
+    // R16C: isolated owner per worker, distinct fixture shapes and HTTP
+    // endpoints. Serial control and concurrent waves use identical inputs.
+    // The open barrier proves overlapping source lifetimes, not CPU-core
+    // parallelism. No XCTest instance or AV* pointer crosses worker queues.
+    private struct R16CInput: Sendable {
+        let id: String
+        let url: URL
+        let payload: Data
+        let rate: Int32
+        let channels: Int
+        let total: Int64
+        let target: Int64
+        let stride: Int
+        let sampleFormat: Int32
+        let reference: Data
+        let remote: Bool
+        let retry503: Bool
+    }
+
+    private struct R16CResult: Sendable {
+        let id: String
+        let openedNS: UInt64?
+        let closedNS: UInt64
+        let startedNS: UInt64
+        let barrierOK: Bool
+        let complete: Bool
+        let requests: Int
+        let bodyBytes: Int
+        let codes: [Int32]
+        let compared: Int
+        let mismatches: Int
+        let statuses: [Int]
+        let first: Int64?
+        let end: Int64?
+        let firstNS: UInt64?
+        let error: String?
+    }
+
+    private final class R16CResults: @unchecked Sendable {
+        private let lock = NSLock()
+        private var values: [R16CResult] = []
+        func append(_ value: R16CResult) {
+            lock.lock()
+            defer { lock.unlock() }
+            values.append(value)
+        }
+        func snapshot() -> [R16CResult] {
+            lock.lock()
+            defer { lock.unlock() }
+            return values
+        }
+    }
+
+    private static func runR16CWorker(_ input: R16CInput, gate: DispatchGroup?) -> R16CResult {
+        let started = DispatchTime.now().uptimeNanoseconds
+        var opened: UInt64?
+        var released = false
+        var barrierOK = gate == nil
+        defer {
+            if !released { gate?.leave() }
+        }
+        let endpoint = G0R15EndpointState()
+        var codes: [Int32] = []
+        var compared = 0
+        var mismatches = 0
+        var first: Int64?
+        var end: Int64?
+        var rawEnd: Int64?
+        var firstNS: UInt64?
+        var complete = false
+        var failure: String?
+        do {
+            try autoreleasepool {
+                var server: G0R15LoopbackServer?
+                if input.remote {
+                    endpoint.configure(payload: input.payload, range: true,
+                        failures: input.retry503 ? 1 : 0, failureStatus: 503)
+                    server = try G0R15LoopbackServer(endpoint: endpoint, delayMS: 5)
+                }
+                defer { server?.stop() }
+                var anchors: [Int64] = []
+                for offset: Int64 in [0, Int64(input.rate) / 8, Int64(input.rate) / 2] {
+                    let a = max(0, input.target - offset)
+                    if !anchors.contains(a) { anchors.append(a) }
+                }
+                let result = try nativePCMSequenceR9Worker(
+                    url: server?.url ?? input.url, targetTick: input.target,
+                    sessionConfiguration: .ephemeral,
+                    onOpened: {
+                        opened = DispatchTime.now().uptimeNanoseconds
+                        if let gate {
+                            released = true
+                            gate.leave()
+                            barrierOK = gate.wait(timeout: .now() + 10) == .success
+                        }
+                    },
+                    expectedRate: input.rate, expectedChannels: input.channels,
+                    retryAnchors: Array(anchors.dropFirst()),
+                    onSeek: { code, _ in codes.append(code) },
+                    onFrame: { frame in
+                        var one = NativePCMSequenceR9()
+                        try one.append(frame, expectedRate: input.rate,
+                            expectedChannels: input.channels)
+                        guard let a = one.firstTick, let b = one.endTick,
+                              b <= input.total, rawEnd == nil || rawEnd == a,
+                              one.stride == input.stride,
+                              one.sampleFormat == input.sampleFormat
+                        else { throw MatrixError.invalidFixture }
+                        rawEnd = b
+                        if b <= input.target { return }
+                        let kept = max(a, input.target)
+                        guard end == nil || end == kept
+                        else { throw MatrixError.invalidTimestamp }
+                        if first == nil {
+                            first = kept
+                            firstNS = DispatchTime.now().uptimeNanoseconds - started
+                        }
+                        end = b
+                        let actual = one.data.dropFirst(Int(kept - a) * input.stride)
+                        let expected = input.reference[(Int(kept) * input.stride)..<(Int(b) * input.stride)]
+                        compared += actual.count
+                        if !actual.elementsEqual(expected) { mismatches += 1 }
+                    }
+                )
+                let events = endpoint.snapshot()
+                let statuses = events.map { $0.status }
+                let transportOK: Bool
+                if !input.remote {
+                    transportOK = events.isEmpty
+                } else if input.retry503 {
+                    transportOK = events.count >= 2 && statuses.first == 503
+                        && events[0].requestStart == events[1].requestStart
+                        && statuses.dropFirst().allSatisfy { $0 == 206 }
+                } else {
+                    transportOK = !events.isEmpty && statuses.allSatisfy { $0 == 206 }
+                }
+                complete = result.code == 0 && barrierOK && opened != nil
+                    && first == input.target && end == input.total && rawEnd == input.total
+                    && compared == Int(input.total - input.target) * input.stride
+                    && mismatches == 0 && transportOK && !codes.isEmpty
+                    && codes.last == 0 && codes.count <= anchors.count
+                    && codes.dropLast().allSatisfy { $0 == -1 }
+            }
+        } catch {
+            failure = String(describing: error)
+        }
+        let events = endpoint.snapshot()
+        return R16CResult(id: input.id, openedNS: opened,
+            closedNS: DispatchTime.now().uptimeNanoseconds, startedNS: started,
+            barrierOK: barrierOK, complete: complete, requests: events.count,
+            bodyBytes: events.reduce(0) { $0 + $1.bytes }, codes: codes,
+            compared: compared, mismatches: mismatches, statuses: events.map { $0.status },
+            first: first, end: end, firstNS: firstNS, error: failure)
+    }
+
+    func testG0B03ConcurrentOwnerIsolationObservation() throws {
+        let specs: [(String, String, Int32, Int, Int64, Int64, Bool, Bool)] = [
+            ("local44", "025", 44100, 2, 11025, 2756, false, false),
+            ("localSurround48", "r13_surround48_s24_b4096", 48000, 6, 72000, 36000, false, false),
+            ("http96", "r13_stereo96_s24_b8192_short", 96000, 2, 24000, 1, true, true),
+            ("http44", "200", 44100, 2, 88200, 78336, true, false)
+        ]
+        var inputs: [R16CInput] = []
+        for (id, tag, rate, channels, total, target, remote, retry) in specs {
+            let local = try fixture(tag, withSeektable: false)
+            let payload = try Data(contentsOf: local)
+            let linear = try nativePCMSequenceR9(url: local, targetTick: nil,
+                expectedRate: rate, expectedChannels: channels)
+            let ref = linear.pcm
+            guard linear.code == 0, ref.firstTick == 0, ref.endTick == total,
+                  ref.channels == channels, ref.stride > 0,
+                  ref.data.count == Int(total) * ref.stride,
+                  let format = ref.sampleFormat,
+                  !payload.isEmpty, payload.count <= 8 * 1024 * 1024
+            else { throw MatrixError.invalidFixture }
+            inputs.append(R16CInput(id: id, url: local, payload: payload,
+                rate: rate, channels: channels, total: total, target: target,
+                stride: ref.stride, sampleFormat: format, reference: ref.data,
+                remote: remote, retry503: retry))
+        }
+        var attempted = 0
+        var exact = 0
+        var serialExact = 0
+        var concurrentExact = 0
+        var overlapWaves = 0
+        var errors = 0
+        var resourceMissing = 0
+
+        for wave in 0..<5 {
+            let concurrent = wave != 0
+            let before = resourceSnapshotR16()
+            let waveStarted = DispatchTime.now().uptimeNanoseconds
+            let collector = R16CResults()
+            if concurrent {
+                let gate = DispatchGroup()
+                let finished = DispatchGroup()
+                for _ in inputs { gate.enter() }
+                for input in inputs {
+                    let queue = DispatchQueue(label: "apolo.g0.r16c.\(wave).\(input.id)")
+                    queue.async(group: finished) {
+                        collector.append(Self.runR16CWorker(input, gate: gate))
+                    }
+                }
+                // Workers retain their own endpoints and contexts until they
+                // finish. Never force-free a timed-out worker's resources.
+                guard finished.wait(timeout: .now() + 60) == .success else {
+                    XCTFail("R16C owner wave timed out; no cross-thread free")
+                    return
+                }
+            } else {
+                for input in inputs {
+                    collector.append(Self.runR16CWorker(input, gate: nil))
+                }
+            }
+            let elapsed = DispatchTime.now().uptimeNanoseconds - waveStarted
+            let after = resourceSnapshotR16()
+            let results = collector.snapshot().sorted { $0.id < $1.id }
+            let opened = results.compactMap { $0.openedNS }
+            let latestOpen = opened.max()
+            let earliestClose = results.map { $0.closedNS }.min()
+            var overlap: UInt64 = 0
+            if opened.count == inputs.count, let a = latestOpen, let b = earliestClose, b > a {
+                overlap = b - a
+            }
+            let overlapOK = concurrent ? overlap > 0 : overlap == 0
+            if concurrent && overlapOK { overlapWaves += 1 }
+            var waveExact = 0
+            for result in results {
+                attempted += 1
+                if result.complete {
+                    exact += 1; waveExact += 1
+                    if concurrent { concurrentExact += 1 } else { serialExact += 1 }
+                }
+                if result.error != nil { errors += 1 }
+                print("G0_B03_R16C_CASE wave=\(wave) mode=\(concurrent ? "parallel4" : "serial") owner=\(result.id) codes=\(result.codes.map(String.init).joined(separator: ",")) first=\(result.first.map(String.init) ?? "none") end=\(result.end.map(String.init) ?? "none") comparedBytes=\(result.compared) mismatches=\(result.mismatches) requests=\(result.requests) bodyBytes=\(result.bodyBytes) statuses=\(result.statuses.map(String.init).joined(separator: ",")) barrierOK=\(result.barrierOK) complete=\(result.complete) error=\(result.error ?? "none")")
+                print("G0_B03_R16C_TIMING wave=\(wave) owner=\(result.id) openNS=\(result.openedNS.map { $0 - result.startedNS }.map(String.init) ?? "none") firstPCMNS=\(result.firstNS.map(String.init) ?? "none") totalWithCloseNS=\(result.closedNS - result.startedNS)")
+            }
+            var cpu: UInt64?
+            if let a = before.cpuUS, let b = after.cpuUS, b >= a { cpu = UInt64(b - a) }
+            if cpu == nil || before.residentBytes == nil || after.residentBytes == nil {
+                resourceMissing += 1
+            }
+            print("G0_B03_R16C_WAVE wave=\(wave) owners=\(results.count) exact=\(waveExact) overlapOK=\(overlapOK) allOwnerOverlapNS=\(overlap) totalNS=\(elapsed) processCPUUS=\(cpu.map(String.init) ?? "none") residentBefore=\(before.residentBytes.map(String.init) ?? "none") residentAfter=\(after.residentBytes.map(String.init) ?? "none") maxRSSDarwin=\(after.maxRSS.map(String.init) ?? "none")")
+            XCTAssertEqual(results.count, 4)
+            XCTAssertEqual(Set(results.map { $0.id }), Set(inputs.map { $0.id }))
+            XCTAssertTrue(overlapOK)
+        }
+        print("G0_B03_R16C_SUMMARY attempted=\(attempted) exact=\(exact) serialExact=\(serialExact) concurrentExact=\(concurrentExact) overlapWaves=\(overlapWaves) errors=\(errors) resourceMissingWaves=\(resourceMissing)")
+        XCTAssertEqual(attempted, 20)
+        XCTAssertEqual(exact, 20)
+        XCTAssertEqual(serialExact, 4)
+        XCTAssertEqual(concurrentExact, 16)
+        XCTAssertEqual(overlapWaves, 4)
+        XCTAssertEqual(errors, 0)
     }
 
     func testG0B03FLACSeek32Cases() throws {
