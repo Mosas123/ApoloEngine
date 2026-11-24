@@ -2,6 +2,7 @@ import AetherLibavcodec
 import AetherLibavformat
 import AetherLibavutil
 import AetherLibswresample
+import AudioToolbox
 import CoreMedia
 import Darwin
 import Dispatch
@@ -1129,14 +1130,14 @@ final class G0FLACSeekMatrixTests: XCTestCase {
 
         var frameCount: Int { channels > 0 ? samples.count / channels : 0 }
 
-        mutating func append(_ buffer: CMSampleBuffer) throws {
+        mutating func append(_ buffer: CMSampleBuffer, rate: Int32 = 44100) throws {
             let count = CMSampleBufferGetNumSamples(buffer)
             let seconds = CMSampleBufferGetPresentationTimeStamp(buffer).seconds
             guard count > 0, seconds.isFinite, seconds >= 0,
                   let block = CMSampleBufferGetDataBuffer(buffer)
             else { throw MatrixError.invalidTimestamp }
-            let tick = Int64((seconds * 44100).rounded())
-            guard abs(seconds * 44100 - Double(tick)) < 0.001,
+            let tick = Int64((seconds * Double(rate)).rounded())
+            guard abs(seconds * Double(rate) - Double(tick)) < 0.001,
                   nextTick == nil || nextTick == tick
             else { throw MatrixError.invalidTimestamp }
 
@@ -1604,7 +1605,7 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     /// Fixed scope: the R9 S16 packed stereo, 44.1-kHz fixtures.
     private func makePCMBufferR10(
         values: [Float], frames: Int, tick: Int64,
-        format: CMFormatDescription
+        format: CMFormatDescription, rate: Int32 = 44100
     ) throws -> CMSampleBuffer {
         let bytes = values.count * MemoryLayout<Float>.stride
         var block: CMBlockBuffer?
@@ -1625,8 +1626,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         }
         guard copy == 0 else { throw MatrixError.invalidFixture }
         var timing = CMSampleTimingInfo(
-            duration: CMTime(value: 1, timescale: 44100),
-            presentationTimeStamp: CMTime(value: tick, timescale: 44100),
+            duration: CMTime(value: 1, timescale: rate),
+            presentationTimeStamp: CMTime(value: tick, timescale: rate),
             decodeTimeStamp: .invalid
         )
         var buffer: CMSampleBuffer?
@@ -2363,6 +2364,284 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         )
         XCTAssertEqual(attempted, 120)
         XCTAssertEqual(setupErrors, 0, "R13 observation incomplete")
+        XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
+    }
+
+    /// R14 joins R12/R13 sequential recovery to R10's sample-granular
+    /// native cut, real SWR and CoreMedia. Same-rate packed S16/S32 FLAC
+    /// only. The linear AudioDecoder reference is independent of seek.
+    /// Compare every channel, including the actual seek ramp.
+    func testG0B03ExpandedCoreMediaRecoveryObservation() throws {
+        let inputs: [(tag: String, rate: Int32, channels: Int,
+                      bits: Int, block: Int64, samples: Int64, control: Int64?)] = [
+            ("025", 44100, 2, 16, 4608, 11025, 2756),
+            ("050", 44100, 2, 16, 4608, 22050, 11025),
+            ("200", 44100, 2, 16, 4608, 88200, 79380),
+            ("r13_mono48_s16_b1024", 48000, 1, 16, 1024, 24000, nil),
+            ("r13_surround48_s24_b4096", 48000, 6, 24, 4096, 72000, nil),
+            ("r13_stereo96_s24_b4096", 96000, 2, 24, 4096, 192000, nil),
+            ("r13_stereo192_s24_b8192", 192000, 2, 24, 8192, 384000, nil),
+            ("r13_stereo44_s16_b4608_long", 44100, 2, 16, 4608, 1323000, nil),
+            ("r13_stereo96_s24_b8192_short", 96000, 2, 24, 8192, 24000, nil)
+        ]
+        var attempted = 0
+        var exact = 0
+        var eofExact = 0
+        var rejected = 0
+        var incomplete = 0
+        var setupErrors = 0
+        for item in inputs {
+            let targets: [Int64]
+            if let control = item.control {
+                // All six original direct-seek failures.
+                targets = [control]
+            } else {
+                targets = [0, 1, item.block - 1, item.block, item.block + 1,
+                           item.samples / 2, item.samples * 9 / 10,
+                           item.samples - 2, item.samples - 1, item.samples]
+            }
+            let fadeFrames = SeekTransientRamp.frameCount(sampleRate: item.rate)
+            let inputFormat = item.bits == 16 ? AV_SAMPLE_FMT_S16 : AV_SAMPLE_FMT_S32
+            let width = item.bits == 16 ? 2 : 4
+            let expectedTag: AudioChannelLayoutTag
+            switch item.channels {
+            case 1: expectedTag = kAudioChannelLayoutTag_Mono
+            case 2: expectedTag = kAudioChannelLayoutTag_Stereo
+            case 6: expectedTag = kAudioChannelLayoutTag_MPEG_5_1_A
+            default: throw MatrixError.invalidFixture
+            }
+            for table in [false, true] {
+                let url = try fixture(item.tag, withSeektable: table)
+                let linear = AudioDecoder()
+                linear.limiterEnabled = false
+                try linear.adopt(OpenedSource.open(url: url))
+                defer { linear.close() }
+                guard let firstBuffer = try linear.readNextBuffer(),
+                      let format = CMSampleBufferGetFormatDescription(firstBuffer),
+                      let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
+                else { throw MatrixError.missingPCM }
+                var layoutSize = 0
+                guard let channelLayout = CMAudioFormatDescriptionGetChannelLayout(
+                    format, sizeOut: &layoutSize
+                ), layoutSize >= MemoryLayout<AudioChannelLayout>.size,
+                      channelLayout.pointee.mChannelLayoutTag == expectedTag,
+                      asbd.pointee.mSampleRate == Double(item.rate),
+                      asbd.pointee.mFormatID == kAudioFormatLinearPCM,
+                      asbd.pointee.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+                      asbd.pointee.mFormatFlags & kAudioFormatFlagIsPacked != 0,
+                      asbd.pointee.mChannelsPerFrame == UInt32(item.channels),
+                      asbd.pointee.mBytesPerFrame == UInt32(item.channels * 4),
+                      asbd.pointee.mBitsPerChannel == 32
+                else { throw MatrixError.invalidFixture }
+                var reference = PCMSequenceR8()
+                try reference.append(firstBuffer, rate: item.rate)
+                for _ in 0..<2048 {
+                    guard let buffer = try linear.readNextBuffer() else { break }
+                    try reference.append(buffer, rate: item.rate)
+                }
+                guard reference.firstTick == 0, reference.nextTick == item.samples,
+                      Int64(reference.frameCount) == item.samples,
+                      reference.channels == item.channels
+                else { throw MatrixError.invalidFixture }
+                linear.close()
+                print(
+                    "G0_B03_R14_REFERENCE tag=\(item.tag) table=\(table) "
+                        + "rate=\(item.rate) channels=\(item.channels) bits=\(item.bits) "
+                        + "frames=\(item.samples) layoutTag=\(expectedTag) rampFrames=\(fadeFrames)"
+                )
+                for target in targets {
+                    attempted += 1
+                    let label = "tag=\(item.tag) table=\(table) targetTick=\(target)"
+                    var anchors: [Int64] = []
+                    for offset: Int64 in [0, Int64(item.rate) / 8, Int64(item.rate) / 2] {
+                        let a = max(0, target - offset)
+                        if !anchors.contains(a) { anchors.append(a) }
+                    }
+                    var swr: OpaquePointer?
+                    defer { swr_free(&swr) }
+                    var codes: [Int32] = []
+                    var rawFirst: Int64?
+                    var rawEnd: Int64?
+                    var firstTick: Int64?
+                    var endTick: Int64?
+                    var rampConsumed = 0
+                    var framesEmitted = 0
+                    var outputBuffers = 0
+                    var discardedSamples = 0
+                    var peakBufferFrames = 0
+                    var differentValues = 0
+                    var maxError: Float = 0
+                    var channelErrors = [Float](repeating: 0, count: item.channels)
+                    do {
+                        let result = try nativePCMSequenceR9(
+                            url: url, targetTick: target,
+                            expectedRate: item.rate, expectedChannels: item.channels,
+                            retryAnchors: Array(anchors.dropFirst()),
+                            onSeek: { code, _ in codes.append(code) },
+                            onFrame: { frame in
+                                let value = frame.pointee
+                                let start = value.pts
+                                let count = Int(value.nb_samples)
+                                guard start >= 0, count > 0,
+                                      value.sample_rate == item.rate,
+                                      Int(value.ch_layout.nb_channels) == item.channels,
+                                      value.format == inputFormat.rawValue,
+                                      let planes = value.extended_data,
+                                      let plane = planes[0]
+                                else { throw MatrixError.invalidFixture }
+                                let end = start + Int64(count)
+                                guard end <= item.samples,
+                                      rawEnd == nil || rawEnd == start
+                                else { throw MatrixError.invalidTimestamp }
+                                if rawFirst == nil { rawFirst = start }
+                                rawEnd = end
+                                if end <= target {
+                                    discardedSamples += count
+                                    return
+                                }
+                                let keptStart = max(start, target)
+                                let skip = Int(keptStart - start)
+                                let kept = count - skip
+                                discardedSamples += skip
+                                guard kept > 0, endTick == nil || endTick == keptStart
+                                else { throw MatrixError.invalidTimestamp }
+                                if swr == nil {
+                                    var inLayout = AVChannelLayout()
+                                    var outLayout = AVChannelLayout()
+                                    defer {
+                                        av_channel_layout_uninit(&inLayout)
+                                        av_channel_layout_uninit(&outLayout)
+                                    }
+                                    guard av_channel_layout_copy(&inLayout, &frame.pointee.ch_layout) >= 0
+                                    else { throw MatrixError.invalidFixture }
+                                    AudioDecoder.makeResamplerOutputLayout(
+                                        channels: Int32(item.channels), into: &outLayout
+                                    )
+                                    let rc = swr_alloc_set_opts2(
+                                        &swr, &outLayout, AV_SAMPLE_FMT_FLT, item.rate,
+                                        &inLayout, inputFormat, item.rate, 0, nil
+                                    )
+                                    guard rc >= 0, let swr, swr_init(swr) >= 0
+                                    else { throw MatrixError.invalidFixture }
+                                }
+                                guard let converter = swr else {
+                                    throw MatrixError.invalidFixture
+                                }
+                                let capacity = Int(swr_get_out_samples(converter, Int32(kept)))
+                                guard capacity >= kept else { throw MatrixError.invalidFixture }
+                                var floats = [Float](repeating: 0, count: capacity * item.channels)
+                                var input: UnsafePointer<UInt8>? = UnsafePointer(
+                                    plane.advanced(by: skip * item.channels * width)
+                                )
+                                let converted = floats.withUnsafeMutableBytes { bytes in
+                                    var output: UnsafeMutablePointer<UInt8>? =
+                                        bytes.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                                    return withUnsafeMutablePointer(to: &output) { out in
+                                        withUnsafePointer(to: &input) { inp in
+                                            swr_convert(converter, out, Int32(capacity), inp, Int32(kept))
+                                        }
+                                    }
+                                }
+                                guard converted == Int32(kept),
+                                      swr_get_delay(converter, Int64(item.rate)) == 0
+                                else { throw MatrixError.invalidFixture }
+                                floats.removeLast(floats.count - kept * item.channels)
+                                floats.withUnsafeMutableBufferPointer { samples in
+                                    SeekTransientRamp.apply(
+                                        interleaved: samples.baseAddress!, frames: kept,
+                                        channels: item.channels, fadeFrames: fadeFrames,
+                                        consumedFrames: &rampConsumed
+                                    )
+                                }
+                                let buffer = try self.makePCMBufferR10(
+                                    values: floats, frames: kept, tick: keptStart,
+                                    format: format, rate: item.rate
+                                )
+                                var observed = PCMSequenceR8()
+                                try observed.append(buffer, rate: item.rate)
+                                guard observed.firstTick == keptStart,
+                                      observed.nextTick == end,
+                                      observed.channels == item.channels,
+                                      observed.frameCount == kept,
+                                      CMTimeCompare(
+                                          CMSampleBufferGetPresentationTimeStamp(buffer),
+                                          CMTime(value: keptStart, timescale: item.rate)
+                                      ) == 0,
+                                      CMTimeCompare(
+                                          CMSampleBufferGetDuration(buffer),
+                                          CMTime(value: Int64(kept), timescale: item.rate)
+                                      ) == 0
+                                else { throw MatrixError.invalidTimestamp }
+                                for i in 0..<observed.samples.count {
+                                    let absolute = Int(keptStart) * item.channels + i
+                                    let rampIndex = framesEmitted + i / item.channels
+                                    let gain: Float = rampIndex < fadeFrames
+                                        ? Float(rampIndex + 1) / Float(fadeFrames) : 1
+                                    let wanted = reference.samples[absolute] * gain
+                                    let error = abs(observed.samples[i] - wanted)
+                                    maxError = max(maxError, error)
+                                    let channel = i % item.channels
+                                    channelErrors[channel] = max(channelErrors[channel], error)
+                                    if error > 0.000001 { differentValues += 1 }
+                                }
+                                if firstTick == nil { firstTick = keptStart }
+                                endTick = end
+                                framesEmitted += kept
+                                outputBuffers += 1
+                                peakBufferFrames = max(peakBufferFrames, capacity)
+                            }
+                        )
+                        guard !codes.isEmpty, codes.count <= anchors.count,
+                              codes.last == result.code,
+                              codes.dropLast().allSatisfy({ $0 == -1 })
+                        else { throw MatrixError.invalidFixture }
+                        let path = "anchors=\(anchors.prefix(codes.count).map(String.init).joined(separator: ",")) "
+                            + "codes=\(codes.map(String.init).joined(separator: ","))"
+                        if result.code < 0 {
+                            rejected += 1
+                            print("G0_B03_R14_CASE \(label) \(path) finalCode=\(result.code)")
+                            continue
+                        }
+                        let expectedFrames = Int(item.samples - target)
+                        let full = target < item.samples
+                            && firstTick == target && endTick == item.samples
+                            && framesEmitted == expectedFrames && differentValues == 0
+                            && rampConsumed == min(fadeFrames, expectedFrames)
+                        let emptyEOF = target == item.samples
+                            && rawFirst != nil && rawEnd == item.samples
+                            && firstTick == nil && endTick == nil
+                            && framesEmitted == 0 && outputBuffers == 0
+                            && rampConsumed == 0 && differentValues == 0
+                        if full { exact += 1 }
+                        else if emptyEOF { eofExact += 1 }
+                        else { incomplete += 1 }
+                        let perChannel = channelErrors.map { String($0) }.joined(separator: ",")
+                        print(
+                            "G0_B03_R14_CASE \(label) \(path) finalCode=0 "
+                                + "rawFirst=\(rawFirst.map(String.init) ?? "none") "
+                                + "rawEnd=\(rawEnd.map(String.init) ?? "none") "
+                                + "firstTick=\(firstTick.map(String.init) ?? "none") "
+                                + "endTick=\(endTick.map(String.init) ?? "none") "
+                                + "frames=\(framesEmitted) expectedFrames=\(expectedFrames) "
+                                + "buffers=\(outputBuffers) discardedSamples=\(discardedSamples) "
+                                + "peakBufferFrames=\(peakBufferFrames) rampConsumed=\(rampConsumed) "
+                                + "differentValues=\(differentValues) maxAbsError=\(maxError) "
+                                + "channelMaxErrors=\(perChannel) complete=\(full) eofExact=\(emptyEOF)"
+                        )
+                    } catch {
+                        setupErrors += 1
+                        print("G0_B03_R14_CASE \(label) setupError=\(error)")
+                    }
+                }
+            }
+        }
+        print(
+            "G0_B03_R14_SUMMARY attempted=\(attempted) exact=\(exact) "
+                + "eofExact=\(eofExact) rejected=\(rejected) "
+                + "incomplete=\(incomplete) setupErrors=\(setupErrors)"
+        )
+        XCTAssertEqual(attempted, 126)
+        XCTAssertEqual(setupErrors, 0, "R14 observation incomplete")
         XCTAssertEqual(exact + eofExact + rejected + incomplete, attempted)
     }
 
