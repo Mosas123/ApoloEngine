@@ -3125,6 +3125,164 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(exact + rejected + incomplete + errors, attempted)
     }
 
+    /// R15C: observe cancellation and terminal states over actual loopback
+    /// HTTP. Every AVIO context is created, read and freed on its own serial
+    /// worker. The control thread may cancel the live token, never AVIO.
+    /// A queued marker models the finite worker's control-queue dependency;
+    /// it is NOT a measurement of the actual host Stop/Next UI.
+    func testG0B03TransportCancellationObservation() throws {
+        let payload = Data([11, 22, 33, 44, 55, 66, 77, 88])
+        let scenarios = ["finiteDelayed", "finiteEOF", "finite403",
+                         "liveCancel", "livePreCancel", "liveEnd"]
+        var attempted = 0
+        var correct = 0
+        var errors = 0
+        for name in scenarios {
+            attempted += 1
+            let live = name.hasPrefix("live")
+            let delayed = name == "finiteDelayed" || name == "liveCancel"
+            let preCancelled = name == "livePreCancel"
+            let endpoint = G0R15EndpointState()
+            endpoint.configure(payload: payload, range: !live,
+                               failures: name == "finite403" ? 1 : 0, failureStatus: 403)
+            do {
+                let server = try G0R15LoopbackServer(endpoint: endpoint, delayMS: delayed ? 1500 : 0)
+                defer { server.stop() }
+                let token = LiveStreamCancellation()
+                if preCancelled { token.cancel() }
+                let worker = DispatchQueue(label: "apolo.g0.r15c.worker")
+                let result = G0R15CResult()
+                let done = DispatchSemaphore(value: 0)
+                let marker = DispatchSemaphore(value: 0)
+                let url = server.url
+                worker.async {
+                    defer { done.signal() }
+                    // Keep server alive even if a diagnostic wait times out.
+                    defer { withExtendedLifetime(server) {} }
+                    let config = URLSessionConfiguration.ephemeral
+                    let transport: any AudioTransport
+                    let failed: () -> Bool
+                    if live {
+                        let stream = LiveHTTPStream(url: url, headers: [:], configuration: config)
+                        token.register(stream)
+                        guard let opened = LiveHTTPTransport(stream: stream) else { return }
+                        transport = opened
+                        failed = { stream.hasError }
+                    } else {
+                        let stream = HTTPStream(url: url, headers: [:], configuration: config)
+                        guard let opened = HTTPTransport(stream: stream) else { return }
+                        transport = opened
+                        failed = { stream.hasError }
+                    }
+                    // Only this worker owns the FFmpeg pointer.
+                    defer { transport.close() }
+                    guard let context = transport.context else { return }
+                    var buffer = [UInt8](repeating: 0, count: payload.count)
+                    let first = buffer.withUnsafeMutableBufferPointer {
+                        avio_read(context, $0.baseAddress!, Int32(payload.count))
+                    }
+                    var byte: UInt8 = 0
+                    let next = avio_read(context, &byte, 1)
+                    result.store(.init(first: first, next: next, hasError: failed(),
+                                       bytesExact: Data(buffer) == payload,
+                                       finishedNS: DispatchTime.now().uptimeNanoseconds))
+                }
+
+                var requestSeen = false
+                var pendingAt200ms: Bool?
+                var markerNS: UInt64?
+                var commandNS: UInt64?
+                if delayed {
+                    // Server records the request BEFORE scheduling its delayed
+                    // response. No arbitrary sleep to guess read entry.
+                    let deadline = DispatchTime.now() + .seconds(4)
+                    while endpoint.snapshot().isEmpty && DispatchTime.now() < deadline {
+                        Thread.sleep(forTimeInterval: 0.005)
+                    }
+                    requestSeen = !endpoint.snapshot().isEmpty
+                    let issued = DispatchTime.now().uptimeNanoseconds
+                    commandNS = issued
+                    if live {
+                        token.cancel()
+                    } else {
+                        worker.async { marker.signal() }
+                        let early = marker.wait(timeout: .now() + .milliseconds(200)) == .success
+                        pendingAt200ms = !early
+                        if early || marker.wait(timeout: .now() + .seconds(8)) == .success {
+                            markerNS = DispatchTime.now().uptimeNanoseconds - issued
+                        }
+                    }
+                }
+                let completed = done.wait(timeout: .now() + .seconds(8)) == .success
+                guard completed, let value = result.snapshot() else {
+                    // No cross-thread free; worker retains its own resources.
+                    token.cancel()
+                    errors += 1
+                    print("G0_B03_R15C_CASE scenario=\(name) setupOrWaitError=true requests=\(endpoint.snapshot().count)")
+                    continue
+                }
+                let events = endpoint.snapshot()
+                let expectedEOF: Int32 = -541_478_725
+                let valid: Bool
+                switch name {
+                case "finiteDelayed":
+                    valid = requestSeen && pendingAt200ms == true && markerNS != nil
+                        && events.count == 1 && events.first?.status == 206
+                        && value.first == 8 && value.next == expectedEOF
+                        && value.bytesExact && !value.hasError
+                case "finiteEOF":
+                    valid = events.count == 1 && events.first?.status == 206
+                        && value.first == 8 && value.next == expectedEOF
+                        && value.bytesExact && !value.hasError
+                case "finite403":
+                    valid = events.count == 1 && events.first?.status == 403
+                        && value.first == -5 && value.next == -5 && value.hasError
+                case "liveCancel":
+                    valid = requestSeen && events.count == 1 && events.first?.status == 200
+                        && value.first == -5 && value.next == -5 && !value.hasError
+                case "livePreCancel":
+                    valid = events.isEmpty && value.first == -5 && value.next == -5 && !value.hasError
+                case "liveEnd":
+                    valid = events.count == 1 && events.first?.status == 200
+                        && value.first == 8 && value.next == -5
+                        && value.bytesExact && value.hasError
+                default:
+                    valid = false
+                }
+                if valid { correct += 1 }
+                let pending = pendingAt200ms.map { String($0) } ?? "none"
+                let statuses = events.map { String($0.status) }.joined(separator: ",")
+                print(
+                    "G0_B03_R15C_CASE scenario=\(name) requests=\(events.count) "
+                        + "statuses=\(statuses.isEmpty ? "none" : statuses) "
+                        + "first=\(value.first) next=\(value.next) bytesExact=\(value.bytesExact) "
+                        + "hasError=\(value.hasError) requestSeen=\(requestSeen) "
+                        + "markerPending200ms=\(pending) correct=\(valid)"
+                )
+                if let commandNS {
+                    let elapsed = value.finishedNS >= commandNS ? value.finishedNS - commandNS : 0
+                    print("G0_B03_R15C_TIMING scenario=\(name) readFinishedAfterCommandNS=\(elapsed) markerAfterCommandNS=\(markerNS.map(String.init) ?? "none")")
+                }
+            } catch {
+                errors += 1
+                print("G0_B03_R15C_CASE scenario=\(name) setupError=\(error)")
+            }
+        }
+        // This checks only the real epoch predicate, not host/renderer/UI.
+        let staleRejected = !ApoloEngine.acceptsDecoderCallback(
+            callbackEpoch: 7, engineEpoch: 8, route: .libavcodec)
+        let currentAccepted = ApoloEngine.acceptsDecoderCallback(
+            callbackEpoch: 8, engineEpoch: 8, route: .libavcodec)
+        let nativeRejected = !ApoloEngine.acceptsDecoderCallback(
+            callbackEpoch: 8, engineEpoch: 8, route: .avPlayer)
+        print("G0_B03_R15C_EPOCH staleRejected=\(staleRejected) currentAccepted=\(currentAccepted) nativeRejected=\(nativeRejected)")
+        print("G0_B03_R15C_SUMMARY attempted=\(attempted) correct=\(correct) errors=\(errors)")
+        XCTAssertEqual(attempted, 6)
+        XCTAssertEqual(errors, 0)
+        XCTAssertTrue(staleRejected && currentAccepted && nativeRejected)
+        // Classify unexpected terminal behavior as evidence, not a fix.
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
@@ -3401,5 +3559,28 @@ private final class G0R15LoopbackServer: @unchecked Sendable {
                 Self.receive(connection, endpoint: endpoint, delayMS: delayMS, queue: queue, accumulated: header)
             }
         }
+    }
+}
+
+
+private final class G0R15CResult: @unchecked Sendable {
+    struct Value {
+        let first: Int32
+        let next: Int32
+        let hasError: Bool
+        let bytesExact: Bool
+        let finishedNS: UInt64
+    }
+    private let lock = NSLock()
+    private var value: Value?
+    func store(_ value: Value) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+    func snapshot() -> Value? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
