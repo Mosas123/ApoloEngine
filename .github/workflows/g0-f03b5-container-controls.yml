@@ -1,0 +1,206 @@
+name: G0 F03B.5 container accounting controls
+
+on:
+  pull_request:
+    branches: [diag/g0-lab-benchmarks-20261123]
+    paths: [".github/workflows/g0-f03b5-container-controls.yml"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  host:
+    if: github.head_ref == 'diag/f03b4-host-alignment-20261124'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact original diagnostic commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 75cba3068bb7a31420b66c251a805200aac9284d
+          persist-credentials: false
+      - name: Retrieve exact F03B.1 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f03b-fixtures-45451919833
+          run-id: 45451919833
+          github-token: ${{ github.token }}
+          path: .
+      - name: Verify original fixture bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --strict -c g0-f03b-fixtures-sha256.txt
+          sha256sum --strict -c <<'SHA256'
+          32d9d4ddf7fb5c0d5675d98ad5c69973b030debe6cc6b6143d2a9d4d47374168  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.mp3
+          8a52187554de34d23837eb19daff605a61bf2d239aad39d40db07d87851797e2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_cbr_44100_2_48123.f32
+          e9913e24c8576258ba4e714d29a67410d80d8ab5b5b5f13007de4236a75b66f2  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.mp3
+          4e9b38fb54bf1019463f2da2c611751749709652fb7fa97aa2d93881e4afe7ca  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_vbr_48000_1_48017.f32
+          1b439d875bde4cc4fd2528458ce19d582c8d0d0a5ffa4a0a13bc94ee208e40dd  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.mp3
+          8949413c93eae20fd82d87f25b627b9843c6bd975462d5a248d0718ed452c50c  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_mp3_no_xing_44100_2_48019.f32
+          617acd252d9d9d955ffc5a0f5a974768487cae68a612827c61b332081e4ef298  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.ogg
+          0e9881018a4cc5edd52e206396fd35b4ad940d7655e6428173e999f74e3586ba  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q5_44100_2_48123.f32
+          fe5da5c7e078d7c9764017508e35345968e76002f442f1b3e95c12034753da23  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.ogg
+          1cf5260d1502c6692927f67cf9fcf5b5aa80ef730b4a5f97d6b8ecfca6768f70  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q4_48000_1_48017.f32
+          7ee4178bc126c4342545a6a7c978da1bcaed30f38d55c4926b739d4eb385aed9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.ogg
+          2ed1fcc78a1798779a89ba4cd2d93d21c505e6a0006f2406fda464afea37b9b4  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_vorbis_q6_48000_2_48239.f32
+          3d1904be1e11bc74562133aa04fe63ebc8e60750456acc3727ee4012a15e0a99  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.mpc
+          d512ae61fae214f198512b80f8e5777a9a7704525b442fbc5008fe5c2ee15b68  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_44100_2_48123.f32
+          aaefac307e26c20bb07d5917b3b5b79a113bad632518cac758b9951a8ab40009  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.mpc
+          f9dc3c6b9bcc2b1bf3aeb4892e43e0b8f511c3c52cc7233c9e71c983d911a5d9  Tests/ApoloEngineTests/Fixtures/G0F03B/f03b_musepack8_sv8_48000_2_48017.f32
+          SHA256
+      - name: Install host tools from Ubuntu signed repositories
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg vorbis-tools musepack-tools
+          dpkg-query -W ffmpeg vorbis-tools musepack-tools
+          command -v ffprobe
+      - name: Observe Ogg page controls and Musepack SV8 header accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee g0-f03b5.log
+          import hashlib,json,math,pathlib,shutil,struct,subprocess,sys,tempfile,wave
+          sys.path.insert(0,"scripts")
+          from g0_generate_lossy_matrix import source_pcm
+          root=pathlib.Path("Tests/ApoloEngineTests/Fixtures/G0F03B")
+          out=pathlib.Path("g0-f03b5")
+          out.mkdir(exist_ok=False)
+          entries=json.loads((root/"manifest.json").read_text())["files"]
+          assert len(entries)==8
+          def sha(data): return hashlib.sha256(data).hexdigest()
+          def run(args): return subprocess.run(args,check=True,capture_output=True,timeout=60).stdout
+          def probe(p):
+              return json.loads(run(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-show_packets","-show_data_hash","sha256","-of","json",str(p)]))
+          def pages(data):
+              rows=[]; pos=0
+              while pos<len(data):
+                  assert len(rows)<8192 and pos+27<=len(data) and data[pos:pos+4]==b"OggS" and data[pos+4]==0
+                  flags=data[pos+5]; gp,serial,seq=struct.unpack_from("<qII",data,pos+6)
+                  n=data[pos+26]; base=pos+27
+                  assert base+n<=len(data)
+                  end=base+n+sum(data[base:base+n])
+                  assert pos<end<=len(data)
+                  rows.append({"flags":flags,"granule":gp,"sequence":seq,"segments":n})
+                  pos=end
+              return rows
+          # https://mutagen-specs.readthedocs.io/en/latest/mpc/sv8.html
+          def varint(data,pos,end):
+              v=0
+              for _ in range(9):
+                  assert pos<end
+                  b=data[pos];pos+=1
+                  v=(v<<7)|(b&127)
+                  if not b&128:return v,pos
+              raise ValueError("SV8 varint exceeds bound")
+          def sv8(data):
+              assert data[:4]==b"MPCK"
+              pos=4; chunks=[]; header=None
+              while pos<len(data):
+                  assert len(chunks)<8192 and pos+3<=len(data)
+                  key=data[pos:pos+2].decode("ascii")
+                  size,p=varint(data,pos+2,len(data)); end=pos+size
+                  assert p<=end<=len(data) and end>pos
+                  chunks.append({"key":key,"size":size,"payload_bytes":end-p})
+                  if key=="SH":
+                      assert header is None and p+7<=end and data[p+4]==8
+                      count,q=varint(data,p+5,end); silence,q=varint(data,q,end)
+                      assert q+2<=end and 0<=silence<=count
+                      idx=data[q]>>5; assert idx<4
+                      header={"sample_count":count,"beginning_silence":silence,"declared_output":count-silence,
+                              "rate":[44100,48000,37800,32000][idx],"channels":(data[q+1]>>4)+1,
+                              "block_power_bits":data[q+1]&7,"version":data[p+4]}
+                  pos=end
+                  if key=="SE":break
+              assert header and chunks[-1]["key"]=="SE"
+              return {"header":header,"chunks":chunks,"trailing_bytes":len(data)-pos}
+          assert varint(bytes([0x81,0]),0,2)==(128,2)
+          assert varint(bytes([0]),0,1)==(0,1)
+          def observe(e,p):
+              info=probe(p); st=info["streams"][0]; pk=info["packets"]
+              ch=e["channels"];rate=e["rate"]
+              assert len(info["streams"])==1 and st["codec_name"]==e["codec"]
+              assert int(st["channels"])==ch and int(st["sample_rate"])==rate and 0<len(pk)<8192
+              raw=run(["ffmpeg","-v","error","-i",str(p),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le","-"])
+              assert raw and len(raw)%(ch*4)==0
+              assert all(math.isfinite(x[0]) for x in struct.iter_unpack("<f",raw))
+              with tempfile.TemporaryDirectory() as tmp:
+                  wav=pathlib.Path(tmp)/"independent.wav"
+                  cmd=["oggdec","-Q","-o",str(wav),str(p)] if e["codec"]=="vorbis" else ["mpcdec",str(p),str(wav)]
+                  run(cmd)
+                  with wave.open(str(wav),"rb") as w:
+                      assert w.getnchannels()==ch and w.getframerate()==rate and w.getsampwidth()==2
+                      independent=w.getnframes()
+                      assert len(w.readframes(independent))==independent*ch*2
+              hashes=[v["data_hash"] for v in pk]
+              side=[{"index":i,"pts":v.get("pts"),**s} for i,v in enumerate(pk) for s in v.get("side_data_list",[]) if s.get("side_data_type")=="Skip Samples"]
+              frames=len(raw)//(ch*4)
+              rec={"file":p.name,"encoded_sha256":sha(p.read_bytes()),"host_frames":frames,
+                   "host_pcm_sha256":sha(raw),"independent_frames":independent,
+                   "packet_count":len(pk),"packet_payload_hashes":hashes,"extradata_hash":st.get("extradata_hash"),
+                   "time_base":st.get("time_base"),"start_pts":st.get("start_pts"),"duration_ts":st.get("duration_ts"),
+                   "first_packet":{k:pk[0].get(k) for k in ("pts","duration")},"last_packet":{k:pk[-1].get(k) for k in ("pts","duration")},
+                   "skip_discard":side}
+              rec["container"]=pages(p.read_bytes()) if e["codec"]=="vorbis" else sv8(p.read_bytes())
+              return rec
+          records=[]; paired=0; isolated=0
+          with tempfile.TemporaryDirectory() as scratch:
+              work=pathlib.Path(scratch)
+              for e in entries:
+                  if e["codec"] not in ("vorbis","musepack8"):continue
+                  p=root/e["file"];src=source_pcm(e["rate"],e["channels"],e["source_frames"])
+                  assert sha(src)==e["source_pcm_sha256"] and sha(p.read_bytes())==e["encoded_sha256"]
+                  original=observe(e,p)
+                  original["matches_pinned_host_pcm"]=original["host_pcm_sha256"]==e["reference_sha256"]
+                  original["role"]="original"
+                  records.append({"fixture":e["fixture"],**original})
+                  if e["codec"]=="vorbis":
+                      wav=work/"source.wav"
+                      with wave.open(str(wav),"wb") as w:
+                          w.setnchannels(e["channels"]);w.setsampwidth(2);w.setframerate(e["rate"]);w.writeframes(src)
+                      for us in (100000,2000000):
+                          control=work/(e["fixture"]+"-page-"+str(us)+".ogg")
+                          run(["ffmpeg","-v","error","-y","-i",str(wav),*e["options"],"-map_metadata","-1","-page_duration",str(us),str(control)])
+                          rec=observe(e,control)
+                          equal=rec["packet_payload_hashes"]==original["packet_payload_hashes"] and rec["extradata_hash"] is not None and rec["extradata_hash"]==original["extradata_hash"]
+                          granule=rec["container"][-1]["granule"]==original["container"][-1]["granule"]
+                          different_pages=[(p["granule"],p["segments"]) for p in rec["container"]]!=[(p["granule"],p["segments"]) for p in original["container"]]
+                          paired+=1
+                          isolated+=int(equal and granule and different_pages)
+                          rec.update({"role":"page_control","page_duration_us":us,"same_packet_payloads_and_headers":equal,"same_eos_granule":granule,"different_page_layout":different_pages})
+                          records.append({"fixture":e["fixture"],**rec})
+                          shutil.copyfile(control,out/control.name)
+                  else:
+                      n=e["source_frames"]+115200
+                      wav=work/"source-long.wav"
+                      long_src=source_pcm(e["rate"],e["channels"],n)
+                      with wave.open(str(wav),"wb") as w:
+                          w.setnchannels(e["channels"]);w.setsampwidth(2);w.setframerate(e["rate"]);w.writeframes(long_src)
+                      control=work/(e["fixture"]+"-long.mpc")
+                      run(["mpcenc",str(wav),str(control)])
+                      rec=observe(e,control)
+                      rec.update({"role":"long_control","source_frames":n,"source_sha256":sha(long_src)})
+                      records.append({"fixture":e["fixture"],**rec})
+                      shutil.copyfile(control,out/control.name)
+          for rec in records:
+              summary={k:v for k,v in rec.items() if k!="packet_payload_hashes"}
+              print("G0_F03B5_CASE "+json.dumps(summary,sort_keys=True),flush=True)
+          (out/"summary.json").write_text(json.dumps(records,indent=2,sort_keys=True))
+          print(f"G0_F03B5_SUMMARY observations={len(records)} pageControls={paired} isolatedPageControls={isolated} sv8Controls=2; no production changes")
+          assert len(records)==13 and paired==6
+          assert isolated>=1, "No page-only comparison isolated; preserve evidence."
+          PY
+      - name: Preserve original observations and new controls
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03b5-controls-${{ github.run_id }}
+          path: |
+            g0-f03b5/
+            g0-f03b5.log
+            g0-f03b-fixtures-sha256.txt
+          if-no-files-found: warn
+          retention-days: 14
