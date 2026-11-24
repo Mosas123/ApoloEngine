@@ -5118,7 +5118,9 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     private func rawF03A(url: URL, codecName: String, rate: Int32,
                          channels: Int, maxFrames: Int, traceMode: String? = nil,
                          setPacketTimeBase: Bool = false) throws
-        -> (values: [Float], first: Int64?, end: Int64?, missingPTS: Int, discontinuities: Int) {
+        -> (values: [Float], first: Int64?, end: Int64?, missingPTS: Int,
+            discontinuities: Int, packets: Int, decodedFrames: Int,
+            maxCursorError: Int64, maxStepError: Int64, timeBaseNum: Int32, timeBaseDen: Int32) {
         func trace(_ message: @autoclosure () -> String) {
             if let traceMode {
                 print("G0_F03A1_TRACE fixture=\(url.lastPathComponent) mode=\(traceMode) \(message())")
@@ -5156,6 +5158,8 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         var discontinuities = 0
         var packets = 0
         var frames = 0
+        var maxCursorError: Int64 = 0
+        var maxStepError: Int64 = 0
         func drain() throws -> Int32 {
             for _ in 0..<2048 {
                 let rc = avcodec_receive_frame(decoder, frame)
@@ -5177,8 +5181,11 @@ final class G0FLACSeekMatrixTests: XCTestCase {
                     if let old = end { end = old + Int64(n) }
                 } else {
                     let tick = av_rescale_q(v.pts, stream.pointee.time_base, AVRational(num: 1, den: rate))
+                    let cursor = Int64(output.count / channels)
+                    maxCursorError = max(maxCursorError, abs(tick - cursor))
                     if let old = end, old != tick {
                         discontinuities += 1
+                        maxStepError = max(maxStepError, abs(tick - old))
                         trace("stage=discontinuity expected=\(old) actual=\(tick) delta=\(tick - old)")
                     }
                     if first == nil { first = tick }
@@ -5201,7 +5208,9 @@ final class G0FLACSeekMatrixTests: XCTestCase {
             if rc == eof {
                 let sent = avcodec_send_packet(decoder, nil)
                 guard sent >= 0 || sent == eof, try drain() == eof else { throw MatrixError.invalidFixture }
-                return (output, first, end, missingPTS, discontinuities)
+                return (output, first, end, missingPTS, discontinuities, packets, frames,
+                    maxCursorError, maxStepError, stream.pointee.time_base.num,
+                    stream.pointee.time_base.den)
             }
             guard rc >= 0 else { throw MatrixError.invalidFixture }
             defer { av_packet_unref(packet) }
@@ -5456,6 +5465,107 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(attempted, 2)
         XCTAssertEqual(pcmExact, 2)
         XCTAssertEqual(controlPCMExact, 2)
+        XCTAssertEqual(errors, 0)
+    }
+
+    // F03A.2: evaluate the native candidate on the original matrix and
+    // six added fixtures. WebM can have a coarser clock than the PCM grid;
+    // record its exact observed deviations rather than inventing precision.
+    func testG0F03A2PacketTimeBaseCompatibility() throws {
+        let cases: [(codec: String, ext: String, rate: Int, channels: Int, frames: Int)] = [
+            ("aac", "m4a", 44100, 2, 49152), ("aac", "m4a", 48000, 1, 49152),
+            ("opus", "opus", 48000, 1, 48000), ("opus", "opus", 48000, 2, 48000),
+            ("aac", "m4a", 48000, 2, 48017), ("aac", "aac", 44100, 2, 48123),
+            ("opus", "opus", 48000, 1, 48017), ("opus", "opus", 48000, 2, 48239),
+            ("opus", "mp4", 48000, 2, 48019), ("opus", "webm", 48000, 2, 48031)
+        ]
+        var attempted = 0
+        var pcmExact = 0
+        var timelineAccepted = 0
+        var exactGrid = 0
+        var coarseGrid = 0
+        var errors = 0
+        var comparedValues = 0
+        func compare(_ a: [Float], _ b: [Float]) -> (different: Int, max: Double, rms: Double) {
+            guard a.count == b.count, !a.isEmpty else { return (-1, .infinity, .infinity) }
+            var different = 0
+            var maximum = 0.0
+            var squares = 0.0
+            for (x, y) in zip(a, b) {
+                if x.bitPattern != y.bitPattern { different += 1 }
+                let delta = abs(Double(x) - Double(y))
+                maximum = max(maximum, delta)
+                squares += delta * delta
+            }
+            return (different, maximum, sqrt(squares / Double(a.count)))
+        }
+        for p in cases {
+            attempted += 1
+            let name = "f03a_\(p.codec)_\(p.rate)_\(p.channels)_\(p.frames)"
+            do {
+                let url = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: p.ext, subdirectory: "Fixtures/G0Lossy"))
+                let refURL = try XCTUnwrap(Bundle.module.url(forResource: name,
+                    withExtension: "f32", subdirectory: "Fixtures/G0Lossy"))
+                let data = try Data(contentsOf: refURL)
+                guard !data.isEmpty, data.count % (4 * p.channels) == 0
+                else { throw MatrixError.invalidFixture }
+                let host: [Float] = data.withUnsafeBytes { bytes in
+                    (0..<(bytes.count / 4)).map {
+                        Float(bitPattern: UInt32(littleEndian: bytes.loadUnaligned(
+                            fromByteOffset: $0 * 4, as: UInt32.self)))
+                    }
+                }
+                let hostFrames = host.count / p.channels
+                guard host.allSatisfy({ $0.isFinite }), hostFrames >= p.frames,
+                      hostFrames <= p.frames + 2048 else { throw MatrixError.invalidFixture }
+                let original = try rawF03A(url: url, codecName: p.codec, rate: Int32(p.rate),
+                    channels: p.channels, maxFrames: p.frames + 4096, traceMode: "F03A2-original")
+                let control = try rawF03A(url: url, codecName: p.codec, rate: Int32(p.rate),
+                    channels: p.channels, maxFrames: p.frames + 4096, traceMode: "F03A2-control",
+                    setPacketTimeBase: true)
+                let diff = compare(control.values, original.values)
+                let hostDiff = compare(control.values, host)
+                let originalHost = compare(original.values, host)
+                let pcm = diff.different == 0 && control.values.count == host.count
+                if pcm { pcmExact += 1; comparedValues += control.values.count }
+                let gridNumerator = Int64(control.timeBaseNum) * Int64(p.rate)
+                let gridDenominator = Int64(control.timeBaseDen)
+                guard gridNumerator > 0, gridDenominator > 0,
+                      original.timeBaseNum == control.timeBaseNum,
+                      original.timeBaseDen == control.timeBaseDen,
+                      original.packets == control.packets,
+                      original.decodedFrames == control.decodedFrames
+                else { throw MatrixError.invalidFixture }
+                let exactRepresentable = gridDenominator % gridNumerator == 0
+                // Only the explicitly included WebM case may use a coarse
+                // grid. One container tick is the experimental error bound;
+                // a bounded coarse timeline is NOT exact sample timing.
+                let tolerance = exactRepresentable ? Int64(0)
+                    : (gridNumerator + gridDenominator - 1) / gridDenominator
+                let gridAllowed = exactRepresentable || p.ext == "webm"
+                let timeline = gridAllowed && control.missingPTS == 0
+                    && control.maxCursorError <= tolerance
+                    && control.maxStepError <= tolerance
+                    && control.first.map { abs($0) <= tolerance } == true
+                    && control.end.map { abs($0 - Int64(hostFrames)) <= tolerance } == true
+                    && (!exactRepresentable || control.discontinuities == 0)
+                if timeline {
+                    timelineAccepted += 1
+                    if exactRepresentable { exactGrid += 1 } else { coarseGrid += 1 }
+                }
+                print("G0_F03A2_CASE fixture=\(name) container=\(p.ext) sourceFrames=\(p.frames) hostFrames=\(hostFrames) originalFrames=\(original.values.count / p.channels) controlFrames=\(control.values.count / p.channels) packets=\(control.packets) decodedFrames=\(control.decodedFrames) timeBase=\(control.timeBaseNum)/\(control.timeBaseDen) originalFirst=\(original.first.map(String.init) ?? "none") originalEnd=\(original.end.map(String.init) ?? "none") originalDiscontinuities=\(original.discontinuities) originalMissingPTS=\(original.missingPTS) originalMaxCursorError=\(original.maxCursorError) originalMaxStepError=\(original.maxStepError) controlFirst=\(control.first.map(String.init) ?? "none") controlEnd=\(control.end.map(String.init) ?? "none") controlDiscontinuities=\(control.discontinuities) controlMissingPTS=\(control.missingPTS) controlMaxCursorError=\(control.maxCursorError) controlMaxStepError=\(control.maxStepError) exactGrid=\(exactRepresentable) tolerance=\(tolerance) originalHostMax=\(originalHost.max) originalHostRMS=\(originalHost.rms) hostDifferent=\(hostDiff.different) hostMax=\(hostDiff.max) hostRMS=\(hostDiff.rms) pcmDifferent=\(diff.different) pcmMax=\(diff.max) pcmExact=\(pcm) timelineAccepted=\(timeline) eof=true")
+            } catch {
+                errors += 1
+                print("G0_F03A2_ERROR fixture=\(name) container=\(p.ext) error=\(error)")
+            }
+        }
+        print("G0_F03A2_SUMMARY attempted=\(attempted) pcmExact=\(pcmExact) timelineAccepted=\(timelineAccepted) exactGrid=\(exactGrid) coarseGrid=\(coarseGrid) errors=\(errors) comparedValues=\(comparedValues)")
+        XCTAssertEqual(attempted, 10)
+        XCTAssertEqual(pcmExact, 10)
+        XCTAssertEqual(timelineAccepted, 10)
+        XCTAssertEqual(exactGrid, 9)
+        XCTAssertEqual(coarseGrid, 1)
         XCTAssertEqual(errors, 0)
     }
 

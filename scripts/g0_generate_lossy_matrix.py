@@ -18,7 +18,19 @@ CASES = (
     ("aac", "m4a", 48000, 1, 49152, "96k"),
     ("opus", "opus", 48000, 1, 48000, "64k"),
     ("opus", "opus", 48000, 2, 48000, "128k"),
+    # F03A.2: non-aligned tails, alternate containers and packet durations.
+    ("aac", "m4a", 48000, 2, 48017, "192k"),
+    ("aac", "aac", 44100, 2, 48123, "192k"),
+    ("opus", "opus", 48000, 1, 48017, "64k"),
+    ("opus", "opus", 48000, 2, 48239, "128k"),
+    ("opus", "mp4", 48000, 2, 48019, "128k"),
+    ("opus", "webm", 48000, 2, 48031, "128k"),
 )
+
+OPUS_FRAME_MS = {
+    ("opus", 48017): "10",
+    ("opus", 48239): "60",
+}
 
 
 def sha(data):
@@ -55,6 +67,7 @@ def verify(out):
         base = stem(*case)
         expected.update((base + "." + ext, base + ".f32"))
         assert entry["case"] == list(case)
+        assert entry["opus_packet_ms"] == (int(OPUS_FRAME_MS.get((ext, frames), "20")) if codec == "opus" else None)
         assert entry["file"] == base + "." + ext
         assert entry["reference"] == base + ".f32"
         encoded = (out / entry["file"]).read_bytes()
@@ -68,7 +81,7 @@ def verify(out):
         assert values and all(math.isfinite(x) for x in values)
         assert max(abs(x) for x in values) > 0.1
     assert {p.name for p in out.iterdir() if p.is_file()} == expected | {"manifest.json"}
-    print("G0_F03A_FIXTURES verified=4 reference=host_ffmpeg")
+    print(f"G0_F03A_FIXTURES verified={len(CASES)} reference=host_ffmpeg")
 
 
 def generate(out):
@@ -94,7 +107,7 @@ def generate(out):
             base = stem(*case)
             encoded = out / (base + "." + ext)
             ref = out / (base + ".f32")
-            encoder = ["-c:a", "aac", "-profile:a", "aac_low"] if codec == "aac" else ["-c:a", "libopus", "-application", "audio", "-frame_duration", "20"]
+            encoder = ["-c:a", "aac", "-profile:a", "aac_low"] if codec == "aac" else ["-c:a", "libopus", "-application", "audio", "-frame_duration", OPUS_FRAME_MS.get((ext, frames), "20")]
             run(exe, "-v", "error", "-y", "-i", str(source), *encoder, "-b:a", bitrate,
                 "-map_metadata", "-1", str(encoded))
             run(exe, "-v", "error", "-y", "-i", str(encoded), "-map", "0:a:0",
@@ -107,6 +120,7 @@ def generate(out):
             rms = math.sqrt(sum((a-b)**2 for a,b in zip(source_values[:n], ref_values[:n])) / n)
             manifest["files"].append({
                 "case": list(case), "file": encoded.name, "reference": ref.name,
+                "opus_packet_ms": int(OPUS_FRAME_MS.get((ext, frames), "20")) if codec == "opus" else None,
                 "source_pcm_sha256": sha(raw), "encoded_sha256": sha(encoded.read_bytes()),
                 "reference_sha256": sha(data), "reference_frames": len(data) // (channels * 4),
                 "source_vs_reference_index_aligned_rms": rms,
