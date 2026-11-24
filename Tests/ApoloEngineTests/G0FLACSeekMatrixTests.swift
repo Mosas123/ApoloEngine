@@ -3283,6 +3283,200 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         // Classify unexpected terminal behavior as evidence, not a fix.
     }
 
+    // R16A: fixed, alternating local/loopback lifecycle workload. This
+    // is process-level simulator telemetry, not isolated codec or device
+    // energy measurement. Every cycle owns and closes its own contexts.
+    private struct ResourceSnapshotR16 {
+        let cpuUS: Int64?
+        let residentBytes: UInt64?
+        let maxRSS: Int64?
+    }
+
+    private func resourceSnapshotR16() -> ResourceSnapshotR16 {
+        var usage = rusage()
+        let usageOK = getrusage(RUSAGE_SELF, &usage) == 0
+        let cpu = Int64(usage.ru_utime.tv_sec) * 1_000_000
+            + Int64(usage.ru_utime.tv_usec)
+            + Int64(usage.ru_stime.tv_sec) * 1_000_000
+            + Int64(usage.ru_stime.tv_usec)
+        var basic = mach_task_basic_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<mach_task_basic_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
+        let capacity = Int(count)
+        let status = withUnsafeMutablePointer(to: &basic) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: capacity) {
+                task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+            }
+        }
+        return ResourceSnapshotR16(
+            cpuUS: usageOK ? cpu : nil,
+            residentBytes: status == KERN_SUCCESS ? UInt64(basic.resident_size) : nil,
+            maxRSS: usageOK ? Int64(usage.ru_maxrss) : nil
+        )
+    }
+
+    func testG0B03RepeatedLifecycleResourceObservation() throws {
+        let local = try fixture("025", withSeektable: false)
+        let payload = try Data(contentsOf: local)
+        let rate: Int32 = 44100
+        let total: Int64 = 11025
+        let linear = try nativePCMSequenceR9(url: local, targetTick: nil)
+        let reference = linear.pcm
+        guard linear.code == 0, reference.firstTick == 0,
+              reference.endTick == total, reference.stride == 4,
+              reference.data.count == Int(total) * reference.stride,
+              payload.count <= 8 * 1024 * 1024
+        else { throw MatrixError.invalidFixture }
+
+        let endpoint = G0R15EndpointState()
+        endpoint.configure(payload: payload, range: true)
+        let server = try G0R15LoopbackServer(endpoint: endpoint)
+        defer { server.stop() }
+        let targets: [Int64] = [0, 2756, 5512, 9922]
+        let profiles = ["local", "loopback206"]
+        var totals: [String: [UInt64]] = [:]
+        var opens: [String: [UInt64]] = [:]
+        var firsts: [String: [UInt64]] = [:]
+        var cpuDeltas: [String: [UInt64]] = [:]
+        var exact = 0
+        var errors = 0
+        var warmExact = 0
+        var measured = 0
+        var resourceMissing = 0
+
+        func percentile(_ values: [UInt64], _ p: Double) -> String {
+            let sorted = values.sorted()
+            guard !sorted.isEmpty else { return "none" }
+            let index = max(0, min(sorted.count - 1, Int(ceil(Double(sorted.count) * p)) - 1))
+            return String(sorted[index])
+        }
+        func emitResources(_ phase: String, _ snapshot: ResourceSnapshotR16) {
+            print("G0_B03_R16A_RESOURCE phase=\(phase) cpuUS=\(snapshot.cpuUS.map(String.init) ?? "none") residentBytes=\(snapshot.residentBytes.map(String.init) ?? "none") maxRSSDarwin=\(snapshot.maxRSS.map(String.init) ?? "none")")
+        }
+
+        emitResources("beforeWarmup", resourceSnapshotR16())
+        // Two warmups per transport; alternate AB/BA order in each pair.
+        // Five measured repetitions of each of four fixed targets.
+        for pair in 0..<22 {
+            let warmup = pair < 2
+            if pair == 2 { emitResources("afterWarmup", resourceSnapshotR16()) }
+            let target = targets[(warmup ? pair : pair - 2) % targets.count]
+            let order = pair.isMultiple(of: 2) ? profiles : Array(profiles.reversed())
+            for profile in order {
+                let remote = profile == "loopback206"
+                endpoint.configure(payload: payload, range: true)
+                let url = remote ? server.url : local
+                let phase = warmup ? "warmup" : "measured"
+                let label = "phase=\(phase) pair=\(pair) profile=\(profile) target=\(target)"
+                var anchors: [Int64] = []
+                for offset: Int64 in [0, Int64(rate) / 8, Int64(rate) / 2] {
+                    let anchor = max(0, target - offset)
+                    if !anchors.contains(anchor) { anchors.append(anchor) }
+                }
+                var codes: [Int32] = []
+                var rawEnd: Int64?
+                var first: Int64?
+                var endKept: Int64?
+                var compared = 0
+                var mismatch = 0
+                var openNS: UInt64?
+                var firstNS: UInt64?
+                var seekNS: UInt64 = 0
+                let before = resourceSnapshotR16()
+                let started = DispatchTime.now().uptimeNanoseconds
+                if !warmup { measured += 1 }
+                do {
+                    let code: Int32 = try autoreleasepool {
+                        try self.nativePCMSequenceR9(
+                            url: url, targetTick: target,
+                            sessionConfiguration: .ephemeral,
+                            onOpened: { openNS = DispatchTime.now().uptimeNanoseconds - started },
+                            retryAnchors: Array(anchors.dropFirst()),
+                            onSeek: { code, elapsed in codes.append(code); seekNS += elapsed },
+                            onFrame: { frame in
+                                var one = NativePCMSequenceR9()
+                                try one.append(frame)
+                                guard let start = one.firstTick, let end = one.endTick,
+                                      end <= total, rawEnd == nil || rawEnd == start,
+                                      one.stride == reference.stride,
+                                      one.sampleFormat == reference.sampleFormat
+                                else { throw MatrixError.invalidFixture }
+                                rawEnd = end
+                                if end <= target { return }
+                                let kept = max(start, target)
+                                guard endKept == nil || endKept == kept
+                                else { throw MatrixError.invalidTimestamp }
+                                if first == nil {
+                                    first = kept
+                                    firstNS = DispatchTime.now().uptimeNanoseconds - started
+                                }
+                                endKept = end
+                                let bytes = one.data.dropFirst(Int(kept - start) * one.stride)
+                                let a = Int(kept) * reference.stride
+                                let b = Int(end) * reference.stride
+                                compared += bytes.count
+                                if !bytes.elementsEqual(reference.data[a..<b]) { mismatch += 1 }
+                            }
+                        ).code
+                    }
+                    // Includes helper's deferred format/codec/AVIO close,
+                    // autoreleasepool drain and PCM comparison, not rendering.
+                    let totalNS = DispatchTime.now().uptimeNanoseconds - started
+                    let after = resourceSnapshotR16()
+                    let events = endpoint.snapshot()
+                    let body = events.reduce(0) { $0 + $1.bytes }
+                    let transportOK = remote
+                        ? !events.isEmpty && events.allSatisfy { $0.status == 206 }
+                        : events.isEmpty
+                    let complete = code == 0 && first == target && endKept == total
+                        && compared == Int(total - target) * reference.stride
+                        && mismatch == 0 && transportOK && !codes.isEmpty
+                        && codes.last == 0 && codes.count <= anchors.count
+                        && codes.dropLast().allSatisfy { $0 == -1 }
+                    var deltaCPU: UInt64?
+                    if let a = before.cpuUS, let b = after.cpuUS, b >= a {
+                        deltaCPU = UInt64(b - a)
+                    }
+                    if !warmup {
+                        if complete {
+                            exact += 1
+                            totals[profile, default: []].append(totalNS)
+                            if let openNS { opens[profile, default: []].append(openNS) }
+                            if let firstNS { firsts[profile, default: []].append(firstNS) }
+                            if let deltaCPU { cpuDeltas[profile, default: []].append(deltaCPU) }
+                        }
+                        if deltaCPU == nil || before.residentBytes == nil || after.residentBytes == nil {
+                            resourceMissing += 1
+                        }
+                    } else if complete {
+                        warmExact += 1
+                    }
+                    print("G0_B03_R16A_CASE \(label) codes=\(codes.map(String.init).joined(separator: ",")) finalCode=\(code) first=\(first.map(String.init) ?? "none") end=\(endKept.map(String.init) ?? "none") comparedBytes=\(compared) mismatch=\(mismatch) requests=\(events.count) bodyBytes=\(body) complete=\(complete)")
+                    print("G0_B03_R16A_TIMING \(label) openNS=\(openNS.map(String.init) ?? "none") seekNS=\(seekNS) firstPCMNS=\(firstNS.map(String.init) ?? "none") totalWithCloseNS=\(totalNS) cpuDeltaUS=\(deltaCPU.map(String.init) ?? "none") residentBefore=\(before.residentBytes.map(String.init) ?? "none") residentAfter=\(after.residentBytes.map(String.init) ?? "none") maxRSSDarwin=\(after.maxRSS.map(String.init) ?? "none")")
+                } catch {
+                    errors += 1
+                    print("G0_B03_R16A_CASE \(label) setupOrDecodeError=\(error)")
+                }
+            }
+        }
+        emitResources("afterMeasured", resourceSnapshotR16())
+        for profile in profiles {
+            let t = totals[profile, default: []]
+            let o = opens[profile, default: []]
+            let f = firsts[profile, default: []]
+            let c = cpuDeltas[profile, default: []]
+            print("G0_B03_R16A_METRICS profile=\(profile) totalN=\(t.count) totalP50NS=\(percentile(t, 0.50)) totalP95NS=\(percentile(t, 0.95)) openN=\(o.count) openP50NS=\(percentile(o, 0.50)) openP95NS=\(percentile(o, 0.95)) firstN=\(f.count) firstP50NS=\(percentile(f, 0.50)) firstP95NS=\(percentile(f, 0.95)) cpuN=\(c.count) cpuP50US=\(percentile(c, 0.50)) cpuP95US=\(percentile(c, 0.95))")
+        }
+        print("G0_B03_R16A_SUMMARY measured=\(measured) exact=\(exact) warmExact=\(warmExact) errors=\(errors) resourceMissing=\(resourceMissing)")
+        XCTAssertEqual(measured, 40)
+        XCTAssertEqual(warmExact, 4)
+        XCTAssertEqual(exact, 40)
+        XCTAssertEqual(errors, 0)
+        // Resource readings can be unavailable; keep that explicit.
+        // No RSS or timing threshold implies a leak or speedup.
+    }
+
     func testG0B03FLACSeek32Cases() throws {
         let durations: [(tag: String, seconds: Double)] = [
             ("025", 0.25), ("050", 0.50),
