@@ -1,0 +1,81 @@
+name: G0 F02C TAK provenance (diagnostic only)
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/g0-tak-provenance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'diag/g0-lab-')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Inspect official TAK archive without executing or redistributing it
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch=$(mktemp -d)
+          trap 'rm -rf "$scratch"' EXIT
+          url=https://www.thbeck.de/Download/TAK_2.3.3.zip
+          echo "G0_F02C_SOURCE url=$url"
+          curl --fail --show-error --silent --location --max-redirs 3 \
+            --proto '=https' --proto-redir '=https' --connect-timeout 15 \
+            --max-time 90 --max-filesize 10485760 "$url" -o "$scratch/tak.zip"
+          python3 - "$scratch/tak.zip" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
+          import zipfile
+
+          archive = pathlib.Path(sys.argv[1])
+          print("G0_F02C_ARCHIVE sha256=" + hashlib.sha256(archive.read_bytes()).hexdigest())
+          with zipfile.ZipFile(archive) as z:
+              entries = z.infolist()
+              assert len(entries) <= 1024
+              assert sum(e.file_size for e in entries) <= 64 * 1024 * 1024
+              executables = []
+              documents = []
+              for entry in entries:
+                  # No extraction or execution, even if archive paths are unsafe.
+                  name = pathlib.PurePosixPath(entry.filename.replace("\\", "/")).name.lower()
+                  print("G0_F02C_ENTRY", repr(entry.filename), "bytes=" + str(entry.file_size))
+                  if name == "takc.exe":
+                      assert entry.file_size <= 8 * 1024 * 1024
+                      executables.append(entry)
+                  if (name.endswith((".txt", ".md", ".rtf", ".html", ".htm", ".pdf"))
+                          and any(word in name for word in ("license", "licence", "readme", "copy", "legal", "lizenz", "liesmich", "tak"))):
+                      documents.append(entry)
+              assert executables, "No Takc.exe in official archive"
+              for entry in executables:
+                  binary = z.read(entry)
+                  assert binary.startswith(b"MZ")
+                  print("G0_F02C_EXECUTABLE", repr(entry.filename), "sha256=" + hashlib.sha256(binary).hexdigest())
+              for entry in documents:
+                  if entry.file_size > 256 * 1024:
+                      continue
+                  data = z.read(entry)
+                  print("G0_F02C_DOCUMENT", repr(entry.filename), "sha256=" + hashlib.sha256(data).hexdigest())
+                  if entry.filename.lower().endswith((".txt", ".md")):
+                      if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+                          decoded = data.decode("utf-16", errors="replace")
+                      else:
+                          decoded = data.decode("utf-8-sig", errors="replace")
+                          if "\ufffd" in decoded:
+                              decoded = data.decode("cp1252", errors="replace")
+                      # Log only candidate license-related lines, as escaped text.
+                      lines = decoded.splitlines()
+                      hits = {j for i, line in enumerate(lines)
+                              if any(word in line.lower() for word in ("license", "licence", "freeware", "commercial", "redistribut", "copyright", "lizenz", "kommerziell", "privat", "verbreit"))
+                              for j in range(max(0, i-1), min(len(lines), i+2))}
+                      for j in sorted(hits)[:80]:
+                          print("G0_F02C_TERM", repr(entry.filename), j+1, repr(lines[j][:500]))
+              print("G0_F02C_SUMMARY archiveInspected=true executableCount=" + str(len(executables))
+                    + " candidateDocuments=" + str(len(documents))
+                    + " executableRun=false licenseApproved=false")
+          PY
