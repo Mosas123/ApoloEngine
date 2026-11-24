@@ -4280,10 +4280,14 @@ final class G0FLACSeekMatrixTests: XCTestCase {
     // FFmpeg distribution. Normalize only exact S16/S32 integers; reject
     // unexpected formats. Compare separately from production AudioDecoder.
     private func rawF01PCM(
-        url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int
+        url: URL, rate: Int32, channels: Int, bits: Int, expectedFrames: Int,
+        expectedCodec: String? = nil
     ) throws -> (values: [Float], first: Int64?, end: Int64?, format: Int32?) {
         let source = try OpenedSource.open(url: url)
         defer { source.close() }
+        if let expectedCodec, source.info.audioTracks.first?.codec != expectedCodec {
+            throw MatrixError.invalidFixture
+        }
         var owned = source.takeFormatContext()
         defer { avformat_close_input(&owned) }
         guard let context = owned, context.pointee.nb_streams == 1,
@@ -4470,6 +4474,109 @@ final class G0FLACSeekMatrixTests: XCTestCase {
         XCTAssertEqual(engineExact, 12)
         XCTAssertEqual(errors, 0)
         // A failed exact comparison is evidence, not a production fix.
+    }
+
+    // F02A: use paired compressed fixture bytes from the host generator,
+    // but expected values are recomputed independently by the F01 oracle.
+    // Compare native packed/planar PCM and real AudioDecoder/CoreMedia.
+    func testG0F02CompressedLosslessFidelity() throws {
+        let profiles: [(rate: Int, channels: Int, bits: Int)] = [
+            (44100, 1, 16), (44100, 2, 24),
+            (48000, 2, 16), (48000, 1, 24),
+            (96000, 2, 24), (192000, 2, 24)
+        ]
+        let codecs = [("alac", "m4a"), ("wavpack", "wv"), ("tta", "tta")]
+        let frames = 8193
+        var attempted = 0
+        var rawExact = 0
+        var engineExact = 0
+        var errors = 0
+        func difference(_ actual: [Float], _ expected: [Float]) -> (Int, Float) {
+            guard actual.count == expected.count else { return (-1, .infinity) }
+            var unequal = 0
+            var maxError: Float = 0
+            for (a, b) in zip(actual, expected) {
+                if a.bitPattern != b.bitPattern { unequal += 1 }
+                maxError = max(maxError, abs(a - b))
+            }
+            return (unequal, maxError)
+        }
+
+        for p in profiles {
+            let expected = makeF01PCMContainer(aiff: false, rate: p.rate,
+                channels: p.channels, bits: p.bits, frames: frames).1
+            for (codec, ext) in codecs {
+                attempted += 1
+                let label = "codec=\(codec) container=\(ext) rate=\(p.rate) channels=\(p.channels) bits=\(p.bits)"
+                let name = "f02_\(codec)_\(p.rate)_\(p.channels)_\(p.bits)"
+                guard let url = Bundle.module.url(forResource: name,
+                    withExtension: ext, subdirectory: "Fixtures/G0")
+                else {
+                    errors += 1
+                    print("G0_F02_MISSING \(label)")
+                    continue
+                }
+                do {
+                    let raw = try rawF01PCM(url: url, rate: Int32(p.rate),
+                        channels: p.channels, bits: p.bits, expectedFrames: frames,
+                        expectedCodec: codec)
+                    let diff = difference(raw.values, expected)
+                    let exact = raw.first == 0 && raw.end == Int64(frames) && diff.0 == 0
+                    if exact { rawExact += 1 }
+                    print("G0_F02_RAW \(label) first=\(raw.first.map(String.init) ?? "none") end=\(raw.end.map(String.init) ?? "none") format=\(raw.format.map(String.init) ?? "none") values=\(raw.values.count) different=\(diff.0) maxAbsError=\(diff.1) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F02_RAW \(label) error=\(error)")
+                }
+
+                do {
+                    let source = try OpenedSource.open(url: url)
+                    defer { source.close() }
+                    guard source.info.audioTracks.first?.codec == codec
+                    else { throw MatrixError.invalidFixture }
+                    let decoder = AudioDecoder()
+                    decoder.limiterEnabled = false
+                    try decoder.adopt(source)
+                    defer { decoder.close() }
+                    var sequence = PCMSequenceR8()
+                    var reachedEOF = false
+                    var asbdValid = true
+                    for _ in 0..<2048 {
+                        guard let sample = try decoder.readNextBuffer() else {
+                            reachedEOF = true
+                            break
+                        }
+                        guard let desc = CMSampleBufferGetFormatDescription(sample),
+                              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)
+                        else { throw MatrixError.invalidFixture }
+                        let shape = asbd.pointee
+                        asbdValid = asbdValid && shape.mSampleRate == Double(p.rate)
+                            && shape.mChannelsPerFrame == UInt32(p.channels)
+                            && shape.mFormatID == kAudioFormatLinearPCM
+                            && shape.mBitsPerChannel == 32
+                            && shape.mBytesPerFrame == UInt32(p.channels * 4)
+                            && (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+                            && (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0
+                        try sequence.append(sample, rate: Int32(p.rate))
+                        guard sequence.frameCount <= frames else { throw MatrixError.invalidFixture }
+                    }
+                    let diff = difference(sequence.samples, expected)
+                    let exact = reachedEOF && asbdValid && sequence.firstTick == 0
+                        && sequence.nextTick == Int64(frames)
+                        && sequence.channels == p.channels && diff.0 == 0
+                    if exact { engineExact += 1 }
+                    print("G0_F02_ENGINE \(label) first=\(sequence.firstTick.map(String.init) ?? "none") end=\(sequence.nextTick.map(String.init) ?? "none") frames=\(sequence.frameCount) values=\(sequence.samples.count) different=\(diff.0) maxAbsError=\(diff.1) asbdValid=\(asbdValid) eof=\(reachedEOF) exact=\(exact)")
+                } catch {
+                    errors += 1
+                    print("G0_F02_ENGINE \(label) error=\(error)")
+                }
+            }
+        }
+        print("G0_F02_SUMMARY attempted=\(attempted) rawExact=\(rawExact) engineExact=\(engineExact) errors=\(errors)")
+        XCTAssertEqual(attempted, 18)
+        XCTAssertEqual(rawExact, 18)
+        XCTAssertEqual(engineExact, 18)
+        XCTAssertEqual(errors, 0)
     }
 
     func testG0B03FLACSeek32Cases() throws {

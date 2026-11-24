@@ -95,6 +95,60 @@ def generate_r13(out: pathlib.Path) -> list:
     return entries
 
 
+
+# F02A: source PCM independently calculated, then compressed losslessly.
+# The host CLI encodes fixtures only; a host roundtrip verifies provenance
+# but the iOS linked library must still match the independent source.
+F02_PROFILES = (
+    (44100, 1, 16), (44100, 2, 24), (48000, 2, 16),
+    (48000, 1, 24), (96000, 2, 24), (192000, 2, 24),
+)
+F02_CODECS = (("alac", "m4a"), ("wavpack", "wv"), ("tta", "tta"))
+F02_FRAMES = 8193
+
+
+def generate_f02(out: pathlib.Path) -> list:
+    entries = []
+    for rate, channels, bits in F02_PROFILES:
+        scale = 1 << (bits - 1)
+        width = bits // 8
+        raw = bytearray()
+        for i in range(F02_FRAMES):
+            for c in range(channels):
+                value = (i * (131 + c * 17) + c * 7919) % (scale // 2) - scale // 4
+                if bits == 24:
+                    value = value * 3 + (i + c) % 7
+                if i < 4:
+                    value = (-scale, scale - 1, 0, 1 if c == 0 else -1)[i]
+                raw.extend(value.to_bytes(width, "little", signed=True))
+        source = out / ".f02_source.raw"
+        decoded = out / ".f02_decoded.raw"
+        source.write_bytes(raw)
+        try:
+            for codec, ext in F02_CODECS:
+                file = out / f"f02_{codec}_{rate}_{channels}_{bits}.{ext}"
+                run("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", f"s{bits}le", "-ar", str(rate), "-ac", str(channels),
+                    "-i", str(source), "-map_metadata", "-1", "-c:a", codec,
+                    "-bits_per_raw_sample", str(bits), str(file))
+                run("ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", str(file), "-map", "0:a:0", "-f", f"s{bits}le",
+                    "-c:a", f"pcm_s{bits}le", str(decoded))
+                assert decoded.read_bytes() == raw, f"host roundtrip mismatch: {file}"
+                encoded = file.read_bytes()
+                entries.append({
+                    "file": file.name, "codec": codec, "sample_rate": rate,
+                    "channels": channels, "bit_depth": bits, "total_samples": F02_FRAMES,
+                    "source_pcm_sha256": hashlib.sha256(raw).hexdigest(),
+                    "host_roundtrip_exact": True,
+                    "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
+                })
+        finally:
+            source.unlink(missing_ok=True)
+            decoded.unlink(missing_ok=True)
+    return entries
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("Usage: g0_generate_flac_matrix.py OUTPUT_DIRECTORY")
@@ -158,6 +212,7 @@ def main() -> None:
 
     manifest["generator"]["flac"] = run("flac", "--version")
     manifest["r13_files"] = generate_r13(out)
+    manifest["f02_files"] = generate_f02(out)
 
     (out / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",

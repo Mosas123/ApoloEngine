@@ -97,7 +97,19 @@ jobs:
               data = (root / entry["file"]).read_bytes()
               assert len(data) == entry["bytes"], entry["file"]
               assert hashlib.sha256(data).hexdigest() == entry["sha256"], entry["file"]
-          print("Verified all 20 fixture hashes and manifest entries.")
+          f02 = manifest["f02_files"]
+          expected_f02 = {
+              f"f02_{codec}_{rate}_{channels}_{bits}.{ext}"
+              for rate, channels, bits in [(44100,1,16),(44100,2,24),(48000,2,16),(48000,1,24),(96000,2,24),(192000,2,24)]
+              for codec, ext in [("alac","m4a"),("wavpack","wv"),("tta","tta")]
+          }
+          assert len(f02) == 18 and {e["file"] for e in f02} == expected_f02
+          assert expected_f02 == {f.name for f in root.glob("f02_*")}
+          for entry in f02:
+              data = (root / entry["file"]).read_bytes()
+              assert len(data) == entry["bytes"] and entry["host_roundtrip_exact"]
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], entry["file"]
+          print("Verified all 20 FLAC and 18 F02 fixture hashes and manifest entries.")
           print(json.dumps(manifest["generator"], sort_keys=True))
           PY
 
@@ -151,7 +163,7 @@ jobs:
             xcodebuild -version
             swift --version
             echo "paired fixture SHA256:"
-            shasum -a 256 Tests/ApoloEngineTests/Fixtures/G0/*.flac
+            shasum -a 256 -c g0-flac-fixtures-sha256.txt
             echo "original FLAC SHA256:"
             shasum -a 256 Tests/ApoloEngineTests/Fixtures/tone.flac
             echo "fixture generator and metadata:"
