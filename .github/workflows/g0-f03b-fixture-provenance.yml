@@ -1,0 +1,120 @@
+name: G0 F03B.1 lossy fixture provenance
+
+on:
+  pull_request:
+    branches: [diag/g0-lab-benchmarks-20261123]
+    paths: [".github/workflows/g0-f03b-fixture-provenance.yml"]
+
+permissions:
+  contents: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f03b-fixture-provenance-20261124'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact diagnostic commit
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 75cba3068bb7a31420b66c251a805200aac9284d
+          persist-credentials: false
+      - name: Install host generators from Ubuntu repositories only
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg musepack-tools
+          dpkg-query -W ffmpeg musepack-tools
+          command -v ffmpeg
+          command -v ffprobe
+          command -v mpcenc
+          ffmpeg -version
+          ffmpeg -hide_banner -encoders | grep -E 'libmp3lame|libvorbis'
+          sha256sum /usr/share/doc/musepack-tools/copyright
+      - name: Generate and verify eight fixed host references
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' | tee g0-f03b-fixtures.log
+          import hashlib, json, math, pathlib, shutil, struct, subprocess, sys, tempfile, wave
+          sys.path.insert(0,"scripts")
+          from g0_generate_lossy_matrix import source_pcm
+          root=pathlib.Path("Tests/ApoloEngineTests/Fixtures/G0F03B")
+          root.mkdir(parents=True,exist_ok=False)
+          def sha(data): return hashlib.sha256(data).hexdigest()
+          def exe(name):
+              p=shutil.which(name)
+              assert p, name
+              return str(pathlib.Path(p).resolve())
+          ff=exe("ffmpeg"); probe=exe("ffprobe"); mpc=exe("mpcenc")
+          def run(args): subprocess.run(args,check=True,timeout=60)
+          def capture(args): return subprocess.check_output(args,text=True,timeout=30)
+          provenance={"ffmpeg_version":capture([ff,"-version"]),
+                      "ffprobe_version":capture([probe,"-version"]),
+                      "binaries":{pathlib.Path(p).name:sha(pathlib.Path(p).read_bytes()) for p in (ff,probe,mpc)},
+                      "packages":capture(["dpkg-query","-W","ffmpeg","musepack-tools"]),
+                      "musepack_copyright_sha256":sha(pathlib.Path("/usr/share/doc/musepack-tools/copyright").read_bytes()),
+                      "reference_kind":"host FFmpeg differential, not independent decoder"}
+          # Separate CBR and VBR MP3, headerless MP3, Ogg Vorbis and SV8 Musepack.
+          cases=[
+          ("mp3","mp3","cbr",44100,2,48123,["-c:a","libmp3lame","-b:a","192k","-write_xing","1"]),
+          ("mp3","mp3","vbr",48000,1,48017,["-c:a","libmp3lame","-q:a","3","-write_xing","1"]),
+          ("mp3","mp3","no_xing",44100,2,48019,["-c:a","libmp3lame","-b:a","192k","-write_xing","0"]),
+          ("vorbis","ogg","q5",44100,2,48123,["-c:a","libvorbis","-q:a","5"]),
+          ("vorbis","ogg","q4",48000,1,48017,["-c:a","libvorbis","-q:a","4"]),
+          ("vorbis","ogg","q6",48000,2,48239,["-c:a","libvorbis","-q:a","6"]),
+          ("musepack8","mpc","sv8",44100,2,48123,[]),
+          ("musepack8","mpc","sv8",48000,2,48017,[]),
+          ]
+          entries=[]
+          with tempfile.TemporaryDirectory() as tmp:
+              wav=pathlib.Path(tmp)/"source.wav"
+              for codec,ext,mode,rate,ch,n,opts in cases:
+                  name=f"f03b_{codec}_{mode}_{rate}_{ch}_{n}"
+                  source=source_pcm(rate,ch,n)
+                  with wave.open(str(wav),"wb") as w:
+                      w.setnchannels(ch);w.setsampwidth(2);w.setframerate(rate);w.writeframes(source)
+                  dest=root/(name+"."+ext); ref=root/(name+".f32")
+                  if codec=="musepack8":
+                      run([mpc,str(wav),str(dest)])
+                  else:
+                      run([ff,"-v","error","-y","-i",str(wav),*opts,"-map_metadata","-1",str(dest)])
+                  data=json.loads(capture([probe,"-v","error","-select_streams","a:0","-show_streams","-show_format","-show_packets","-of","json",str(dest)]))
+                  assert len(data["streams"])==1
+                  stream=data["streams"][0]; packets=data["packets"]
+                  assert stream["codec_name"]==codec and int(stream["sample_rate"])==rate and int(stream["channels"])==ch,stream
+                  assert 0<len(packets)<2048
+                  run([ff,"-v","error","-y","-i",str(dest),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le",str(ref)])
+                  raw=ref.read_bytes()
+                  assert len(raw)>0 and len(raw)%(4*ch)==0
+                  count=len(raw)//(4*ch)
+                  assert abs(count-n)<=4096,(name,count,n)
+                  values=[v[0] for v in struct.iter_unpack("<f",raw)]
+                  assert all(math.isfinite(x) for x in values) and max(map(abs,values))>0.1
+                  side=[{"index":i,"pts":p.get("pts"),**s} for i,p in enumerate(packets) for s in p.get("side_data_list",[]) if s.get("side_data_type")=="Skip Samples"]
+                  entry={"fixture":name,"codec":codec,"container":ext,"mode":mode,"rate":rate,"channels":ch,"source_frames":n,"reference_frames":count,"source_pcm_sha256":sha(source),"file":dest.name,"encoded_sha256":sha(dest.read_bytes()),"reference":ref.name,"reference_sha256":sha(raw),"options":opts,"packet_count":len(packets),"stream_time_base":stream.get("time_base"),"stream_start_pts":stream.get("start_pts"),"stream_duration_ts":stream.get("duration_ts"),"first_packet":{k:packets[0].get(k) for k in ("pts","dts","duration")},"last_packet":{k:packets[-1].get(k) for k in ("pts","dts","duration")},"skip_discard":side}
+                  entries.append(entry)
+                  print("G0_F03B_FIXTURE "+json.dumps(entry,sort_keys=True),flush=True)
+          assert len(entries)==8 and len({e["fixture"] for e in entries})==8
+          manifest={"generator":provenance,"files":entries}
+          (root/"manifest.json").write_text(json.dumps(manifest,sort_keys=True,indent=2)+"\n")
+          for e in entries:
+              assert sha((root/e["file"]).read_bytes())==e["encoded_sha256"]
+              assert sha((root/e["reference"]).read_bytes())==e["reference_sha256"]
+              assert sha(source_pcm(e["rate"],e["channels"],e["source_frames"]))==e["source_pcm_sha256"]
+          print("G0_F03B_FIXTURE_SUMMARY verified=8 mp3=3 vorbis=3 musepack8=2; host references only")
+          PY
+          sha256sum Tests/ApoloEngineTests/Fixtures/G0F03B/* | tee g0-f03b-fixtures-sha256.txt
+          sha256sum --strict -c g0-f03b-fixtures-sha256.txt
+      - name: Preserve fixture bytes and provenance
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f03b-fixtures-${{ github.run_id }}
+          path: |
+            Tests/ApoloEngineTests/Fixtures/G0F03B/
+            g0-f03b-fixtures.log
+            g0-f03b-fixtures-sha256.txt
+          if-no-files-found: warn
+          retention-days: 14
