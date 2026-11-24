@@ -26,10 +26,79 @@ def run(*args: str) -> str:
     return result.stdout.strip()
 
 
+# R13: deterministic signed integer PCM with distinct channels and low bits.
+R13_CASES = (
+    ("mono48_s16_b1024", 48000, 1, 16, 1024, 24000),
+    ("surround48_s24_b4096", 48000, 6, 24, 4096, 72000),
+    ("stereo96_s24_b4096", 96000, 2, 24, 4096, 192000),
+    ("stereo192_s24_b8192", 192000, 2, 24, 8192, 384000),
+    ("stereo44_s16_b4608_long", 44100, 2, 16, 4608, 1323000),
+    ("stereo96_s24_b8192_short", 96000, 2, 24, 8192, 24000),
+)
+
+
+def generate_r13(out: pathlib.Path) -> list:
+    entries = []
+    for tag, rate, channels, bits, block, count in R13_CASES:
+        raw_path = out / f".r13_{tag}.raw"
+        plain = out / f"seek_r13_{tag}_no_table.flac"
+        table = out / f"seek_r13_{tag}_table.flac"
+        width = bits // 8
+        raw_md5 = hashlib.md5()
+        with raw_path.open("wb") as raw:
+            for start in range(0, count, 4096):
+                chunk = bytearray()
+                for i in range(start, min(count, start + 4096)):
+                    for c in range(channels):
+                        phase = (i * (31 + 7 * c) + c * 101) % 2048
+                        value = (phase - 1024) * (1 << (bits - 12))
+                        value += (i * 17 + c * 13) % (1 << (bits - 12))
+                        chunk.extend(value.to_bytes(width, "little", signed=True))
+                raw.write(chunk)
+                raw_md5.update(chunk)
+        try:
+            run(
+                "flac", "-f", "-s", "-5", "--no-seektable",
+                "--force-raw-format", "--endian=little", "--sign=signed",
+                f"--channels={channels}", f"--bps={bits}",
+                f"--sample-rate={rate}", f"--blocksize={block}",
+                "-o", str(plain), str(raw_path),
+            )
+        finally:
+            raw_path.unlink(missing_ok=True)
+        assert not run("metaflac", "--list", "--block-type=SEEKTABLE", str(plain))
+        shutil.copyfile(plain, table)
+        run(
+            "metaflac", "--add-seekpoint=0",
+            f"--add-seekpoint={count // 4}", f"--add-seekpoint={count // 2}",
+            f"--add-seekpoint={count * 9 // 10}", str(table),
+        )
+        listing = run("metaflac", "--list", "--block-type=SEEKTABLE", str(table))
+        assert "type: 3 (SEEKTABLE)" in listing and "sample_number=0" in listing
+        for file, has_table in ((plain, False), (table, True)):
+            for field, expected in (
+                ("sample-rate", rate), ("channels", channels), ("bps", bits),
+                ("total-samples", count), ("min-blocksize", block),
+                ("max-blocksize", block),
+            ):
+                assert int(run("metaflac", f"--show-{field}", str(file))) == expected
+            assert run("metaflac", "--show-md5sum", str(file)) == raw_md5.hexdigest()
+            run("flac", "-t", "-s", str(file))
+            encoded = file.read_bytes()
+            entries.append({
+                "file": file.name, "tag": tag, "sample_rate": rate,
+                "channels": channels, "bit_depth": bits, "block_size": block,
+                "total_samples": count, "seektable": has_table,
+                "source_pcm_md5": raw_md5.hexdigest(),
+                "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
+            })
+    return entries
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit("Usage: g0_generate_flac_matrix.py OUTPUT_DIRECTORY")
-    for command in ("ffmpeg", "metaflac"):
+    for command in ("ffmpeg", "metaflac", "flac"):
         if not shutil.which(command):
             raise SystemExit(f"Missing required fixture generator: {command}")
 
@@ -86,6 +155,9 @@ def main() -> None:
                 "bytes": len(raw),
                 "sha256": hashlib.sha256(raw).hexdigest(),
             })
+
+    manifest["generator"]["flac"] = run("flac", "--version")
+    manifest["r13_files"] = generate_r13(out)
 
     (out / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
