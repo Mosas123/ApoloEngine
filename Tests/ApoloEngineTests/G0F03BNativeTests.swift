@@ -2,6 +2,8 @@ import AetherLibavcodec
 import AetherLibavformat
 import AetherLibavutil
 import CryptoKit
+import CoreMedia
+import AudioToolbox
 import Foundation
 import Darwin
 import XCTest
@@ -214,5 +216,121 @@ final class G0F03BNativeTests: XCTestCase {
         XCTAssertEqual(errors, 0)
         XCTAssertEqual(hostCountMatches, cases.count, "Host count discrepancy is an observation to investigate, not a production fix.")
         XCTAssertEqual(controlExact, cases.count, "Packet timebase control must not change PCM.")
+    }
+
+    /// Observe the actual AudioDecoder -> CMSampleBuffer bridge, without
+    /// modifying its clock, decoding policy, trimming or DSP implementation.
+    func testG0F03B3CoreMediaBridgeObservation() throws {
+        let cases: [(String,String,String,Int32,Int,Int,Int)] = [
+            ("f03b_mp3_cbr_44100_2_48123","mp3","mp3",44100,2,48123,48123),
+            ("f03b_mp3_vbr_48000_1_48017","mp3","mp3",48000,1,48017,48017),
+            ("f03b_mp3_no_xing_44100_2_48019","mp3","mp3",44100,2,48019,49536),
+            ("f03b_vorbis_q5_44100_2_48123","ogg","vorbis",44100,2,48123,48123),
+            ("f03b_vorbis_q4_48000_1_48017","ogg","vorbis",48000,1,48017,47889),
+            ("f03b_vorbis_q6_48000_2_48239","ogg","vorbis",48000,2,48239,48111),
+            ("f03b_musepack8_sv8_44100_2_48123","mpc","musepack8",44100,2,48123,49536),
+            ("f03b_musepack8_sv8_48000_2_48017","mpc","musepack8",48000,2,48017,49536)
+        ]
+        var complete = 0, bridgeExact = 0, nativeMatches = 0, errors = 0, compared = 0
+        var timelineValid = 0
+        for (name, ext, codec, rate, ch, sourceCount, hostCount) in cases {
+            do {
+                let url = try XCTUnwrap(Bundle.module.url(forResource: name, withExtension: ext, subdirectory: "Fixtures/G0F03B"))
+                let native = try decode(url, codec: codec, rate: rate, channels: ch, maxFrames: sourceCount + 8192, control: false)
+                let source = try OpenedSource.open(url: url)
+                defer { source.close() }
+                let decoder = AudioDecoder()
+                decoder.limiterEnabled = false
+                try decoder.adopt(source)
+                defer { decoder.close() }
+
+                var pcm: [Float] = []
+                var first: Int64?, end: Int64?
+                var buffers = 0, invalidPTS = 0, offGrid = 0, negativePTS = 0
+                var discontinuities = 0, invalidDuration = 0, durationMismatch = 0
+                var cursorError: Int64 = 0, stepError: Int64 = 0
+                var eof = false
+                for _ in 0..<2048 {
+                    guard let sample = try decoder.readNextBuffer() else { eof = true; break }
+                    buffers += 1
+                    let count = CMSampleBufferGetNumSamples(sample)
+                    let cursor = pcm.count / ch
+                    guard count > 0, cursor + count <= sourceCount + 8192,
+                          let desc = CMSampleBufferGetFormatDescription(sample),
+                          let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc),
+                          let block = CMSampleBufferGetDataBuffer(sample)
+                    else { throw LabError.invalid }
+                    let shape = asbd.pointee
+                    guard shape.mSampleRate == Double(rate),
+                          shape.mChannelsPerFrame == UInt32(ch),
+                          shape.mFormatID == kAudioFormatLinearPCM,
+                          shape.mBitsPerChannel == 32,
+                          shape.mBytesPerFrame == UInt32(ch * 4),
+                          (shape.mFormatFlags & kAudioFormatFlagIsFloat) != 0,
+                          (shape.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0,
+                          CMBlockBufferGetDataLength(block) == count * ch * 4
+                    else { throw LabError.invalid }
+
+                    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+                    let duration = CMSampleBufferGetDuration(sample)
+                    var tick: Int64?
+                    if pts.seconds.isFinite, abs(pts.seconds) < 60 {
+                        let scaled = pts.seconds * Double(rate)
+                        let t = Int64(scaled.rounded())
+                        tick = t
+                        if first == nil { first = t }
+                        if t < 0 { negativePTS += 1 }
+                        if abs(scaled - Double(t)) >= 0.001 { offGrid += 1 }
+                        cursorError = max(cursorError, abs(t - Int64(cursor)))
+                        if let previous = end, previous != t {
+                            discontinuities += 1
+                            stepError = max(stepError, abs(t - previous))
+                        }
+                        end = t + Int64(count)
+                    } else {
+                        invalidPTS += 1
+                        end = nil
+                    }
+                    if duration.seconds.isFinite, duration.seconds > 0 {
+                        if abs(duration.seconds * Double(rate) - Double(count)) >= 0.001 {
+                            durationMismatch += 1
+                        }
+                    } else { invalidDuration += 1 }
+                    print("G0_F03B3_BUFFER fixture=\(name) index=\(buffers) ptsValue=\(pts.value) ptsScale=\(pts.timescale) tick=\(tick.map(String.init) ?? "none") durationValue=\(duration.value) durationScale=\(duration.timescale) samples=\(count) cursor=\(cursor)")
+
+                    var chunk = [Float](repeating: 0, count: count * ch)
+                    let status = chunk.withUnsafeMutableBytes { bytes in
+                        CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: bytes.count, destination: bytes.baseAddress!)
+                    }
+                    guard status == 0, chunk.allSatisfy({ $0.isFinite }) else { throw LabError.frame }
+                    pcm.append(contentsOf: chunk)
+                }
+                guard eof, !pcm.isEmpty else { throw LabError.bound }
+                // A second read documents terminal behavior; do not call again
+                // indefinitely if the underlying decoder does not reach EOF.
+                let terminal = try decoder.readNextBuffer() == nil
+                let difference = metrics(pcm, native.pcm)
+                let exact = difference.different == 0
+                let strictTimeline = first == 0 && end == Int64(pcm.count / ch)
+                    && discontinuities == 0 && invalidPTS == 0 && offGrid == 0
+                    && negativePTS == 0 && invalidDuration == 0 && durationMismatch == 0
+                complete += 1
+                if native.pcm.count == hostCount * ch { nativeMatches += 1 }
+                if exact && terminal { bridgeExact += 1; compared += pcm.count }
+                if strictTimeline { timelineValid += 1 }
+                print("G0_F03B3_NATIVE fixture=\(name) frames=\(native.pcm.count/ch) packets=\(native.packets) decodedBlocks=\(native.frames) missingPTS=\(native.missing) first=\(native.first.map(String.init) ?? "none") end=\(native.end.map(String.init) ?? "none") pcmSHA256=\(digest(native.pcm))")
+                print("G0_F03B3_ENGINE fixture=\(name) sourceFrames=\(sourceCount) hostFrames=\(hostCount) engineFrames=\(pcm.count/ch) buffers=\(buffers) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") invalidPTS=\(invalidPTS) negativePTS=\(negativePTS) offGrid=\(offGrid) discontinuities=\(discontinuities) cursorError=\(cursorError) stepError=\(stepError) invalidDuration=\(invalidDuration) durationMismatch=\(durationMismatch) bridgeDifferent=\(difference.different) bridgePeak=\(difference.peak) bridgeRMS=\(difference.rms) pcmSHA256=\(digest(pcm)) asbdValid=true eof=\(eof) repeatedEOF=\(terminal) timelineValid=\(strictTimeline)")
+            } catch {
+                errors += 1
+                print("G0_F03B3_ERROR fixture=\(name) error=\(error)")
+            }
+        }
+        print("G0_F03B3_SUMMARY attempted=\(cases.count) complete=\(complete) nativeMatches=\(nativeMatches) bridgeExact=\(bridgeExact) timelineValid=\(timelineValid) comparedValues=\(compared) errors=\(errors)")
+        XCTAssertEqual(complete, cases.count)
+        XCTAssertEqual(nativeMatches, cases.count)
+        XCTAssertEqual(bridgeExact, cases.count, "Keep bridge differences or repeated EOF failures visible; do not repair in G0.")
+        XCTAssertEqual(compared, 681836)
+        XCTAssertEqual(errors, 0)
+        // Strict timeline is reported independently, not silently normalized.
     }
 }
