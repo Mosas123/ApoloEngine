@@ -1,0 +1,163 @@
+name: G0 F08C paired multichannel audio
+
+on:
+  pull_request:
+    branches: [diag/f08b-pcm-variants-20261125]
+    paths: [".github/workflows/g0-f08c-multichannel.yml", "Tests/ApoloEngineTests/G0F08MultichannelTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f08c-multichannel-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install signed Ubuntu FFmpeg packages
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg
+      - name: Generate deterministic DTS TrueHD MLP and validate lossless source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir G0F08C
+          python3 - <<'PY'
+          import hashlib,json,math,pathlib,shutil,struct,subprocess,tempfile
+          root=pathlib.Path("G0F08C")
+          def run(args):
+              return subprocess.check_output(args,timeout=90)
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          ff=shutil.which("ffmpeg"); probe=shutil.which("ffprobe")
+          manifest={"ffmpeg_version":run([ff,"-version"]).decode(),"ffprobe_version":run([probe,"-version"]).decode(),"packages":run(["dpkg-query","-W","ffmpeg"]).decode(),"exe_sha256":{x:sha(pathlib.Path(x)) for x in (ff,probe)},"fixtures":{}}
+          frames=10240
+          with tempfile.TemporaryDirectory() as tmp:
+              source=pathlib.Path(tmp)/"source.s16"
+              for codec,encoder in (("dts","dca"),("truehd","truehd"),("mlp","mlp")):
+                  for rate in (44100,48000):
+                      for ch in (2,6):
+                          layout="stereo" if ch==2 else ("5.1" if codec=="mlp" else "5.1(side)")
+                          # Distinct channel frequencies and amplitudes. Synthetic,
+                          # bounded 16-bit input, exactly representable as Float32.
+                          vals=[round((8000-400*c)*math.sin(2*math.pi*(301+137*c)*i/rate)) for i in range(frames) for c in range(ch)]
+                          raw=struct.pack("<"+"h"*len(vals),*vals)
+                          source.write_bytes(raw)
+                          name=f"{codec}-{rate}-{ch}"
+                          dest=root/f"{name}.mka"
+                          ref=root/f"{name}.f32"
+                          args=[ff,"-nostdin","-v","error","-y","-f","s16le","-ar",str(rate),"-ac",str(ch),"-channel_layout",layout,"-i",str(source),"-map_metadata","-1","-c:a",encoder,"-strict","experimental","-f","matroska",str(dest)]
+                          run(args)
+                          run([ff,"-nostdin","-v","error","-y","-i",str(dest),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le",str(ref)])
+                          info=json.loads(run([probe,"-v","error","-select_streams","a:0","-show_streams","-of","json",str(dest)]))["streams"]
+                          assert len(info)==1 and info[0]["codec_name"]==codec and int(info[0]["sample_rate"])==rate and info[0]["channels"]==ch,(name,info)
+                          assert ref.stat().st_size==frames*ch*4,(name,ref.stat().st_size)
+                          oracle=struct.pack("<"+"f"*len(vals),*(v/32768 for v in vals))
+                          lossless=codec!="dts"
+                          if lossless:
+                              assert ref.read_bytes()==oracle,(name,"source oracle mismatch")
+                          manifest["fixtures"][name]={"encoded_sha256":sha(dest),"reference_sha256":sha(ref),"source_s16_sha256":hashlib.sha256(raw).hexdigest(),"source_f32_sha256":hashlib.sha256(oracle).hexdigest(),"source_frames":frames,"source_layout":layout,"lossless_source_oracle_exact":lossless,"stream":info[0],"encoder_args":args[1:]}
+                          print("G0_F08C_FIXTURE",name,sha(dest),sha(ref),"sourceOracle",lossless,"layout",layout,"decodedLayout",info[0].get("channel_layout"))
+          assert len(manifest["fixtures"])==12
+          (root/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          PY
+          (cd G0F08C && sha256sum *.mka *.f32 manifest.json > SHA256SUMS)
+      - name: Preserve exact fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08c-fixtures
+          path: G0F08C/
+          if-no-files-found: error
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f08c-multichannel-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical generated fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08c-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F08C
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08C
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08c-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08c-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08C-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08c-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08MultichannelTests/testG0F08CMultichannel \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08c-$variant-output.log"; then
+              echo "G0_F08C_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08C_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08c-paired-${{ github.run_id }}
+          path: |
+            g0-f08c-*-output.log
+            g0-f08c-*-dependency.patch
+            g0-f08c-environment.txt
+            g0-f08c-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
