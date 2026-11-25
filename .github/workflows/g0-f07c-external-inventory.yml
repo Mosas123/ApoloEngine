@@ -30,37 +30,38 @@ jobs:
           git ls-files Sources | tee g0-f07c-source-inventory.txt
           git grep -nE 'AetherLib(swscale|dav1d|zimg|zvbi)|sws_|dav1d_|zimg_|vbi_|AVMEDIA_TYPE_VIDEO|AVMEDIA_TYPE_SUBTITLE' -- Sources >> g0-f07c-source-inventory.txt || test "$?" -eq 1
           cat g0-f07c-source-inventory.txt
-      - name: Generate independent synthetic lossless AV1 fixtures
+      - name: Materialize pinned synthetic AV1 fixtures
         shell: bash
         run: |
           set -euo pipefail
-          if ! command -v ffmpeg >/dev/null; then
-            brew install ffmpeg
-          fi
-          ffmpeg -version > g0-f07c-host-encoder.txt
-          ffmpeg -hide_banner -h encoder=libaom-av1 >> g0-f07c-host-encoder.txt 2>&1
-          ROOT=Tests/ApoloEngineTests/Fixtures
-          mkdir -p "$ROOT"
           python3 - <<'PY'
           from pathlib import Path
-          import struct
+          import base64, hashlib, struct
           root = Path("Tests/ApoloEngineTests/Fixtures")
-          for depth in (8,10):
+          root.mkdir(parents=True, exist_ok=True)
+          # Synthetic tiles generated independently on Linux with FFmpeg
+          # 7.1.5 / libaom 3.12.1; decoded by host dav1d 1.5.1 and cmp verified.
+          # No encoder installation or network dependency on the Apple runner.
+          fixtures = {
+              8: ("REtJRgAAIABBVjAxIAAYABkAAAABAAAABAAAAAAAAABIAAAAAAAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWP9WN1pEk5t94FKZeChXaE8THD48unh54dGVMgLTrS9Mja5YR+S188nKTs+q7dfArPPBIAAAAAQAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQCeClpEk5vahSnCqChXaE8THD48unh54dGVNDFMc49Mja5YR+S188nKTs+q7dfArPPBIAAAAAgAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQHke9QjCzWAqBtAWB99HK6c9XDV+lBUpsi1cPOALX08+XOFrFIFcacbWwFmM4igfVhBIAAAAAwAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQMp7tQjCzXa7PHRiB99HK6c9XDV+lBUpsi1cxFW3908+XOFrFIFcacbWwFmM4igfVhA=", "6ade914ec670d141ad4ce5e9ba7d599d12c2d57f25165a7308a833ec9dac750a", "20e4f243ff2f40761fc252488f5dfa313e3ae1d2b043557b0031bd223036c77b"),
+              10: ("REtJRgAAIABBVjAxIAAYABkAAAABAAAABAAAAAAAAABRAAAAAAAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWP9VoaScSnEwiQ2ohdNEnihXaE8THD48unh54dGVMgTWWExtMjZ3JUh+KwAY8a3MUlvlh7W93t80jA8BRAAAAAQAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQChxOScSecqsYuFV0q33ihXaE8THD48unh54dGVNDpzRKZtMjZ3JUh+KmEQ8bGMclvlh7W93t80jA8BRAAAAAgAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQHsd7QBRo4rFTLRsmdcnh99HK6c9XDV+lBUpsi1cObN52SE8+WFEhbE/Zd8V1QoGAsBRpGJ7/Ytkb8BRAAAAAwAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQM2KmOjiI4rFY5EI7Tj2h99HK6c9XDV+lBUpsi1cwuRbIak8+WFtx7E/Zd8V1QoGAqeQpGJ7/Ytkb8A=", "d61a260630944db4ac665755f2670071c85abc7c0794adc938da6e34c96cb927", "9d38340f6eb03cff2d8fef6ab6d3e24d2a4ff7586da6c094f603b3902835d5b0"),
+          }
+          for depth, (encoded, ivf_sha, raw_sha) in fixtures.items():
               raw = bytearray()
               for frame in range(4):
                   for plane, w, h in ((0,32,24),(1,16,12),(2,16,12)):
                       for y in range(h):
                           for x in range(w):
-                              value = (x*17+y*31+plane*53+frame*19) % (1<<depth)
+                              value = ((37+plane*53+frame*19+(x//8)*7+(y//8)*11) << (depth-8)) + ((x//8+y//8+frame)%4 if depth==10 else 0)
                               raw.extend(bytes([value]) if depth==8 else struct.pack("<H",value))
+              ivf = base64.b64decode(encoded, validate=True)
+              assert hashlib.sha256(ivf).hexdigest() == ivf_sha
+              assert hashlib.sha256(raw).hexdigest() == raw_sha
+              (root/f"g0-f07c-{depth}.ivf").write_bytes(ivf)
               (root/f"g0-f07c-{depth}.yuv").write_bytes(raw)
           PY
-          for depth in 8 10; do
-            fmt=yuv420p
-            if [[ "$depth" == 10 ]]; then fmt=yuv420p10le; fi
-            ffmpeg -nostdin -v error -y -f rawvideo -pixel_format "$fmt" -video_size 32x24 -framerate 25 -i "$ROOT/g0-f07c-$depth.yuv" -frames:v 4 -c:v libaom-av1 -crf 0 -b:v 0 -aom-params lossless=1 -cpu-used 4 -g 1 -lag-in-frames 0 -pix_fmt "$fmt" -f ivf "$ROOT/g0-f07c-$depth.ivf"
-          done
-          shasum -a 256 "$ROOT"/g0-f07c-* | tee g0-f07c-fixture-sha256.txt
+          printf '%s\n' 'Independent Linux FFmpeg 7.1.5-0+deb13u1; libaom3 3.12.1; libdav1d7 1.5.1' 'libaom-av1 -crf 0 -b:v 0 -aom-params lossless=1 -cpu-used 4 -g 1 -lag-in-frames 0; 32x24 YUV420 4 frames; source/host decoded cmp exact' > g0-f07c-host-encoder.txt
+          shasum -a 256 Tests/ApoloEngineTests/Fixtures/g0-f07c-* | tee g0-f07c-fixture-sha256.txt
       - name: Execute both pinned variants on the same runner
         shell: bash
         env:
