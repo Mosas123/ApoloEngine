@@ -1,0 +1,129 @@
+name: G0 F08C.1 paired Matroska clock isolation
+
+on:
+  pull_request:
+    branches: [diag/f08c-multichannel-20261125]
+    paths: [".github/workflows/g0-f08c1-matroska-clock.yml", "Tests/ApoloEngineTests/G0F08MatroskaClockTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f08c1-matroska-clock-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download original F08C fixture artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08c-fixtures
+          run-id: 45560982101
+          github-token: ${{ github.token }}
+          path: Tests/ApoloEngineTests/Fixtures/G0F08C
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08C
+          shasum -a 256 -c SHA256SUMS
+          cat > /tmp/g0-f08c1-pinned-sha256 <<'PINNED'
+          9e824f39668312fd781fd52450a3af9f66a1b53bb9a5358a2ac4f42e5d12620b  dts-44100-2.mka
+          8d7eea3f84bb1661a9165256588b5765f04346b1778f55462b5dfd1320469d6f  dts-44100-2.f32
+          7add4065e3b4c80d0b5c42b4a75a4ac6f6d67d2f1433d7fb4cbdd7a1bddfcf42  dts-44100-6.mka
+          357b4d77911da2e9c1e5e408b84c43155299a1718d1f5af2d0996f5ec946f55e  dts-44100-6.f32
+          3ff0a325286e1512e747fa18d6b2474da1c61051716a57356e6915d1e66ec3fa  dts-48000-2.mka
+          2c26cb82aaf32b741946e6ddf2e78842bd08c2a5fa063dc206bb5bdd54e0eae3  dts-48000-2.f32
+          5c83dc462d448090218eb736fd832f30e43618dbccaf742f8c1ba8c3a86e8a0d  dts-48000-6.mka
+          a12a1c6468ef293c821a96d2059a8b35d42d252d3dee621b2ab715e90fb64aed  dts-48000-6.f32
+          c3cb2782aed0d65877335b0e57b8a488ce5e6ae2ffa7a19639f5daee0f89009c  truehd-44100-2.mka
+          875d47bcf658d6f3b727ea3a71ba0d0a119db0b12f2342ff5ed0b1f43adc23df  truehd-44100-2.f32
+          7b7d02722a033c7e0235c7646877134a7d0bcf5ab67132c97dbbb19201cd6faa  truehd-44100-6.mka
+          e9dc36a9eb7beec300b00881ab737354cf79532494c257c4244b7b664b25d703  truehd-44100-6.f32
+          83f1b8150c37dc75c4b7013e096da9956c0d18c3c38786e8823fbac5a0756841  truehd-48000-2.mka
+          e81fc3413f2b4c2d8a5917bcd73c6e63edac606b2de3c71c74765715a0b5952d  truehd-48000-2.f32
+          532ab5f999137621f336a60c87682007811b8101a29810738316c0d5cf632995  truehd-48000-6.mka
+          2c06047204eca2430e560af5a049ee47615a9272ca5558881c0b1be72fa46287  truehd-48000-6.f32
+          1be76a7a8841064e7b159130b275bc1a75883e8267ee6f7cc90aa56ea4b0ebe9  mlp-44100-2.mka
+          875d47bcf658d6f3b727ea3a71ba0d0a119db0b12f2342ff5ed0b1f43adc23df  mlp-44100-2.f32
+          3496e41e8fed50f2c9d4e0fcc4b16d41ddeeb9f235217c0576eb206ac30af60f  mlp-44100-6.mka
+          e9dc36a9eb7beec300b00881ab737354cf79532494c257c4244b7b664b25d703  mlp-44100-6.f32
+          8580d7b267b216001281dbdfbd508b2f6ff0b6b9952e49df2dbde1d712ba754a  mlp-48000-2.mka
+          e81fc3413f2b4c2d8a5917bcd73c6e63edac606b2de3c71c74765715a0b5952d  mlp-48000-2.f32
+          974530f4ce5197c1783450cbd8cb33693f1773257c5012c9da16a1da18f400de  mlp-48000-6.mka
+          2c06047204eca2430e560af5a049ee47615a9272ca5558881c0b1be72fa46287  mlp-48000-6.f32
+          PINNED
+          shasum -a 256 -c /tmp/g0-f08c1-pinned-sha256
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08c1-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08c1-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08C1-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08c1-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08MatroskaClockTests/testG0F08C1MatroskaClock \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08c1-$variant-output.log"; then
+              echo "G0_F08C1_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08C1_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08c1-paired-${{ github.run_id }}
+          path: |
+            g0-f08c1-*-output.log
+            g0-f08c1-*-dependency.patch
+            g0-f08c1-environment.txt
+            g0-f08c1-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
