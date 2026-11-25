@@ -1,0 +1,98 @@
+name: G0 F06C paired sample formats and layouts
+
+on:
+  pull_request:
+    branches: [diag/f06b2-avio-dictionary-20261124]
+    paths: [".github/workflows/g0-f06c-formats-layouts.yml", "Tests/ApoloEngineTests/G0F06FormatTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f06c-formats-layouts-20261124'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Inventory production libavutil call sites
+        shell: bash
+        run: |
+          git ls-files Sources | tee g0-f06c-source-inventory.txt
+          git grep -nE 'AetherLibavutil|av_(rescale|compare_ts|add_stable|frame_|buffer_|channel_layout_|samples_|sample_fmt_|get_sample_fmt|sample_fmt_is_planar|malloc|free|dict_|opt_|strerror|error|log|util_version)|AV_NOPTS|AV_TIME_BASE' -- Sources >> g0-f06c-source-inventory.txt || test "$?" -eq 1
+          cat g0-f06c-source-inventory.txt
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f06c-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f06c-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F06C-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f06c-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F06FormatTests/testG0F06CFormatsAndLayouts \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f06c-$variant-output.log"; then
+              echo "G0_F06C_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F06C_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f06c-paired-${{ github.run_id }}
+          path: |
+            g0-f06c-*-output.log
+            g0-f06c-*-dependency.patch
+            g0-f06c-environment.txt
+            g0-f06c-source-inventory.txt
+            g0-f06c-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
