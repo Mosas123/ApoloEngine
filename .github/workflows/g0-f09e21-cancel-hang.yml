@@ -1,0 +1,136 @@
+name: G0 F09E21 never responding cancellation
+
+on:
+  pull_request:
+    branches: [diag/f09e2-finite-cancel-20261125]
+    paths: [".github/workflows/g0-f09e21-cancel-hang.yml", "Tests/ApoloEngineTests/G0F09HangCancelTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f09e21-cancel-hang-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Checkout exact historical candidate
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: 188295b7800406b3fd31a69df73b752c3d04d274
+          path: .g0-candidate
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f09e21-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            for mode in original trace; do
+            git restore -- Package.swift Sources/ApoloEngine/HTTPStream.swift Tests/ApoloEngineTests/G0F09HangCancelTests.swift Tests/ApoloEngineTests/HTTPStreamTests.swift
+            rm -f Sources/ApoloEngine/FiniteStreamCancellation.swift
+            cp .g0-candidate/Sources/ApoloEngine/HTTPStream.swift Sources/ApoloEngine/HTTPStream.swift
+            cp .g0-candidate/Sources/ApoloEngine/FiniteStreamCancellation.swift Sources/ApoloEngine/FiniteStreamCancellation.swift
+            label="$variant-$mode"
+            git hash-object Sources/ApoloEngine/HTTPStream.swift Sources/ApoloEngine/FiniteStreamCancellation.swift | tee "g0-f09e21-$label-source-hashes.txt"
+            if [[ "$mode" == original ]]; then
+              cp .g0-candidate/Tests/ApoloEngineTests/HTTPStreamTests.swift Tests/ApoloEngineTests/HTTPStreamTests.swift
+              selected=ApoloEngineTests/HTTPStreamTests/testFiniteCancellationAbortsBlockedRangeWithoutWaitingForTimeout
+            else
+              selected=ApoloEngineTests/G0F09HangCancelTests
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Tests/ApoloEngineTests/G0F09HangCancelTests.swift")
+          s = p.read_text()
+          old = "return {} // G0_E21_CANCEL"
+          assert s.count(old) == 1
+          s = s.replace(old, "let token = FiniteStreamCancellation(); token.register(stream); return { token.cancel() }")
+          old = '        try XCTSkipUnless(ProcessInfo.processInfo.environment["G0_F09E21_ENABLED"] == "1")'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, ""))
+          p = Path("Sources/ApoloEngine/HTTPStream.swift")
+          s = p.read_text()
+          pairs = [
+              ("        task?.cancel()", '        print("G0_F09E21_EVENT event=taskCancelEnter ns=\\(DispatchTime.now().uptimeNanoseconds)")\n        task?.cancel()\n        print("G0_F09E21_EVENT event=taskCancelReturn ns=\\(DispatchTime.now().uptimeNanoseconds)")'),
+              ("            result.set(data: data, response: response, error: error)", '            print("G0_F09E21_EVENT event=completion ns=\\(DispatchTime.now().uptimeNanoseconds)")\n            result.set(data: data, response: response, error: error)'),
+              ("            if isCancelled {\n                task.cancel()", '            if isCancelled {\n                print("G0_F09E21_EVENT event=pollCancellation ns=\\(DispatchTime.now().uptimeNanoseconds)")\n                task.cancel()'),
+          ]
+          for old, new in pairs:
+              assert s.count(old) == 1, old
+              s = s.replace(old, new)
+          p.write_text(s)
+          PY
+            fi
+            git diff -- Sources/ApoloEngine/HTTPStream.swift Tests/ApoloEngineTests/G0F09HangCancelTests.swift Tests/ApoloEngineTests/HTTPStreamTests.swift > "g0-f09e21-$label-overlay.patch"
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f09e21-$label-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F09E21-$label" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f09e21-$label.xcresult" \
+              -only-testing:"$selected" \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f09e21-$label-output.log"; then
+              echo "G0_F09E21_VARIANT variant=$variant mode=$mode result=PASS"
+            else
+              failed=1
+              echo "G0_F09E21_VARIANT variant=$variant mode=$mode result=FAIL"
+            fi
+            done
+          done
+          git restore -- Package.swift Sources/ApoloEngine/HTTPStream.swift Tests/ApoloEngineTests/G0F09HangCancelTests.swift Tests/ApoloEngineTests/HTTPStreamTests.swift
+          rm -f Sources/ApoloEngine/FiniteStreamCancellation.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09e21-paired-${{ github.run_id }}
+          path: |
+            g0-f09e21-*-output.log
+            g0-f09e21-*-dependency.patch
+            g0-f09e21-*-overlay.patch
+            g0-f09e21-*-source-hashes.txt
+            g0-f09e21-environment.txt
+            g0-f09e21-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
