@@ -1,0 +1,133 @@
+name: G0 F07C paired external decoder and registry inventory
+
+on:
+  pull_request:
+    branches: [diag/f07b-color-zimg-20261124]
+    paths: [".github/workflows/g0-f07c-external-inventory.yml", "Tests/ApoloEngineTests/G0F07ExternalTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f07c-external-inventory-20261124'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Inventory production video and external library call sites
+        shell: bash
+        run: |
+          git ls-files Sources | tee g0-f07c-source-inventory.txt
+          git grep -nE 'AetherLib(swscale|dav1d|zimg|zvbi)|sws_|dav1d_|zimg_|vbi_|AVMEDIA_TYPE_VIDEO|AVMEDIA_TYPE_SUBTITLE' -- Sources >> g0-f07c-source-inventory.txt || test "$?" -eq 1
+          cat g0-f07c-source-inventory.txt
+      - name: Materialize pinned synthetic AV1 fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import base64, hashlib, struct
+          root = Path("Tests/ApoloEngineTests/Fixtures")
+          root.mkdir(parents=True, exist_ok=True)
+          # Synthetic tiles generated independently on Linux with FFmpeg
+          # 7.1.5 / libaom 3.12.1; decoded by host dav1d 1.5.1 and cmp verified.
+          # No encoder installation or network dependency on the Apple runner.
+          fixtures = {
+              8: ("REtJRgAAIABBVjAxIAAYABkAAAABAAAABAAAAAAAAABIAAAAAAAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWP9WN1pEk5t94FKZeChXaE8THD48unh54dGVMgLTrS9Mja5YR+S188nKTs+q7dfArPPBIAAAAAQAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQCeClpEk5vahSnCqChXaE8THD48unh54dGVNDFMc49Mja5YR+S188nKTs+q7dfArPPBIAAAAAgAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQHke9QjCzWAqBtAWB99HK6c9XDV+lBUpsi1cPOALX08+XOFrFIFcacbWwFmM4igfVhBIAAAAAwAAAAAAAAASAAoKAAAAAifubXzAIDI4FAAgAACWQMp7tQjCzXa7PHRiB99HK6c9XDV+lBUpsi1cxFW3908+XOFrFIFcacbWwFmM4igfVhA=", "6ade914ec670d141ad4ce5e9ba7d599d12c2d57f25165a7308a833ec9dac750a", "20e4f243ff2f40761fc252488f5dfa313e3ae1d2b043557b0031bd223036c77b"),
+              10: ("REtJRgAAIABBVjAxIAAYABkAAAABAAAABAAAAAAAAABRAAAAAAAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWP9VoaScSnEwiQ2ohdNEnihXaE8THD48unh54dGVMgTWWExtMjZ3JUh+KwAY8a3MUlvlh7W93t80jA8BRAAAAAQAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQChxOScSecqsYuFV0q33ihXaE8THD48unh54dGVNDpzRKZtMjZ3JUh+KmEQ8bGMclvlh7W93t80jA8BRAAAAAgAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQHsd7QBRo4rFTLRsmdcnh99HK6c9XDV+lBUpsi1cObN52SE8+WFEhbE/Zd8V1QoGAsBRpGJ7/Ytkb8BRAAAAAwAAAAAAAAASAAoKAAAAAifubXzgIDJBFAAgAACWQM2KmOjiI4rFY5EI7Tj2h99HK6c9XDV+lBUpsi1cwuRbIak8+WFtx7E/Zd8V1QoGAqeQpGJ7/Ytkb8A=", "d61a260630944db4ac665755f2670071c85abc7c0794adc938da6e34c96cb927", "9d38340f6eb03cff2d8fef6ab6d3e24d2a4ff7586da6c094f603b3902835d5b0"),
+          }
+          for depth, (encoded, ivf_sha, raw_sha) in fixtures.items():
+              raw = bytearray()
+              for frame in range(4):
+                  for plane, w, h in ((0,32,24),(1,16,12),(2,16,12)):
+                      for y in range(h):
+                          for x in range(w):
+                              value = ((37+plane*53+frame*19+(x//8)*7+(y//8)*11) << (depth-8)) + ((x//8+y//8+frame)%4 if depth==10 else 0)
+                              raw.extend(bytes([value]) if depth==8 else struct.pack("<H",value))
+              ivf = base64.b64decode(encoded, validate=True)
+              assert hashlib.sha256(ivf).hexdigest() == ivf_sha
+              assert hashlib.sha256(raw).hexdigest() == raw_sha
+              (root/f"g0-f07c-{depth}.ivf").write_bytes(ivf)
+              (root/f"g0-f07c-{depth}.yuv").write_bytes(raw)
+          PY
+          printf '%s\n' 'Independent Linux FFmpeg 7.1.5-0+deb13u1; libaom3 3.12.1; libdav1d7 1.5.1' 'libaom-av1 -crf 0 -b:v 0 -aom-params lossless=1 -cpu-used 4 -g 1 -lag-in-frames 0; 32x24 YUV420 4 frames; source/host decoded cmp exact' > g0-f07c-host-encoder.txt
+          shasum -a 256 Tests/ApoloEngineTests/Fixtures/g0-f07c-* | tee g0-f07c-fixture-sha256.txt
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f07c-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f07c-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F07C-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f07c-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F07ExternalTests/testG0F07CExternalInventory \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f07c-$variant-output.log"; then
+              echo "G0_F07C_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F07C_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f07c-paired-${{ github.run_id }}
+          path: |
+            g0-f07c-*-output.log
+            g0-f07c-*-dependency.patch
+            g0-f07c-environment.txt
+            g0-f07c-host-encoder.txt
+            g0-f07c-fixture-sha256.txt
+            Tests/ApoloEngineTests/Fixtures/g0-f07c-*
+            g0-f07c-source-inventory.txt
+            g0-f07c-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
