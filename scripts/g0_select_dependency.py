@@ -22,7 +22,15 @@ def main() -> None:
     assert source.count(LEGACY_URL) == 1, "Unexpected dependency origin"
     assert source.count(LEGACY_BRANCH) == 1, "Unexpected dependency branch"
     count = source.count('package: "FFmpegBuild"')
-    assert count == 9, f"Unexpected package product count: {count}"
+    # F07 adds one explicit swscale dependency to the diagnostic test target.
+    # Keep the original guard for manifests without it.
+    swscale = '.product(name: "AetherLibswscale", package: "FFmpegBuild"),'
+    test_target = source.split(".testTarget(", 1)
+    expected = 9
+    if len(test_target) == 2 and test_target[1].count(swscale) == 1:
+        assert swscale not in test_target[0], "Unexpected production swscale dependency"
+        expected = 10
+    assert count == expected, f"Unexpected package product count: {count}"
     if name == "baseline":
         print("G0_DEPENDENCY variant=baseline origin=FFmpegBuild ref=apolo-union")
         return

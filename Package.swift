@@ -40,6 +40,7 @@ let package = Package(
                 "ApoloEngine",
                 .product(name: "AetherLibavcodec", package: "FFmpegBuild"),
                 .product(name: "AetherLibavfilter", package: "FFmpegBuild"),
+                .product(name: "AetherLibswscale", package: "FFmpegBuild"),
                 .product(name: "AetherLibavformat", package: "FFmpegBuild"),
                 .product(name: "AetherLibavutil", package: "FFmpegBuild"),
             ],
