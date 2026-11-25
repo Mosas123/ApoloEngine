@@ -61,7 +61,15 @@ final class G0F05LoudnessTests: XCTestCase {
         }
         func blocks(_ h:[Double])->[Double]{
             guard h.count>=4 else{return []}
-            return (0...(h.count-4)).map{(h[$0]+h[$0+1]+h[$0+2]+h[$0+3])/4}
+            var result: [Double] = []
+            result.reserveCapacity(h.count - 3)
+            for i in 0...(h.count - 4) {
+                let first: Double = h[i] + h[i + 1]
+                let third: Double = first + h[i + 2]
+                let total: Double = third + h[i + 3]
+                result.append(total / 4.0)
+            }
+            return result
         }
         let complete=blocks(sums),strict=gated(complete)
         // Counterfactual: same independent filter but include partial hop
