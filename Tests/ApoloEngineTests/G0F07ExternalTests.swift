@@ -105,7 +105,7 @@ final class G0F07ExternalTests: XCTestCase {
         // not successful page decoding without a verified teletext fixture.
         var teletextOpen=0
         for i in 0..<4{
-            let codec=try XCTUnwrap(avcodec_find_decoder_by_name("libzvbi_teletext"))
+            let codec=try XCTUnwrap(avcodec_find_decoder_by_name("libzvbi_teletextdec"))
             var ctx=avcodec_alloc_context3(codec)
             defer{avcodec_free_context(&ctx)}
             let rc=avcodec_open2(try XCTUnwrap(ctx),codec,nil)
