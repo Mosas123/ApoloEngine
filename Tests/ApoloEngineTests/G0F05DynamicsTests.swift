@@ -67,7 +67,14 @@ final class G0F05DynamicsTests: XCTestCase {
                 guard rc>=0 else{throw LabError.frame}
                 defer{av_frame_unref(output)}
                 let f=output.pointee,n=Int(f.nb_samples)
-                guard n>0,n<=262144,r.pcm.count+n<=pcm.count+262144,
+                // loudnorm drains up to a three-second window. Keep a
+                // rate-scaled finite bound and distinguish it from shape errors.
+                let frameLimit=max(262144,Int(rate)*3+4096)
+                guard n>0,n<=frameLimit,r.pcm.count+n<=pcm.count+frameLimit else {
+                    print("G0_F05C_BOUND rate=\(rate) filter=\(name) frame=\(n) accumulated=\(r.pcm.count) input=\(pcm.count) limit=\(frameLimit)")
+                    throw LabError.bound
+                }
+                guard
                       f.format==AV_SAMPLE_FMT_FLT.rawValue,f.sample_rate==rate,
                       f.ch_layout.nb_channels==1,f.pts != Int64.min,
                       let planes=f.extended_data,let data=planes[0] else{throw LabError.bound}
