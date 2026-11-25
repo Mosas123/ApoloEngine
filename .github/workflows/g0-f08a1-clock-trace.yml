@@ -1,0 +1,145 @@
+name: G0 F08A.1 paired packet frame and CoreMedia clock trace
+
+on:
+  pull_request:
+    branches: [diag/f08a-audio-coverage-20261125]
+    paths: [".github/workflows/g0-f08a1-clock-trace.yml", "Tests/ApoloEngineTests/G0F08AudioTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f08a1-clock-trace-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download original immutable F08A fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08a-fixtures
+          run-id: 45551989623
+          github-token: ${{ github.token }}
+          path: Tests/ApoloEngineTests/Fixtures/G0F08A
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08A
+          shasum -a 256 -c SHA256SUMS
+          cat > PINNED_SHA256SUMS <<'HASHES'
+          707f579a1c05b225d29c2cfb4bfc2f6f741e0c98bbef392a7db62100472bc153  wmav1-44100-1.asf
+          cdb8ebd0083c8c3234b36616c0f0ef3db428b1663272da58f8d4a59db115e2fa  wmav1-44100-1.f32
+          a78ebd1feca222ca7c5caa8bcebb83702abf60f38524437b16aa26417c8360d1  wmav2-44100-1.asf
+          a75429a0ca74f14dfc806b03b26bd3e82170e3e41fd7d4997bd2a39aed6217b8  wmav2-44100-1.f32
+          db314369d1fc5d219b264a0bb55af0cbf0366521bdd3fdcc07c0a914abc8d8cb  aac_latm-44100-1.latm
+          49ee7b8b4c868631c841a6cb57549e9fdcdf25b58e67f70dc28567e20ab32de7  aac_latm-44100-1.f32
+          f715637e2169af6333cfa3155603c63054c8701acab1f417fbf32402890dff45  ac3-44100-1.ac3
+          3bf4d69cf041c77e9c17f7d306292aa3928eb44937ed684922cdb609d162245d  ac3-44100-1.f32
+          ac81f5054e182f27ad62e98ef186f0686216445555fc0708d7f9141df3a567a8  eac3-44100-1.eac3
+          2d76a63680274b65b93dc92024be944e4f57110c8bb360de2105aeda5e1b1051  eac3-44100-1.f32
+          c778175cb35b7d49b15c0129f06734b028aaef09e718acca75a05fed246f04be  wmav1-44100-2.asf
+          d33ee36718ea5287292fc774b5a52caeedca4f8fbd4779b9465e978be78f20ab  wmav1-44100-2.f32
+          1f50ae48d8b33f6d28ac44361b3f2d3032a05ced6ae9f157a957cffcb54c18fc  wmav2-44100-2.asf
+          06528f47d7f81ddbcdfa095a8055f77f1086d3ff2754513150ecb5d40f8ce483  wmav2-44100-2.f32
+          86d420f151a86979c7b0fc1cb8e7505bcc3cf1d57436eaa2fc0308878c213726  aac_latm-44100-2.latm
+          a61772e1a98127012b11fad5d63135a999cb2fc14de8ec6864e346c6601d04cf  aac_latm-44100-2.f32
+          7dbcc53b67af4d1af35fb53c7097bbfb2cff9b4ce446a58e8dc59f7b6e4d6e25  ac3-44100-2.ac3
+          eef46cfedd5c58d45b48b25656cee9bff3972f054f87393171861e686ba673ff  ac3-44100-2.f32
+          7fb6caeb213e9221e43f8ae0ab2bac98c5cfc1178d251d3847bd27c7873e7393  eac3-44100-2.eac3
+          2213d0342e2e8892fc11df1156fa7d7bc6ec60f5fd0bb8cf4d0b943022f17507  eac3-44100-2.f32
+          575969f2885e1319c869d01d68a7fe7f9205dd3bd3290ed2be66aa4efb6d7907  wmav1-48000-1.asf
+          49e51514924166c3b8cc65a21c6150b2703f46f92fe82a91cc3fa9e364d57a65  wmav1-48000-1.f32
+          6bcb9e9d3dbf06844fc3fea216460e76b4bf4fc34f0c2801a9400ad689001a5b  wmav2-48000-1.asf
+          8ad43bc6e23b370fa86a27c6aa849b582fe568f836be6ad026dc12eaccfc9fde  wmav2-48000-1.f32
+          fe24b94e8fcc553b8558c9e99f3ec7d5495be89f7fc254973950dcebe37e4b99  aac_latm-48000-1.latm
+          2f97944866e8c0d34ecd96fb9234f6fff26455cb024c25497a2e2c67ca3c56fd  aac_latm-48000-1.f32
+          d687578759d41f057b7e7b85b465233366d1531a830111f3c69f29a4208a2d60  ac3-48000-1.ac3
+          e99cfd7553d225c812a08fdb3ae2e8d78cc0f90295a31f91defd90188c83157a  ac3-48000-1.f32
+          660a185a76c5a69f548af6ec4ffa97b8921f6171930f939ade6ad1c5160f43fe  eac3-48000-1.eac3
+          5f60cabea68e522ca64af9ac0f0dbbdcc812802ec8f2becdb4cfa58dac11237e  eac3-48000-1.f32
+          ccfd22ec0e55847e121f70fe3af64662f7bf607b2a99c5a08fe2ad7d9eb41331  wmav1-48000-2.asf
+          ec048f34a7276a60b963c844e5359f8ca5268e488d0556abe24c0090b7c1da9c  wmav1-48000-2.f32
+          b76b16429c1caf2c288e2f23e3644da14a5e12402518b5881f68457db04e0bbb  wmav2-48000-2.asf
+          32509937dddfa71a85f363b6a74825603684828b77888ff4159a99cfefd135c6  wmav2-48000-2.f32
+          4f1521660a858a2d0b3df0b7985e3714eabbe1590dcfbff90aac43888adf5ab0  aac_latm-48000-2.latm
+          24e29a4cc9cba1a1836099e0fc1b157bc6322f8ebf87103f6bec32ea5044f3d5  aac_latm-48000-2.f32
+          af5f373b391835d2b76307aa5dedbd43e4848a6f4f8599e46f88ca7f6124af6c  ac3-48000-2.ac3
+          97e77c5ccf2e1c9929514ee2e53873529fe98191f586ecff9ead97bf9c0fb5d7  ac3-48000-2.f32
+          ce25edd283e725e9dcfd22f37cd6b3b161c74106d0ca2a94f1cfbb9a10eebb2e  eac3-48000-2.eac3
+          3f60f4591722607b146d98ae82f6c8d5f43196c07aae2f852246b14c451cb33a  eac3-48000-2.f32
+          HASHES
+          shasum -a 256 -c PINNED_SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08a1-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08a1-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08A1-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08a1-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08AudioTests/testG0F08A1ClockTrace \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08a1-$variant-output.log"; then
+              echo "G0_F08A1_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08A1_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08a1-paired-${{ github.run_id }}
+          path: |
+            g0-f08a1-*-output.log
+            g0-f08a1-*-dependency.patch
+            g0-f08a1-environment.txt
+            g0-f08a1-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
