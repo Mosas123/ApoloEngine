@@ -67,7 +67,7 @@ final class G0F09DurationSeekTests:XCTestCase {
                 let spanUS=span.map{av_rescale_q($0,tb,micros)}
                 let bytes=records.reduce(0){$0+$1.size}
                 let gaps=zip(records,records.dropFirst()).filter{pair in pair.0.pts != Int64.min && pair.1.pts != Int64.min && pair.0.duration>0 && pair.0.pts+pair.0.duration != pair.1.pts}.count
-                print("G0_F09D_DURATION fixture=\(name) packets=\(records.count) payloadBytes=\(bytes) sourceUS=1000000 formatUS=\(c.pointee.duration) streamTicks=\(s.pointee.duration) tb=\(tb.num)/\(tb.den) sumTicks=\(sum) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") spanUS=\(spanUS.map(String.init) ?? "none") missingPTS=\(records.filter{$0.pts==Int64.min}.count) zeroDuration=\(records.filter{$0.duration==0}.count) gaps=\(gaps) estimationMethod=\(av_fmt_ctx_get_duration_estimation_method(c).rawValue)")
+                print("G0_F09D_DURATION fixture=\(name) packets=\(records.count) payloadBytes=\(bytes) sourceUS=1000000 formatUS=\(c.pointee.duration) streamTicks=\(s.pointee.duration) tb=\(tb.num)/\(tb.den) sumTicks=\(sum) first=\(first.map(String.init) ?? "none") end=\(end.map(String.init) ?? "none") spanUS=\(spanUS.map(String.init) ?? "none") missingPTS=\(records.filter{$0.pts==Int64.min}.count) zeroDuration=\(records.filter{$0.duration==0}.count) gaps=\(gaps) estimationMethod=unavailable")
                 if name=="avi"{XCTAssertEqual(bytes,192000)}
                 fullReads+=1
                 return records
@@ -94,9 +94,21 @@ final class G0F09DurationSeekTests:XCTestCase {
                         // Capture up to four post-seek packets, never decode.
                         var records:[Packet]=[]
                         for _ in 0..<4{guard let v=try next(c,p) else{break};records.append(v)}
-                        let matches=reference.indices.filter{i in
-                            i+records.count<=reference.count && !records.isEmpty &&
-                            zip(reference[i..<(i+records.count)],records).allSatisfy{$0.0.size==$0.1.size && $0.0.hash==$0.1.hash}
+                        // Explicit bounded sequence comparison avoids Swift type-check timeout.
+                        var matches: [Int] = []
+                        if !records.isEmpty && records.count <= reference.count {
+                            for i in 0...(reference.count-records.count) {
+                                var equal = true
+                                for j in records.indices {
+                                    let a = reference[i+j]
+                                    let b = records[j]
+                                    if a.size != b.size || a.hash != b.hash {
+                                        equal = false
+                                        break
+                                    }
+                                }
+                                if equal { matches.append(i) }
+                            }
                         }
                         if !matches.isEmpty{matchedPayload+=1}
                         let first=records.first
