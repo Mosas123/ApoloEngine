@@ -1,0 +1,91 @@
+name: G0 F05E3 paired independent loudness reference
+
+on:
+  pull_request:
+    branches: [diag/f05e2-dsp-state-20261124]
+    paths: [".github/workflows/g0-f05e3-loudness.yml", "Tests/ApoloEngineTests/G0F05LoudnessTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f05e3-loudness-20261124'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f05e3-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f05e3-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F05E3-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f05e3-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F05LoudnessTests/testG0F05E3Loudness \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f05e3-$variant-output.log"; then
+              echo "G0_F05E3_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F05E3_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f05e3-paired-${{ github.run_id }}
+          path: |
+            g0-f05e3-*-output.log
+            g0-f05e3-*-dependency.patch
+            g0-f05e3-environment.txt
+            g0-f05e3-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
