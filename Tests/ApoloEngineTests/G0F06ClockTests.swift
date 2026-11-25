@@ -52,11 +52,14 @@ final class G0F06ClockTests: XCTestCase {
                         let expected=oracle(x,mul,div,mode:m)
                         if actual==expected{roundExact+=1}else{mismatches+=1;print("G0_F06A_MISMATCH kind=round mode=\(m) x=\(x) from=\(a.num)/\(a.den) to=\(b.num)/\(b.den) actual=\(actual) expected=\(expected)")}
                     }
-                    // Exact rational cross multiplication: all selected
-                    // products fit Int64, including the non-unit numerator.
+                    // Signed 128-bit cross products represented by high/low
+                    // words, so even large non-unit time bases cannot overflow.
                     for y in stamps{
-                        let lhs=x*Int64(mul),rhs=y*Int64(div)
-                        let expected:Int32=lhs<rhs ? -1 : lhs>rhs ? 1:0
+                        let lhs=x.multipliedFullWidth(by:Int64(mul))
+                        let rhs=y.multipliedFullWidth(by:Int64(div))
+                        let less=lhs.high<rhs.high || (lhs.high==rhs.high && lhs.low<rhs.low)
+                        let greater=lhs.high>rhs.high || (lhs.high==rhs.high && lhs.low>rhs.low)
+                        let expected:Int32=less ? -1 : greater ? 1:0
                         let actual=av_compare_ts(x,a,y,b)
                         cmpCount+=1
                         if actual==expected{cmpExact+=1}else{mismatches+=1;print("G0_F06A_MISMATCH kind=compare x=\(x) y=\(y) from=\(a.num)/\(a.den) to=\(b.num)/\(b.den) actual=\(actual) expected=\(expected)")}
