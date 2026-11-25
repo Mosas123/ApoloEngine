@@ -1,0 +1,182 @@
+name: G0 F08D.2 paired synthetic legacy audio
+
+on:
+  pull_request:
+    branches: [diag/f08d11-legacy-clock-20261125]
+    paths: [".github/workflows/g0-f08d2-synthetic.yml", "Tests/ApoloEngineTests/G0F08SyntheticLegacyTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f08d2-synthetic-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install signed Ubuntu FFmpeg packages
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg libopencore-amrnb0 libvo-amrwbenc0
+      - name: Generate synthetic MP1 AMR and MP3 fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir G0F08D2
+          python3 - <<'PY'
+          import ctypes as c,hashlib,json,math,pathlib,shutil,struct,subprocess,tempfile
+          root=pathlib.Path("G0F08D2")
+          def run(args):
+              return subprocess.check_output(args,timeout=90)
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          ff=shutil.which("ffmpeg"); probe=shutil.which("ffprobe")
+          manifest={"ffmpeg_version":run([ff,"-version"]).decode(),"ffprobe_version":run([probe,"-version"]).decode(),"packages":run(["dpkg-query","-W","ffmpeg","libopencore-amrnb0","libvo-amrwbenc0"]).decode(),"exe_sha256":{x:sha(pathlib.Path(x)) for x in (ff,probe)},"fixtures":{}}
+          def validate(name,dest,codec,rate,ch,decoder,source_frames,source_sha,expected_frames=None,silence=False):
+              ref=root/f"{name}.f32"
+              run([ff,"-nostdin","-v","error","-y","-c:a",decoder,"-i",str(dest),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le",str(ref)])
+              info=json.loads(run([probe,"-v","error","-select_streams","a","-show_streams","-of","json",str(dest)]))["streams"]
+              assert len(info)==1 and info[0]["codec_name"]==codec and int(info[0]["sample_rate"])==rate and info[0]["channels"]==ch,(name,info)
+              n=ref.stat().st_size//(4*ch)
+              assert 0<n<=rate*3 and ref.stat().st_size==n*4*ch,(name,n)
+              if expected_frames is not None: assert n==expected_frames,(name,n)
+              if silence: assert not any(ref.read_bytes()),name
+              manifest["fixtures"][name]={"encoded_sha256":sha(dest),"reference_sha256":sha(ref),"source_sha256":source_sha,"source_frames":source_frames,"host_frames":n,"host_decoder":decoder,"silence_oracle":silence,"stream":info[0]}
+              print("G0_F08D2_FIXTURE",name,sha(dest),sha(ref),"sourceFrames",source_frames,"hostFrames",n,"decoder",decoder,"silenceOracle",silence)
+          with tempfile.TemporaryDirectory() as tmp:
+              tmp=pathlib.Path(tmp)
+              for rate,si in [(44100,0),(48000,1)]:
+                  for ch in (1,2):
+                      # MPEG-1 Layer I, 128 kb/s, no CRC, zero bit allocation.
+                      header=0xffe00000|(3<<19)|(3<<17)|(1<<16)|(4<<12)|(si<<10)|((3 if ch==1 else 0)<<6)
+                      size=(12*128000//rate)*4
+                      name=f"mp1-{rate}-{ch}"; dest=root/f"{name}.mp1"
+                      dest.write_bytes((struct.pack(">I",header)+bytes(size-4))*30)
+                      validate(name,dest,"mp1",rate,ch,"mp1",11520,hashlib.sha256(bytes(11520*ch*2)).hexdigest(),11520,True)
+                      name=f"mp3-{rate}-{ch}"; dest=root/f"{name}.mp3"
+                      frames=rate//5
+                      vals=[round((7000-1000*k)*math.sin(2*math.pi*(301+137*k)*i/rate)) for i in range(frames) for k in range(ch)]
+                      raw=struct.pack("<"+"h"*len(vals),*vals); src=tmp/"source.s16";src.write_bytes(raw)
+                      run([ff,"-nostdin","-v","error","-y","-f","s16le","-ar",str(rate),"-ac",str(ch),"-i",str(src),"-map_metadata","-1","-c:a","libmp3lame","-b:a","128k","-write_xing","1","-f","mp3",str(dest)])
+                      validate(name,dest,"mp3",rate,ch,"mp3float",frames,hashlib.sha256(raw).hexdigest())
+              for codec,lib,pre,rate,mode,magic,enc_symbol in [
+                  ("amr_nb","libopencore-amrnb.so.0","Encoder_Interface_",8000,7,b"#!AMR\n","Encode"),
+                  ("amr_wb","libvo-amrwbenc.so.0","E_IF_",16000,8,b"#!AMR-WB\n","encode")]:
+                  l=c.CDLL(lib); init=getattr(l,pre+"init");init.restype=c.c_void_p;init.argtypes=[c.c_int] if codec=="amr_nb" else []
+                  enc=getattr(l,pre+enc_symbol);enc.argtypes=[c.c_void_p,c.c_int,c.POINTER(c.c_short),c.POINTER(c.c_ubyte),c.c_int];enc.restype=c.c_int
+                  free=getattr(l,pre+"exit");free.argtypes=[c.c_void_p];free.restype=None
+                  state=init(0) if codec=="amr_nb" else init();assert state
+                  out=bytearray(magic);source=bytearray();n=rate//50
+                  try:
+                      for j in range(20):
+                          vals=[round(5000*math.sin(2*math.pi*440*(j*n+i)/rate)) for i in range(n)]
+                          source.extend(struct.pack("<"+"h"*n,*vals))
+                          a=(c.c_short*n)(*vals);b=(c.c_ubyte*128)();size=enc(state,mode,a,b,0)
+                          assert 0<size<=128
+                          out.extend(bytes(b[:size]))
+                  finally: free(state)
+                  p=tmp/"a.amr";p.write_bytes(out);name=f"{codec}-{rate}-1";dest=root/f"{name}.3gp"
+                  run([ff,"-nostdin","-v","error","-y","-i",str(p),"-map","0:a:0","-c","copy","-f","3gp",str(dest)])
+                  validate(name,dest,codec,rate,1,"amrnb" if codec=="amr_nb" else "amrwb",20*n,hashlib.sha256(source).hexdigest(),20*n)
+          assert len(manifest["fixtures"])==10
+          (root/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          PY
+          (cd G0F08D2 && sha256sum *.mp1 *.mp3 *.3gp *.f32 manifest.json > SHA256SUMS)
+      - name: Preserve exact fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d2-fixtures
+          path: G0F08D2/
+          if-no-files-found: error
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f08d2-synthetic-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical generated fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08d2-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F08D2
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08D2
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08d2-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08d2-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08D2-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08d2-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08SyntheticLegacyTests/testG0F08D2SyntheticLegacy \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08d2-$variant-output.log"; then
+              echo "G0_F08D2_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08D2_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d2-paired-${{ github.run_id }}
+          path: |
+            g0-f08d2-*-output.log
+            g0-f08d2-*-dependency.patch
+            g0-f08d2-environment.txt
+            g0-f08d2-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
