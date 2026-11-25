@@ -58,7 +58,7 @@ jobs:
           for depth in 8 10; do
             fmt=yuv420p
             if [[ "$depth" == 10 ]]; then fmt=yuv420p10le; fi
-            ffmpeg -nostdin -v error -y -f rawvideo -pixel_format "$fmt" -video_size 32x24 -framerate 25 -i "$ROOT/g0-f07c-$depth.yuv" -frames:v 4 -c:v libaom-av1 -lossless 1 -cpu-used 4 -g 1 -lag-in-frames 0 -pix_fmt "$fmt" -f ivf "$ROOT/g0-f07c-$depth.ivf"
+            ffmpeg -nostdin -v error -y -f rawvideo -pixel_format "$fmt" -video_size 32x24 -framerate 25 -i "$ROOT/g0-f07c-$depth.yuv" -frames:v 4 -c:v libaom-av1 -crf 0 -b:v 0 -aom-params lossless=1 -cpu-used 4 -g 1 -lag-in-frames 0 -pix_fmt "$fmt" -f ivf "$ROOT/g0-f07c-$depth.ivf"
           done
           shasum -a 256 "$ROOT"/g0-f07c-* | tee g0-f07c-fixture-sha256.txt
       - name: Execute both pinned variants on the same runner
