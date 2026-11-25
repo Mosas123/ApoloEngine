@@ -89,6 +89,14 @@ final class G0F08AudioTests:XCTestCase{
                       let planes = v.extended_data else { throw MatrixError.invalidFixture }
                 frames += 1
                 trace("stage=frame index=\(frames) packet=\(packets) pts=\(v.pts) bestEffort=\(v.best_effort_timestamp) duration=\(v.duration) samples=\(n) cursor=\(output.count / channels) format=\(v.format) rate=\(v.sample_rate) channels=\(v.ch_layout.nb_channels)")
+                if traceMode != nil {
+                    let cursor=Int64(output.count/channels)
+                    let ticks=v.pts==Int64.min ? nil:av_rescale_q(v.pts,stream.pointee.time_base,AVRational(num:1,den:rate))
+                    let model=ticks ?? cursor
+                    let anchored=(first ?? ticks ?? 0)+cursor
+                    let residual=end.map{model-$0}
+                    trace("stage=coordinate index=\(frames) cursor=\(cursor) ptsTick=\(ticks.map(String.init) ?? "none") modelTick=\(model) anchoredTick=\(anchored) previousRawEnd=\(end.map(String.init) ?? "none") modelVsRawEnd=\(residual.map(String.init) ?? "none")")
+                }
                 if v.pts == Int64.min {
                     missingPTS += 1
                     if let old = end { end = old + Int64(n) }
@@ -119,6 +127,7 @@ final class G0F08AudioTests:XCTestCase{
         for _ in 0..<2048 {
             let rc = av_read_frame(context, packet)
             if rc == eof {
+                trace("stage=flush packets=\(packets) frames=\(frames) cursor=\(output.count/channels)")
                 let sent = avcodec_send_packet(decoder, nil)
                 guard sent >= 0 || sent == eof, try drain() == eof else { throw MatrixError.invalidFixture }
                 return (output, first, end, missingPTS, discontinuities, packets, frames,
@@ -155,7 +164,9 @@ final class G0F08AudioTests:XCTestCase{
     }
 
 
-    func testG0F08ACompressedAudio()throws{
+    func testG0F08ACompressedAudio()throws{try observeCompressedAudio(trace:false)}
+    func testG0F08A1ClockTrace()throws{try observeCompressedAudio(trace:true)}
+    private func observeCompressedAudio(trace:Bool)throws{
         let profiles=[("wmav1","asf"),("wmav2","asf"),("aac_latm","latm"),("ac3","ac3"),("eac3","eac3")]
         var attempted=0,observed=0,errors=0,bridgeExact=0,hostCountMatch=0,compared=0
         for (codec,ext) in profiles{
@@ -173,8 +184,8 @@ final class G0F08AudioTests:XCTestCase{
                         }
                         let maxFrames=Int(rate)*3
                         guard host.count<=maxFrames*ch,host.allSatisfy({$0.isFinite}) else{throw MatrixError.invalidFixture}
-                        let original=try raw(url:url,codecName:codec,rate:rate,channels:ch,maxFrames:maxFrames)
-                        let control=try raw(url:url,codecName:codec,rate:rate,channels:ch,maxFrames:maxFrames,setPacketTimeBase:true)
+                        let original=try raw(url:url,codecName:codec,rate:rate,channels:ch,maxFrames:maxFrames,traceMode:trace ? "original":nil)
+                        let control=try raw(url:url,codecName:codec,rate:rate,channels:ch,maxFrames:maxFrames,traceMode:trace ? "control":nil,setPacketTimeBase:true)
                         let source=try OpenedSource.open(url:url)
                         defer{source.close()}
                         let decoder=AudioDecoder()
@@ -195,6 +206,13 @@ final class G0F08AudioTests:XCTestCase{
                             let t=CMSampleBufferGetPresentationTimeStamp(b).seconds
                             guard t.isFinite,abs(t)<3600 else{throw MatrixError.invalidFixture}
                             let tick=Int64((t*Double(rate)).rounded())
+                            if trace {
+                                let cursor=pcm.count/ch
+                                let delta=end.map{tick-$0}
+                                let pts=CMSampleBufferGetPresentationTimeStamp(b)
+                                let duration=CMSampleBufferGetDuration(b)
+                                print("G0_F08A1_BUFFER fixture=\(name) index=\(buffers+1) cursor=\(cursor) samples=\(n) ptsValue=\(pts.value) ptsScale=\(pts.timescale) tick=\(tick) delta=\(delta.map(String.init) ?? "none") durationValue=\(duration.value) durationScale=\(duration.timescale)")
+                            }
                             if let end,end != tick{jumps+=1;maxJump=max(maxJump,abs(tick-end))}
                             if first==nil{first=tick}
                             end=tick+Int64(n)
