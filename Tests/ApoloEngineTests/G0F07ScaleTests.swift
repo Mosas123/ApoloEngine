@@ -48,7 +48,7 @@ final class G0F07ScaleTests: XCTestCase {
             print("G0_F07A_FORMAT name=\(name) input=\(sws_isSupportedInput(fmt)) output=\(sws_isSupportedOutput(fmt))")
         }
         var profiles=0,oracleProfiles=0,oracleExact=0,compared=0,constantProfiles=0,constantExact=0
-        let algorithms:[(String,Int32)]=[("point",Int32(SWS_POINT)),("bilinear",Int32(SWS_BILINEAR)),("bicubic",Int32(SWS_BICUBIC)),("lanczos",Int32(SWS_LANCZOS))]
+        let algorithms:[(String,Int32)]=[("point",Int32(truncatingIfNeeded: SWS_POINT.rawValue)),("bilinear",Int32(truncatingIfNeeded: SWS_BILINEAR.rawValue)),("bicubic",Int32(truncatingIfNeeded: SWS_BICUBIC.rawValue)),("lanczos",Int32(truncatingIfNeeded: SWS_LANCZOS.rawValue))]
         for (w,h) in [(16,12),(31,19),(64,48)]{
             for (dw,dh) in [(w,h),(w*2,h*2),(w*3,h*3),(max(1,w/2),max(1,h/2))]{
                 for (name,flags) in algorithms{
