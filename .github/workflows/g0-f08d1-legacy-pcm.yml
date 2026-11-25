@@ -1,0 +1,173 @@
+name: G0 F08D.1 paired legacy audio and disc PCM
+
+on:
+  pull_request:
+    branches: [diag/f08c1-matroska-clock-20261125]
+    paths: [".github/workflows/g0-f08d1-legacy-pcm.yml", "Tests/ApoloEngineTests/G0F08LegacyTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f08d1-legacy-pcm-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Install signed Ubuntu FFmpeg packages
+        run: |
+          set -euo pipefail
+          sudo timeout 180s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 update
+          sudo timeout 300s apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 install -y --no-install-recommends ffmpeg
+      - name: Generate legacy and disc PCM fixtures and reference outputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir G0F08D1
+          python3 - <<'PY'
+          import hashlib,json,math,pathlib,shutil,struct,subprocess,tempfile
+          root=pathlib.Path("G0F08D1")
+          def run(args):
+              return subprocess.check_output(args,timeout=90)
+          def sha(p):
+              return hashlib.sha256(p.read_bytes()).hexdigest()
+          ff=shutil.which("ffmpeg"); probe=shutil.which("ffprobe")
+          manifest={"ffmpeg_version":run([ff,"-version"]).decode(),"ffprobe_version":run([probe,"-version"]).decode(),"packages":run(["dpkg-query","-W","ffmpeg"]).decode(),"exe_sha256":{x:sha(pathlib.Path(x)) for x in (ff,probe)},"fixtures":{}}
+          profiles=[
+              ("mp2","mp2","mp2","mp2",[44100,48000],[1,2]),
+              ("adpcm_swf","adpcm_swf","flv","flv",[22050,44100],[1,2]),
+              ("nellymoser","nellymoser","flv","flv",[8000,16000,44100],[1]),
+              ("ra_144","real_144","rm","rm",[8000],[1]),
+              ("speex","libspeex","ogg","ogg",[8000,16000,32000],[1]),
+              ("pcm_bluray","pcm_bluray","mpegts","m2ts",[48000,96000],[2]),
+              ("pcm_dvd","pcm_dvd","dvd","vob",[48000,96000],[2]),
+          ]
+          with tempfile.TemporaryDirectory() as tmp:
+              source=pathlib.Path(tmp)/"source.s16"
+              for codec,encoder,mux,ext,rates,channels in profiles:
+                  for rate in rates:
+                      for ch in channels:
+                          frames=rate//5
+                          vals=[round((8000-400*c)*math.sin(2*math.pi*(301+137*c)*i/rate)) for i in range(frames) for c in range(ch)]
+                          raw=struct.pack("<"+"h"*len(vals),*vals)
+                          source.write_bytes(raw)
+                          name=f"{codec}-{rate}-{ch}"
+                          dest=root/f"{name}.{ext}"
+                          ref=root/f"{name}.f32"
+                          args=[ff,"-nostdin","-v","error","-y","-f","s16le","-ar",str(rate),"-ac",str(ch),"-i",str(source),"-map_metadata","-1","-c:a",encoder,"-strict","experimental"]
+                          if codec=="pcm_bluray": args+=["-mpegts_m2ts_mode","1"]
+                          args+=["-f",mux,str(dest)]
+                          run(args)
+                          # Explicit native decoder for Speex, not the external library.
+                          decode=[ff,"-nostdin","-v","error","-y"]+(["-c:a","speex"] if codec=="speex" else [])+["-i",str(dest),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le",str(ref)]
+                          run(decode)
+                          info=json.loads(run([probe,"-v","error","-select_streams","a","-show_streams","-of","json",str(dest)]))["streams"]
+                          assert len(info)==1 and info[0]["codec_name"]==codec and int(info[0]["sample_rate"])==rate and info[0]["channels"]==ch,(name,info)
+                          assert 0<ref.stat().st_size<=rate*3*ch*4 and ref.stat().st_size%(ch*4)==0,(name,ref.stat().st_size)
+                          oracle=struct.pack("<"+"f"*len(vals),*(v/32768 for v in vals))
+                          lossless=codec.startswith("pcm_")
+                          if lossless:
+                              assert ref.read_bytes()==oracle,(name,"source oracle mismatch")
+                          manifest["fixtures"][name]={"encoded_sha256":sha(dest),"reference_sha256":sha(ref),"source_s16_sha256":hashlib.sha256(raw).hexdigest(),"source_f32_sha256":hashlib.sha256(oracle).hexdigest(),"source_frames":frames,"host_frames":ref.stat().st_size//(ch*4),"lossless_source_oracle_exact":lossless,"stream":info[0],"encoder_args":args[1:],"decoder_args":decode[1:]}
+                          print("G0_F08D1_FIXTURE",name,sha(dest),sha(ref),"sourceOracle",lossless,"sourceFrames",frames,"hostFrames",ref.stat().st_size//(ch*4))
+          assert len(manifest["fixtures"])==19
+          (root/"manifest.json").write_text(json.dumps(manifest,indent=2))
+          PY
+          (cd G0F08D1 && sha256sum *.mp2 *.flv *.rm *.ogg *.m2ts *.vob *.f32 manifest.json > SHA256SUMS)
+      - name: Preserve exact fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d1-fixtures
+          path: G0F08D1/
+          if-no-files-found: error
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f08d1-legacy-pcm-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical generated fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08d1-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F08D1
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08D1
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08d1-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08d1-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08D1-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08d1-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08LegacyTests/testG0F08D1LegacyAndDiscPCM \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08d1-$variant-output.log"; then
+              echo "G0_F08D1_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08D1_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d1-paired-${{ github.run_id }}
+          path: |
+            g0-f08d1-*-output.log
+            g0-f08d1-*-dependency.patch
+            g0-f08d1-environment.txt
+            g0-f08d1-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
