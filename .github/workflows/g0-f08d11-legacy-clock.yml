@@ -1,0 +1,143 @@
+name: G0 F08D.1.1 paired legacy clock trace
+
+on:
+  pull_request:
+    branches: [diag/f08d1-legacy-pcm-20261125]
+    paths: [".github/workflows/g0-f08d11-legacy-clock.yml", "Tests/ApoloEngineTests/G0F08LegacyClockTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f08d11-legacy-clock-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download original F08D.1 fixture artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f08d1-fixtures
+          run-id: 45579506878
+          github-token: ${{ github.token }}
+          path: Tests/ApoloEngineTests/Fixtures/G0F08D1
+      - name: Verify fixture bytes
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F08D1
+          shasum -a 256 -c SHA256SUMS
+          cat > /tmp/g0-f08d11-pinned-sha256 <<'PINNED'
+          704304039462cf443f871f93508aba4818554045be2168a06e320d6eb40884ee  mp2-44100-1.mp2
+          ee46845f8c661b862c60ec991e6cf5c86911367b8b93b498ecd595e4828cdcb5  mp2-44100-1.f32
+          d8eb13844656d49147bdef0fd7e6170e5b5c19d90cfe0708b5760892d8bb9eec  mp2-44100-2.mp2
+          2fa8f8df6a97042f7f5779ba53bf0da082c741453807859c88f044553d47cb33  mp2-44100-2.f32
+          3a7528036413bd6a29ff6cf58db12bfa14af6ef04bcb1143a474fd295b6aef8e  mp2-48000-1.mp2
+          79a8275c866b170930a3c796f6cef0aced1a72cba71913348a4e753f8809cb3a  mp2-48000-1.f32
+          406f8fd25ebacda7da23ac3cc7fd73374101ac10390ae4113f9abe1910f7fc9f  mp2-48000-2.mp2
+          5101e51cfaa169f9498442ba9cd178d189435957251d401605f8b21e7827f96b  mp2-48000-2.f32
+          52598887685f6ec9583838d492222b2a66cb64b2d15238911c2b88b727fea01c  adpcm_swf-22050-1.flv
+          fabe611bc0ea80ff7467c28a4d0a2ba7dc7f07b27ba3eb8481f1d540ef9eca92  adpcm_swf-22050-1.f32
+          4ddddd678f677843dd53dea128a83f1ae2f5acf77235d617a3f1b73b094fc6bb  adpcm_swf-22050-2.flv
+          1f4d65446dddf75a43a4332006a925498ece61d02b3d7629a06fccb68812d7b9  adpcm_swf-22050-2.f32
+          9db9ef040ae67fa247fb48aea4ebf63b5e6b84a01f1f6e2ccc26e05ad253094a  adpcm_swf-44100-1.flv
+          c424fd717ce743202e7bce4115df2131e1439916d672383d88260a0259745985  adpcm_swf-44100-1.f32
+          58d0df679ea122c23ee90d63b629de8e3ab7fc95bd87fe722b2aa7678c10ef3d  adpcm_swf-44100-2.flv
+          91df35e8f0881908c01557ddf009eab1f9a910506d3a23685dd7264f80e9a909  adpcm_swf-44100-2.f32
+          1069f37e7626b063c1a2c372354a0d691ccc52f688796671ccf5e3a19c994d99  nellymoser-8000-1.flv
+          1bdd04ec689ccda2567b9be70d97e1bf9f36e4cf9df3a9dd2e419e15897eb5f3  nellymoser-8000-1.f32
+          ca73218401b7f0a2dd49aec103283dbab779c4b097ff745d2a9137d5927ff8c5  nellymoser-16000-1.flv
+          21440b8857c864e5d66a5e71c14584e18f096c5a3a0ddb6d684f7a9f3d81eb0e  nellymoser-16000-1.f32
+          4c8e6807cf0d25e5641766ee658425f4211dc4812ab0c4b9dc3169856f88f5e2  nellymoser-44100-1.flv
+          49deacff5e7b26a927d38c3eb1130e1d5346d86d7e36a67b7db62e920db027d4  nellymoser-44100-1.f32
+          fc20c09fb37676b5fd4ca6974234f0210c601ad36eaa4c2cd3aebed023a9738b  ra_144-8000-1.rm
+          723a1235425ad868363acf7a16df5a3f428296d1c3bf5fe796691da1437a8a01  ra_144-8000-1.f32
+          a8fe8f32c37892936355d447f70b09d9f6015963694b56a029c663fe513ffa7e  speex-8000-1.ogg
+          0b4faa398a91d70eadd39dafe49240bf09c1d54db58a3826b4f0c4a9f043de5b  speex-8000-1.f32
+          671de2e4e7a42f3faacd8237eabcef72be2637a6920b46f3d8a6367490b1dd77  speex-16000-1.ogg
+          d03fd3532361a660122fbb2af4f83878707f5ad33c266f699e63e893678d537e  speex-16000-1.f32
+          09190d070ce0f13ee6a76877b7e38c2f2e7e684a011b9e766e1c3430f2c6c314  speex-32000-1.ogg
+          c4be5af4f9aaf8e2d685881b8b7ee76d6e3ab760d9b93fe3c406d0229db19232  speex-32000-1.f32
+          9a530f63c0e257cbc5132e24a6de03cd07540c36a6a144f4abf50795c5a3924a  pcm_bluray-48000-2.m2ts
+          a84185fa084aa1c430d4d1001064305eef93fe7cae34b688fcfc3085f38895f2  pcm_bluray-48000-2.f32
+          8a4603595b68d317eb9121b14e36212c7090554b5acd20e79ab158e9601c510c  pcm_bluray-96000-2.m2ts
+          64e0e9c1ad3dcc1bb67d29e45e515c40344663ba717d9b66878a6ba8bbe866b3  pcm_bluray-96000-2.f32
+          43a67377558509c914689f4195b30539918915ba26e1987a7de2cfbc755b9f5b  pcm_dvd-48000-2.vob
+          a84185fa084aa1c430d4d1001064305eef93fe7cae34b688fcfc3085f38895f2  pcm_dvd-48000-2.f32
+          d9f75d544c769b0d3e3d67ff7c42ed64044cd13d5c4136b7f3d21134a2169321  pcm_dvd-96000-2.vob
+          64e0e9c1ad3dcc1bb67d29e45e515c40344663ba717d9b66878a6ba8bbe866b3  pcm_dvd-96000-2.f32
+          PINNED
+          shasum -a 256 -c /tmp/g0-f08d11-pinned-sha256
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f08d11-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f08d11-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F08D11-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f08d11-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F08LegacyClockTests/testG0F08D11LegacyClock \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f08d11-$variant-output.log"; then
+              echo "G0_F08D11_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F08D11_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d11-paired-${{ github.run_id }}
+          path: |
+            g0-f08d11-*-output.log
+            g0-f08d11-*-dependency.patch
+            g0-f08d11-environment.txt
+            g0-f08d11-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
