@@ -1,0 +1,97 @@
+name: G0 F08D.3 remaining codec provenance
+on:
+  pull_request:
+    branches: [diag/f08d2-synthetic-20261125]
+    paths: [".github/workflows/g0-f08d3-provenance.yml"]
+permissions:
+  contents: read
+jobs:
+  provenance:
+    if: github.head_ref == 'diag/f08d3-provenance-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Inspect exact upstream FFmpeg FATE definitions
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: FFmpeg/FFmpeg
+          ref: 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
+          path: upstream
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Inventory candidate fixtures without downloading media
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C upstream rev-parse HEAD)" = 1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7
+          mkdir provenance
+          python3 - <<'PY'
+          import concurrent.futures, hashlib, json, pathlib, re, ssl, urllib.error, urllib.parse, urllib.request
+          root=pathlib.Path("upstream")
+          out=pathlib.Path("provenance")
+          patterns={
+              "atrac3":r"\batrac3\b",
+              "cook":r"\bcook\b",
+              "mpc7":r"\b(?:mpc7|musepack7|mpc-7)\b",
+              "ralf":r"\bralf\b",
+              "real_288":r"\b(?:ra[-_]?288|real[-_]?288|ra[-_]?28[._-]?8)\b",
+              "sipr":r"\bsipr\b",
+              "tak":r"\btak\b",
+              "wmalossless":r"\b(?:wmalossless|wma[-_]lossless)\b",
+              "wmapro":r"\b(?:wmapro|wma[-_]pro)\b",
+              "wmavoice":r"\b(?:wmavoice|wma[-_]voice)\b",
+          }
+          sample=re.compile(r"\$\((?:TARGET_SAMPLES|SAMPLES)\)/([A-Za-z0-9_./+(),@%-]+)")
+          records={k:{"license_status":"UNVERIFIED","approved_for_decode":False,"references":[],"candidates":[]} for k in patterns}
+          files=sorted((root/"tests/fate").glob("*.mak"))
+          assert files,"missing FATE definitions"
+          for p in files:
+              data=p.read_bytes()
+              for n,line in enumerate(data.decode("utf-8",errors="replace").splitlines(),1):
+                  if "CMD" not in line or ":" not in line: continue
+                  lhs=line.split(":",1)[0]
+                  for codec,pat in patterns.items():
+                      if not re.search(pat,lhs,re.I): continue
+                      paths=[]
+                      for m in sample.finditer(line):
+                          v=m.group(1)
+                          if ".." in pathlib.PurePosixPath(v).parts or v.startswith("/"): continue
+                          paths.append(v)
+                      records[codec]["references"].append({"file":str(p.relative_to(root)),"line":n,"definition_sha256":hashlib.sha256(data).hexdigest(),"target":lhs.strip(),"recipe":line.strip(),"literal_paths":paths})
+          all_paths=sorted({p for r in records.values() for ref in r["references"] for p in ref["literal_paths"]})
+          assert len(all_paths)<=200,"unexpected candidate expansion"
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,req,fp,code,msg,headers,newurl): return None
+          def head(path):
+              url="https://fate-suite.ffmpeg.org/"+urllib.parse.quote(path,safe="/")
+              result={"path":path,"url":url,"method":"HEAD","media_downloaded":False,"license_status":"UNVERIFIED"}
+              opener=urllib.request.build_opener(NoRedirect(),urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+              try:
+                  with opener.open(urllib.request.Request(url,method="HEAD",headers={"User-Agent":"ApoloEngine-provenance-audit/1"}),timeout=8) as res:
+                      result.update({"status":res.status,"content_length":res.headers.get("Content-Length"),"content_type":res.headers.get("Content-Type"),"last_modified":res.headers.get("Last-Modified"),"etag":res.headers.get("ETag")})
+              except urllib.error.HTTPError as e:
+                  result.update({"status":e.code,"error":str(e.reason),"location":e.headers.get("Location")})
+                  e.close()
+              except Exception as e: result.update({"status":None,"error":str(e)[:240]})
+              return result
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+              metadata={r["path"]:r for r in pool.map(head,all_paths)}
+          for codec,r in records.items():
+              paths=sorted({p for ref in r["references"] for p in ref["literal_paths"]})
+              r["candidates"]=[metadata[p] for p in paths]
+              print("G0_F08D3_CODEC",codec,"definitions="+str(len(r["references"])),"literalCandidates="+str(len(paths)),"https2xx="+str(sum(isinstance(metadata[p].get("status"),int) and 200<=metadata[p]["status"]<300 for p in paths)),"license=UNVERIFIED","decode=NOT_RUN")
+              for p in paths:
+                  print("G0_F08D3_HEAD",codec,json.dumps(metadata[p],sort_keys=True))
+          report={"upstream_commit":"1041abdc962f4cc4f394aa8de9dc5236c0c3b9e7","official_fate_docs":"https://ffmpeg.org/fate.html","scope":"candidate discovery only; no media bodies, no execution, no redistribution, no license approval","codecs":records}
+          (out/"candidates.json").write_text(json.dumps(report,indent=2,sort_keys=True))
+          assert len(records)==10 and all(not r["approved_for_decode"] for r in records.values())
+          print("G0_F08D3_SUMMARY inventory=10 candidatePaths="+str(len(all_paths))+" approved=0 decoded=0")
+          PY
+      - name: Preserve provenance metadata only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f08d3-provenance-${{ github.run_id }}
+          path: provenance/
+          if-no-files-found: warn
+          retention-days: 14
