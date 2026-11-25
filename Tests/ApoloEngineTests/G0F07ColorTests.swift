@@ -49,7 +49,7 @@ final class G0F07ColorTests: XCTestCase {
             return p
         }
         let ri=inputFull ? "full":"limited",ro=outputFull ? "full":"limited"
-        let src=try node("buffer","src","video_size=\(w)x\(h):pix_fmt=\(infmt.rawValue):time_base=1/1000:pixel_aspect=1/1")
+        let src=try node("buffer","src","video_size=\(w)x\(h):pix_fmt=\(infmt.rawValue):time_base=1/1000:pixel_aspect=1/1:colorspace=bt709:range=\(ri)")
         let options=filter=="zscale"
             ? "w=\(w):h=\(h):rangein=\(ri):range=\(ro):matrixin=709:matrix=709:dither=none"
             : "w=\(w):h=\(h):in_range=\(ri):out_range=\(ro):in_color_matrix=bt709:out_color_matrix=bt709:flags=bilinear+accurate_rnd"
