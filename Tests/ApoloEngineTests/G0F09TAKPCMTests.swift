@@ -245,7 +245,18 @@ final class G0F09TAKPCMTests:XCTestCase{
                             pcm.append(contentsOf:chunk);buffers+=1
                         }
                         guard eof,!original.values.isEmpty,!control.values.isEmpty,!pcm.isEmpty else{throw MatrixError.invalidFixture}
-                        let oracle=(0..<(Int(rate)+17)).flatMap { i in (0..<ch).map { c in Float((i*17+c*113)%8192-4096)/32768 } }
+                        let oracleFrames: Int = Int(rate) + 17
+                        var oracle: [Float] = []
+                        oracle.reserveCapacity(oracleFrames * ch)
+                        for i in 0..<oracleFrames {
+                            for c in 0..<ch {
+                                let frameTerm: Int = i * 17
+                                let channelTerm: Int = c * 113
+                                let sample: Int = (frameTerm + channelTerm) % 8192 - 4096
+                                let normalized: Float = Float(sample) / Float(32768)
+                                oracle.append(normalized)
+                            }
+                        }
                         XCTAssertEqual(metric(host,oracle).0,0)
                         XCTAssertEqual(metric(original.values,oracle).0,0)
                         XCTAssertEqual(metric(control.values,oracle).0,0)
