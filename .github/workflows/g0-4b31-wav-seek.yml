@@ -1,0 +1,156 @@
+name: G0 4B31 WAV seek localization
+
+on:
+  pull_request:
+    branches: [diag/g0-4b3-control-latency-20261126]
+    paths: [".github/workflows/g0-4b31-wav-seek.yml", "Tests/ApoloEngineTests/G0WAVSeekLocalizationTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b31-wav-seek-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-4b1-fixtures
+          run-id: 45762076874
+          github-token: ${{ github.token }}
+          path: Tests/ApoloEngineTests/Fixtures/G04B31
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G04B31
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b31-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b31-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B31-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B31-packages-$variant" \
+              -disablePackageRepositoryCache \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              2>&1 | tee "g0-4b31-$variant-build.log"
+          done
+          git restore -- Package.swift
+          failed=0
+          profiles=(LocalSine HTTPSine LocalPattern HTTPPattern)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B31-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$variant" "$profile")
+              echo "G0_4B31_RUN index=$index variant=$variant test=$profile" | tee "g0-4b31-$run-output.log"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b31-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0WAVSeekLocalizationTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 180 \
+                -maximum-test-execution-time-allowance 300 \
+                2>&1 | tee -a "g0-4b31-$run-output.log"; then
+                echo "G0_4B31_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B31_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b31-control-comparison.txt
+          import pathlib,re,collections
+          paths=sorted(pathlib.Path(".").glob("g0-4b31-[0-9][0-9]-*-output.log"))
+          assert len(paths)==8
+          pids=set()
+          paired={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B31_PROCESS profile=(\S+) pid=(\d+) route=",log)
+              raw=re.findall(r"G0_4B31_RAW case=(\S+) flush=(true|false) ",log)
+              bridge=re.findall(r"G0_4B31_BRIDGE case=(\S+) seek=(\S+) read=(\S+)",log)
+              summary=re.findall(r"G0_4B31_SUMMARY profile=(\S+) cases=20 routes=60",log)
+              assert len(proc)==1 and len(raw)==40 and len(bridge)==20 and len(summary)==1,(path.name,proc,len(raw),len(bridge),summary)
+              name,pid=proc[0]
+              assert pid not in pids
+              pids.add(pid)
+              assert len(set(raw))==40 and len({x[0] for x in bridge})==20
+              assert {x[0] for x in raw}=={x[0] for x in bridge}
+              assert summary==[name]
+              paired[name]=paired.get(name,0)+1
+              print(path.name,"pid",pid,"bridge outcomes",dict(collections.Counter((x[1],x[2]) for x in bridge)))
+          assert len(paired)==4 and all(v==2 for v in paired.values())
+          print("G0_4B31_PAIRED processes=8 profiles=4 cases=160 routes=480 raw=320 bridge=160")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b31-paired-${{ github.run_id }}
+          path: |
+            g0-4b31-*-output.log
+            g0-4b31-*-build.log
+            g0-4b31-control-comparison.txt
+            g0-4b31-*-dependency.patch
+            g0-4b31-environment.txt
+            g0-4b31-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
