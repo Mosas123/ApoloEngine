@@ -1,0 +1,155 @@
+name: G0 4B84 SWR layout format
+
+on:
+  pull_request:
+    branches: [diag/g0-4b83-swr-reconfigure-20261126]
+    paths: [".github/workflows/g0-4b84-swr-layout-format.yml", "Tests/ApoloEngineTests/G0SWRShapePCMTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b84-swr-layout-format-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b84-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b84-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B84-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B84-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+              2>&1 | tee "g0-4b84-$variant-build.log"
+          done
+          git restore -- Package.swift
+          failed=0
+          profiles=(Packing S16 S32 Double Layout Mixed)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B84-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$variant" "$profile")
+              echo "G0_4B84_RUN index=$index variant=$variant test=$profile" | tee "g0-4b84-$run-output.log"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b84-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0SWRShapePCMTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b84-$run-output.log"; then
+                echo "G0_4B84_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B84_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b84-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b84-[0-9][0-9]-*-output.log"))
+          assert len(paths)==12
+          pids=set(); controls={}; identities=0; rematrix=0
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B84_PROCESS pid=(\d+) scenario=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key=proc[0]
+              assert pid not in pids
+              pids.add(pid)
+              cs=re.findall(r"G0_4B84_CONTROL (.*)",log)
+              assert len(cs)==6
+              assert "G0_4B84_SUMMARY controls=6" in log
+              pairs=set()
+              for c in cs:
+                  fields=dict(re.findall(r"(\w+)=([^\s]+)",c))
+                  pairs.add((fields["policy"],fields["phase"]))
+                  assert fields["scenario"]==key
+                  assert int(fields["frames"])==257 and int(fields["tail"])==0
+                  assert float(fields["delta"])<=1e-6
+                  if fields["identity"]=="true":
+                      assert fields["exactIdentity"]=="true"
+                      identities+=1
+                  else:
+                      rematrix+=1
+              assert len(pairs)==6
+              if key in controls:assert controls[key]==cs,(key,"control mismatch")
+              else:controls[key]=cs
+              print(path.name,"pid",pid,*cs,sep="\n")
+          assert len(controls)==6 and identities==68 and rematrix==4
+          print("G0_4B84_PAIRED processes=12 controls=72 identities=68 rematrix=4")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b84-paired-${{ github.run_id }}
+          path: |
+            g0-4b84-*-output.log
+            g0-4b84-*-build.log
+            g0-4b84-control-comparison.txt
+            g0-4b84-*-dependency.patch
+            g0-4b84-environment.txt
+            g0-4b84-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
