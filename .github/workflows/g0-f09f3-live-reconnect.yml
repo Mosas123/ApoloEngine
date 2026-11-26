@@ -1,0 +1,125 @@
+name: G0 F09F3 live reconnect orchestration
+
+on:
+  pull_request:
+    branches: [diag/f09f2-live-cancel-20261125]
+    paths: [".github/workflows/g0-f09f3-live-reconnect.yml", "Tests/ApoloEngineTests/G0F09LiveReconnectTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/f09f3-live-reconnect-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f09f3-environment.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s = p.read_text()
+          old = "    private var liveShouldPlay = true"
+          assert s.count(old) == 1
+          s = s.replace(old, old + "\n    @ObservationIgnored var g0F09F3Open: (@MainActor (ApoloTrack, UInt64) async throws -> Void)?")
+          old = "        liveTitle = nil\n\n        if track.streamMode == .live {"
+          assert s.count(old) == 1
+          s = s.replace(old, "        liveTitle = nil\n\n        if track.streamMode == .live, let hook = g0F09F3Open {\n            try await hook(track, epoch)\n            return\n        }\n\n        if track.streamMode == .live {")
+          s += """
+          @MainActor
+          extension ApoloEngine {
+              var g0F09F3Pending: Bool { liveReconnectTask != nil }
+              var g0F09F3Opening: Bool { liveRetryOpening }
+              var g0F09F3Attempts: Int { liveRetryAttempts }
+              func g0F09F3State(_ value: PlaybackState) { apply(value) }
+              func g0F09F3HTTPStatus(_ status: Int) {
+                  let token = LiveStreamCancellation()
+                  token.recordHTTPStatus(status)
+                  liveCancellation = token
+              }
+          }
+          """
+          p.write_text(s)
+          t = Path("Tests/ApoloEngineTests/G0F09LiveReconnectTests.swift")
+          src = t.read_text()
+          assert src.startswith("#if G0_F09F3_ENABLED\n") and src.rstrip().endswith("#endif")
+          t.write_text(src.split("\n", 1)[1].rstrip().removesuffix("#endif"))
+          PY
+          git diff -- Sources/ApoloEngine/ApoloEngine.swift Tests/ApoloEngineTests/G0F09LiveReconnectTests.swift > g0-f09f3-lab-overlay.patch
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f09f3-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F09F3-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f09f3-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F09LiveReconnectTests \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G0F09F3-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f09f3-$variant-output.log"; then
+              echo "G0_F09F3_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F09F3_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift Sources/ApoloEngine/ApoloEngine.swift Tests/ApoloEngineTests/G0F09LiveReconnectTests.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09f3-paired-${{ github.run_id }}
+          path: |
+            g0-f09f3-*-output.log
+            g0-f09f3-*-dependency.patch
+            g0-f09f3-environment.txt
+            g0-f09f3-lab-overlay.patch
+            g0-f09f3-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
