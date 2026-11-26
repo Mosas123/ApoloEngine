@@ -114,7 +114,6 @@ final class G0ControlLatencyTests: XCTestCase, @unchecked Sendable {
         for index in -1...20 {
             ep.configure(payload:wave,range:true);epB.configure(payload:bWave,range:true)
             blocker.configure(payload:wave,range:true)
-            while blocker.received.wait(timeout:.now()) == .success {}
             let state=State()
             try await submit(q) {
                 let d=try self.open(aURL);state.decoder=d;state.previous=d
@@ -134,7 +133,11 @@ final class G0ControlLatencyTests: XCTestCase, @unchecked Sendable {
                     } catch {blocked.set(begin,self.now(),false)}
                 }
                 // Confirm an actual HTTP request was selected before command submission.
-                guard blocker.received.wait(timeout:.now()+10) == .success else {throw Failure.timeout}
+                let deadline = self.now() + 10_000_000_000
+                while blocker.snapshot().isEmpty {
+                    guard self.now() < deadline else {throw Failure.timeout}
+                    try await Task.sleep(for: .milliseconds(1))
+                }
             }
             let submitted=now()
             let value=try await submit(q) {
@@ -221,7 +224,6 @@ private final class G0ControlRSSEndpointState: @unchecked Sendable {
         let headers: [String: String]
         let body: Data
     }
-    let received = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var payload = Data()
     private var range = true
@@ -280,7 +282,6 @@ private final class G0ControlRSSEndpointState: @unchecked Sendable {
         }
         headers["Content-Length"] = String(body.count)
         events.append(Event(requestStart: start, start: responseStart, status: status, bytes: body.count))
-        received.signal()
         return Reply(status: status, headers: headers, body: body)
     }
 }
