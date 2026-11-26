@@ -1,0 +1,125 @@
+name: G0 F09G31 TAK PCM and partial frame
+
+on:
+  pull_request:
+    branches: [diag/f09g3-tak-fixture-20261125]
+    paths: [".github/workflows/g0-f09g31-tak-pcm.yml", "Tests/ApoloEngineTests/G0F09TAKPCMTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f09g31-tak-pcm-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download original PCM-verified TAK fixture archive
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f09g3-fixtures
+          run-id: 45754065366
+          github-token: ${{ github.token }}
+          path: fixtures
+      - name: Verify original fixture bytes
+        run: |
+          cd fixtures
+          sha256sum -c SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09g31-fixtures
+          path: fixtures/
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f09g31-tak-pcm-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f09g31-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F09G31
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F09G31
+          shasum -a 256 -c SHA256SUMS
+          cat generator.txt encoder-revision.txt
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f09g31-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f09g31-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F09G31-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f09g31-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F09TAKPCMTests \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G0F09G31-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f09g31-$variant-output.log"; then
+              echo "G0_F09G31_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F09G31_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09g31-paired-${{ github.run_id }}
+          path: |
+            g0-f09g31-*-output.log
+            g0-f09g31-*-dependency.patch
+            g0-f09g31-environment.txt
+            g0-f09g31-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
