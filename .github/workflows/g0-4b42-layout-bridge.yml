@@ -1,0 +1,210 @@
+name: G0 4B42 layout bridge isolated control
+
+on:
+  pull_request:
+    branches: [diag/g0-4b41-hires-multichannel-20261126]
+    paths: [".github/workflows/g0-4b42-layout-bridge.yml", "Tests/ApoloEngineTests/G0LayoutBridgeTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b42-layout-bridge-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b42-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            for mode in original overlay; do
+              select_pin "$variant"
+              git restore -- Sources/ApoloEngine/AudioDecoder.swift
+              if [[ "$mode" == overlay ]]; then
+                python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        Self.makeResamplerOutputLayout(channels: channels, into: &outputLayout)"
+          assert s.count(old)==1
+          s=s.replace(old,"        guard av_channel_layout_copy(&outputLayout, &inputLayout) >= 0 else { av_channel_layout_uninit(&inputLayout); return false }")
+          old="try createFormatDescription()"
+          assert s.count(old)==1
+          s=s.replace(old,"try createFormatDescription(&outputLayout)")
+          start=s.index("    private func createFormatDescription() throws {")
+          end=s.index("    private static func layoutTag(",start)
+          s=s[:start]+'''    private func createFormatDescription(_ output: inout AVChannelLayout) throws {
+                  let mapping: [String: UInt32] = [
+                      "FL": kAudioChannelLabel_Left, "FR": kAudioChannelLabel_Right,
+                      "FC": kAudioChannelLabel_Center, "LFE": kAudioChannelLabel_LFEScreen,
+                      "BL": kAudioChannelLabel_RearSurroundLeft, "BR": kAudioChannelLabel_RearSurroundRight,
+                      "SL": kAudioChannelLabel_LeftSurround, "SR": kAudioChannelLabel_RightSurround,
+                      "BC": kAudioChannelLabel_CenterSurround,
+                      "FLC": kAudioChannelLabel_LeftCenter, "FRC": kAudioChannelLabel_RightCenter
+                  ]
+                  let count = Int(output.nb_channels)
+                  guard count == Int(channels), count > 0,
+                        let offset = MemoryLayout<AudioChannelLayout>.offset(of: \\.mChannelDescriptions)
+                  else { throw ApoloError.unsupportedFormat }
+                  var labels: [UInt32] = []
+                  for i in 0..<count {
+                      let id = av_channel_layout_channel_from_index(&output, UInt32(i))
+                      var buffer = [CChar](repeating: 0, count: 64)
+                      let rc = buffer.withUnsafeMutableBufferPointer { av_channel_name($0.baseAddress, $0.count, id) }
+                      guard rc >= 0 else { throw ApoloError.unsupportedFormat }
+                      let name = buffer.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+                      if count == 1 && name == "FC" { labels.append(kAudioChannelLabel_Mono) }
+                      else if let label = mapping[name] { labels.append(label) }
+                      else { throw ApoloError.unsupportedFormat }
+                  }
+                  let size = offset + count * MemoryLayout<AudioChannelDescription>.stride
+                  let storage = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: MemoryLayout<AudioChannelLayout>.alignment)
+                  defer { storage.deallocate() }
+                  storage.initializeMemory(as: UInt8.self, repeating: 0, count: size)
+                  let layout = storage.assumingMemoryBound(to: AudioChannelLayout.self)
+                  layout.pointee.mChannelLayoutTag = kAudioChannelLayoutTag_UseChannelDescriptions
+                  layout.pointee.mNumberChannelDescriptions = UInt32(count)
+                  let entries = storage.advanced(by: offset).assumingMemoryBound(to: AudioChannelDescription.self)
+                  for (i,label) in labels.enumerated() {
+                      var entry = AudioChannelDescription()
+                      entry.mChannelLabel = label
+                      entries[i] = entry
+                  }
+                  var asbd = AudioStreamBasicDescription(mSampleRate: Float64(sampleRate),
+                      mFormatID: kAudioFormatLinearPCM,
+                      mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
+                      mBytesPerPacket: UInt32(count*4), mFramesPerPacket: 1,
+                      mBytesPerFrame: UInt32(count*4), mChannelsPerFrame: UInt32(count),
+                      mBitsPerChannel: 32, mReserved: 0)
+                  var description: CMAudioFormatDescription?
+                  let status = CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault,
+                      asbd: &asbd, layoutSize: size, layout: layout, magicCookieSize: 0,
+                      magicCookie: nil, extensions: nil, formatDescriptionOut: &description)
+                  guard status == noErr, let description else { throw ApoloError.unsupportedFormat }
+                  formatDescription = description
+              }
+
+          '''+s[end:]
+          p.write_text(s)
+          PY
+              fi
+              key="$variant-$mode"
+              git diff -- Package.swift | tee "g0-4b42-$key-dependency.patch"
+              git diff -- Sources/ApoloEngine/AudioDecoder.swift | tee "g0-4b42-$key-source.patch"
+              xcodebuild build-for-testing \
+                -scheme ApoloEngine \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -derivedDataPath ".build/G04B42-$key" \
+                -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B42-packages-$variant" \
+                -disablePackageRepositoryCache \
+                ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+                2>&1 | tee "g0-4b42-$key-build.log"
+            done
+          done
+          git restore -- Package.swift Sources/ApoloEngine/AudioDecoder.swift
+          failed=0
+          for key in baseline-original baseline-overlay a1-overlay a1-original; do
+            XCTESTRUN=$(find ".build/G04B42-$key/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            export TEST_RUNNER_APOLO_G0_LAYOUT_OVERLAY=0
+            if [[ "$key" == *-overlay ]]; then export TEST_RUNNER_APOLO_G0_LAYOUT_OVERLAY=1; fi
+            echo "G0_4B42_RUN key=$key" | tee "g0-4b42-$key-output.log"
+            if xcodebuild test-without-building \
+              -xctestrun "$XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-4b42-$key.xcresult" \
+              -only-testing:ApoloEngineTests/G0LayoutBridgeTests/testMatrix \
+              -parallel-testing-enabled NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 300 \
+              -maximum-test-execution-time-allowance 600 \
+              2>&1 | tee -a "g0-4b42-$key-output.log"; then
+              echo "G0_4B42_VARIANT key=$key result=PASS"
+            else
+              failed=1
+              echo "G0_4B42_VARIANT key=$key result=FAIL"
+            fi
+          done
+          python3 - <<'PY' | tee g0-4b42-control-comparison.txt
+          import pathlib,re
+          pids=set()
+          results={}
+          for key in ("baseline-original","baseline-overlay","a1-overlay","a1-original"):
+              log=pathlib.Path(f"g0-4b42-{key}-output.log").read_text(errors="replace")
+              flag=str(key.endswith("-overlay")).lower()
+              proc=re.findall(r"G0_4B42_PROCESS pid=(\d+) overlay=(true|false)",log)
+              assert len(proc)==1 and proc[0][1]==flag and proc[0][0] not in pids,(key,proc)
+              pids.add(proc[0][0])
+              cases=re.findall(r"G0_4B42_CASE (.*)",log)
+              assert len(cases)==28,(key,len(cases))
+              assert len(set(re.findall(r"G0_4B42_CASE name=(\S+) rate=(\d+)",log)))==28
+              summary=re.findall(r"G0_4B42_SUMMARY cases=28 sourceExact=(\d+) labelsExact=(\d+) overlay=(true|false)",log)
+              assert len(summary)==1 and summary[0][2]==flag
+              if flag=="true":
+                  assert summary==[("28","28","true")]
+              results[key]=cases
+              print(key,summary)
+          for mode in ("original","overlay"):
+              assert results[f"baseline-{mode}"]==results[f"a1-{mode}"],mode
+          print("G0_4B42_PAIRED processes=4 cases=112 original=56 overlay=56")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b42-paired-${{ github.run_id }}
+          path: |
+            g0-4b42-*-output.log
+            g0-4b42-*-build.log
+            g0-4b42-control-comparison.txt
+            g0-4b42-*-dependency.patch
+            g0-4b42-*-source.patch
+            g0-4b42-environment.txt
+            g0-4b42-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
