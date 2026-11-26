@@ -2,7 +2,7 @@ name: G0 4B2 HTTP memory isolation
 
 on:
   pull_request:
-    branches: [diag/g0-4b2-baseline-20261126]
+    branches: [diag/g0-4b1-baseline-20261126]
     paths: [".github/workflows/g0-4b2-http-rss.yml", "Tests/ApoloEngineTests/G0HTTPMemoryTests.swift"]
 
 permissions:
