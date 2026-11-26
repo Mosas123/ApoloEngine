@@ -124,7 +124,7 @@ final class G0HTTPMemoryTests: XCTestCase {
                 sem.signal()
             }
             task.resume()
-            guard sem.wait(timeout:.now()+15)==.success else{task.cancel();throw Failure.timeout}
+            guard sem.wait(timeout: .now() + 15) == .success else{task.cancel();throw Failure.timeout}
             let v=result.get()
             if let error=v.2 {throw error}
             let data=try XCTUnwrap(v.0)
