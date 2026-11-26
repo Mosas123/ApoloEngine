@@ -1,0 +1,226 @@
+name: G0 4B82 dynamic shape
+
+on:
+  pull_request:
+    branches: [diag/g0-4b81-dynamic-swr-20261126]
+    paths: [".github/workflows/g0-4b82-dynamic-shape.yml", "Tests/ApoloEngineTests/G0DynamicShapeTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate synthetic AAC-LC ADTS channel sequences
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          mkdir -p fixtures
+          ffmpeg -version > fixtures/generator.txt
+          for ch in 1 2 6; do
+            ffmpeg -nostdin -v error -f lavfi -i "sine=frequency=997:sample_rate=48000:duration=0.25" -ac "$ch" -c:a aac -profile:a aac_low -b:a 128k -f adts "fixtures/$ch.aac"
+          done
+          cat fixtures/2.aac fixtures/2.aac fixtures/2.aac > fixtures/Constant.aac
+          cat fixtures/2.aac fixtures/1.aac fixtures/2.aac > fixtures/StereoMono.aac
+          cat fixtures/1.aac fixtures/2.aac fixtures/1.aac > fixtures/MonoStereo.aac
+          cat fixtures/2.aac fixtures/6.aac fixtures/2.aac > fixtures/StereoSix.aac
+          (cd fixtures && sha256sum *.aac > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b82-fixtures
+          path: fixtures/
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/g0-4b82-dynamic-shape-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: g0-4b82-fixtures
+          path: fixtures
+      - name: Verify fixture hashes
+        run: cd fixtures && shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_SHAPE_GUARD: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b82-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="    private var resampler: OpaquePointer?"
+          assert s.count(old)==1
+          s=s.replace(old,old+"\n    private var g0ShapeSignature: String?")
+          old="""            if resampler == nil, !makeResampler(from: frame) {
+                continue
+            }
+            append(frame)"""
+          new="""            // G0 runner-only observation. Never call stale SWR with changed input shape.
+            var layout = frame.pointee.ch_layout
+            let ch = layout.nb_channels
+            let rate = frame.pointee.sample_rate
+            let fmt = frame.pointee.format
+            guard rate > 0, ch > 0, ch <= 8,
+                  fmt == AV_SAMPLE_FMT_FLTP.rawValue,
+                  let planes = frame.pointee.extended_data,
+                  (0..<Int(ch)).allSatisfy({ planes[$0] != nil }) else {
+                print("G0_4B82_GUARD invalid=true")
+                continue
+            }
+            let ids = (0..<Int(ch)).map { String(av_channel_layout_channel_from_index(&layout, UInt32($0)).rawValue) }
+            let sig = "\\(rate):\\(fmt):\\(ch):\\(ids.joined(separator: ","))"
+            if resampler == nil {
+                guard makeResampler(from: frame) else { continue }
+                g0ShapeSignature = sig
+            }
+            let allow = g0ShapeSignature == sig
+            print("G0_4B82_GUARD sig=\\(sig) samples=\\(frame.pointee.nb_samples) allow=\\(allow)")
+            guard allow else { continue }
+            append(frame)"""
+          assert s.count(old)==1
+          p.write_text(s.replace(old,new))
+          PY
+          git diff -- Sources/ApoloEngine/AudioDecoder.swift | tee g0-4b82-guard.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b82-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B82-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B82-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+              2>&1 | tee "g0-4b82-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine/AudioDecoder.swift
+          failed=0
+          profiles=(Constant StereoMono MonoStereo StereoSix Descriptors)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B82-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              if [[ "$profile" != Descriptors ]]; then
+                export TEST_RUNNER_APOLO_G0_DYNAMIC_FIXTURE="$(base64 -i "fixtures/$profile.aac" | tr -d '\n')"
+              else
+                unset TEST_RUNNER_APOLO_G0_DYNAMIC_FIXTURE
+              fi
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$variant" "$profile")
+              echo "G0_4B82_RUN index=$index variant=$variant test=$profile" | tee "g0-4b82-$run-output.log"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b82-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0DynamicShapeTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b82-$run-output.log"; then
+                echo "G0_4B82_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B82_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b82-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b82-[0-9][0-9]-*-output.log"))
+          assert len(paths)==10
+          pids=set(); controls={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B82_PROCESS pid=(\d+) scenario=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key=proc[0]
+              assert pid not in pids
+              pids.add(pid)
+              cs=re.findall(r"G0_4B82_CONTROL (.*)",log)
+              assert len(cs)==1
+              assert "G0_4B82_SUMMARY controls=1" in log
+              assert "G0_4B82_GUARD invalid=true" not in log
+              if key != "Descriptors":
+                  guard=re.findall(r"G0_4B82_GUARD sig=(\S+) samples=(\d+) allow=(true|false)",log)
+                  assert guard,(path.name,"no actual guard")
+                  counts=dict(re.findall(r"(acceptedFrames|blockedFrames|acceptedSamples|blockedSamples|bridgeSamples)=(\d+)",cs[0]))
+                  for label,flag in [("accepted","true"),("blocked","false")]:
+                      subset=[int(n) for sig,n,ok in guard if ok==flag]
+                      assert len(subset)==int(counts[label+"Frames"])
+                      assert sum(subset)==int(counts[label+"Samples"])
+                  assert int(counts["bridgeSamples"])==int(counts["acceptedSamples"])
+                  assert (int(counts["blockedFrames"])==0)==(key=="Constant")
+              if key in controls:assert controls[key]==cs,(key,"control mismatch")
+              else:controls[key]=cs
+              print(path.name,"pid",pid,cs[0])
+          assert len(controls)==5
+          print("G0_4B82_PAIRED processes=10 controls=10")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b82-paired-${{ github.run_id }}
+          path: |
+            g0-4b82-*-output.log
+            g0-4b82-*-build.log
+            g0-4b82-control-comparison.txt
+            g0-4b82-*-dependency.patch
+            g0-4b82-environment.txt
+            g0-4b82-guard.patch
+            g0-4b82-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
