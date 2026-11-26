@@ -1,0 +1,177 @@
+name: G0 4B1 performance baseline
+
+on:
+  pull_request:
+    branches: [diag/f09h1-mux-pcm-20261125]
+    paths: [".github/workflows/g0-4b1-baseline.yml", "Tests/ApoloEngineTests/G0PerformanceBaselineTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/g0-4b1-baseline-20261126'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Generate identical synthetic fixtures and host counts
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          mkdir -p fixtures
+          cd fixtures
+          ffmpeg -version > generator.txt
+          ffmpeg -nostdin -v error -f lavfi -i 'sine=frequency=433:sample_rate=48000:duration=4' -ac 2 -c:a pcm_s16le source.wav
+          ffmpeg -nostdin -v error -i source.wav -c:a flac source.flac
+          ffmpeg -nostdin -v error -i source.wav -c:a libopus -b:a 96k source.opus
+          ffmpeg -nostdin -v error -i source.wav -c:a aac -b:a 96k source.m4a
+          python3 - <<'PY'
+          import json, pathlib, subprocess, hashlib
+          rows=[]
+          for name,codec in [("source.wav","pcm_s16le"),("source.flac","flac"),("source.opus","opus"),("source.m4a","aac")]:
+              result=json.loads(subprocess.check_output(["ffprobe","-v","error","-show_streams","-of","json",name]))
+              s=result["streams"][0]
+              assert len(result["streams"])==1 and s["codec_name"]==codec and s["sample_rate"]=="48000" and s["channels"]==2
+              pcm=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-xerror","-i",name,"-map","0:a:0","-c:a","pcm_f32le","-f","f32le","-"])
+              assert 0<len(pcm)<=48000*12*8 and len(pcm)%8==0
+              row=dict(file=name,codec=codec,frames=len(pcm)//8,sha256=hashlib.sha256(pathlib.Path(name).read_bytes()).hexdigest())
+              if codec in ("pcm_s16le","flac"): assert row["frames"]==192000
+              rows.append(row)
+              print("G0_4B1_HOST",row)
+          pathlib.Path("manifest.json").write_text(json.dumps(rows,indent=2))
+          PY
+          sha256sum source.* manifest.json generator.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b1-fixtures
+          path: fixtures/
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/g0-4b1-baseline-20261126'
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-4b1-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G04B1
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G04B1
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b1-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b1-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B1-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B1-packages-$variant" \
+              -disablePackageRepositoryCache \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              2>&1 | tee "g0-4b1-$variant-build.log"
+          done
+          git restore -- Package.swift
+          failed=0
+          index=0
+          for variant in baseline a1 a1 baseline; do
+            index=$((index+1))
+            run="$index-$variant"
+            # Reuse exact prebuilt xctestrun; no compile during timed trials.
+            XCTESTRUN=$(find ".build/G04B1-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            echo "G0_4B1_RUN index=$index variant=$variant xctestrun=$XCTESTRUN" | tee "g0-4b1-$run-output.log"
+            if xcodebuild test-without-building \
+              -xctestrun "$XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-4b1-$run.xcresult" \
+              -only-testing:ApoloEngineTests/G0PerformanceBaselineTests \
+              -parallel-testing-enabled NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee -a "g0-4b1-$run-output.log"; then
+              echo "G0_4B1_VARIANT index=$index variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_4B1_VARIANT index=$index variant=$variant result=FAIL"
+            fi
+          done
+          python3 - <<'PY' | tee g0-4b1-control-comparison.txt
+          import pathlib,re
+          rows=[]
+          for path in sorted(pathlib.Path(".").glob("g0-4b1-[1-4]-*-output.log")):
+              lines=path.read_text(errors="replace").splitlines()
+              controls=[re.search(r"G0_4B1_CONTROL profile=(\S+) frames=(\d+) buffers=(\d+) sha=([0-9a-f]{64})",x).groups() for x in lines if re.search(r"G0_4B1_CONTROL profile=(\S+) frames=(\d+) buffers=(\d+) sha=([0-9a-f]{64})",x)]
+              cases=[x for x in lines if re.search(r"G0_4B1_CASE profile=\S+ index=\d+",x)]
+              print(path.name,"controls",len(controls),"measured",len(cases))
+              assert len(controls)==6 and len(cases)==120
+              rows.append(controls)
+          assert len(rows)==4 and all(r==rows[0] for r in rows), "paired correctness control mismatch"
+          print("G0_4B1_PAIRED controls=24 measured=480 bitwiseControlHashes=true")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b1-paired-${{ github.run_id }}
+          path: |
+            g0-4b1-*-output.log
+            g0-4b1-*-build.log
+            g0-4b1-control-comparison.txt
+            g0-4b1-*-dependency.patch
+            g0-4b1-environment.txt
+            g0-4b1-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
