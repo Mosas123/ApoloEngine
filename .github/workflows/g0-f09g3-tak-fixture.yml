@@ -1,0 +1,167 @@
+name: G0 F09G3 TAK fixture provenance and demux
+
+on:
+  pull_request:
+    branches: [diag/f09g2-bitmap-subtitles-20261125]
+    paths: [".github/workflows/g0-f09g3-tak-fixture.yml", "Tests/ApoloEngineTests/G0F09TAKDemuxTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/f09g3-tak-fixture-20261125'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Generate synthetic WAV and build isolated encoder
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          mkdir -p fixtures encoder
+          git -C encoder init
+          git -C encoder remote add origin https://github.com/Snesnopic/takdecomp.git
+          git -C encoder fetch --depth=1 origin 38872fe2d61b6e76c0f07990c05bc397166f0418
+          git -C encoder checkout --detach FETCH_HEAD
+          test "$(git -C encoder rev-parse HEAD)" = 38872fe2d61b6e76c0f07990c05bc397166f0418
+          cp encoder/LICENSE fixtures/encoder-LICENSE.txt
+          git -C encoder rev-parse HEAD > fixtures/encoder-revision.txt
+          ffmpeg -version > fixtures/generator.txt
+          python3 - <<'PY'
+          import wave, struct, pathlib
+          for name,rate,channels in [('mono',44100,1),('stereo',48000,2)]:
+              pcm=b''.join(struct.pack('<h',((i*17+c*113)%8192)-4096) for i in range(rate+17) for c in range(channels))
+              pathlib.Path('fixtures',name+'.pcm').write_bytes(pcm)
+              with wave.open('fixtures/'+name+'.wav','wb') as w:
+                  w.setnchannels(channels);w.setsampwidth(2);w.setframerate(rate);w.writeframes(pcm)
+          PY
+          # Build toolchain image before mounting any encoder source.
+          printf 'FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y --no-install-recommends g++ cmake make && rm -rf /var/lib/apt/lists/*\n' | docker build -t g0-tak-toolchain -
+          # No repository credentials, external network, or host workspace mounted.
+          docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --user "$(id -u):$(id -g)" --memory 2g --pids-limit 128 \
+            -v "$PWD/encoder:/src:ro" -v "$PWD/fixtures:/out:rw" g0-tak-toolchain \
+            sh -c 'set -eu; cmake -S /src -B /tmp/build -DCMAKE_BUILD_TYPE=Release; cmake --build /tmp/build -j2; for name in mono stereo; do /tmp/build/bin/takc -e -p0 -tn1 -overwrite /out/$name.wav /out/$name.tak; done'
+      - name: Independent FFmpeg PCM and packet verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd fixtures
+          python3 - <<'PY'
+          import subprocess, hashlib, json, pathlib
+          p=pathlib.Path
+          fixtures=[]
+          for name,rate,channels in [('mono',44100,1),('stereo',48000,2)]:
+              fn=name+'.tak'
+              original=p(name+'.pcm').read_bytes()
+              assert len(original)==(rate+17)*channels*2
+              decoded=subprocess.check_output(['ffmpeg','-nostdin','-v','error','-xerror','-i',fn,'-map','0:a:0','-f','s16le','-c:a','pcm_s16le','-'])
+              assert decoded==original, (name,len(decoded),len(original))
+              result=json.loads(subprocess.check_output(['ffprobe','-v','error','-show_streams','-show_format','-show_packets','-show_data_hash','sha256','-of','json',fn]))
+              assert result['format']['format_name']=='tak'
+              st=result['streams'][0]
+              assert len(result['streams'])==1 and st['codec_name']=='tak' and int(st['sample_rate'])==rate and st['channels']==channels
+              assert result['packets']
+              fixtures.append(dict(file=fn,format='tak',codec='tak',forced=False,rate=rate,channels=channels,samples=rate+17,sha256=hashlib.sha256(p(fn).read_bytes()).hexdigest(),packets=[dict(size=int(q['size']),sha256=q['data_hash'].split(':')[1].lower()) for q in result['packets']]))
+              print('G0_F09G3_HOST',name,'samples',rate+17,'pcmExact',True,'sha256',hashlib.sha256(original).hexdigest())
+          p('manifest.json').write_text(json.dumps(dict(fixtures=fixtures),indent=2))
+          PY
+          sha256sum *.tak *.wav *.pcm manifest.json generator.txt encoder-LICENSE.txt encoder-revision.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09g3-fixtures
+          path: fixtures/
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/f09g3-tak-fixture-20261125'
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-f09g3-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G0F09G3
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G0F09G3
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Execute both pinned variants on the same runner
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          NAME=$(xcrun simctl list devices available \
+            | sed -n 's/^[[:space:]]*\(iPhone[^()]*\) (.*/\1/p' \
+            | head -1 | sed 's/[[:space:]]*$//')
+          test -n "$NAME"
+          {
+            git rev-parse HEAD
+            uname -a
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$NAME"
+          } | tee g0-f09g3-environment.txt
+          failed=0
+          for variant in baseline a1; do
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$variant"
+            if [[ "$variant" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p = Path("Package.swift")
+          s = p.read_text()
+          old = 'branch: "apolo-union"'
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, 'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+            git diff -- Package.swift | tee "g0-f09g3-$variant-dependency.patch"
+            export G0_VARIANT="$variant"
+            if xcodebuild test \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,name=$NAME" \
+              -derivedDataPath ".build/G0F09G3-$variant" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-f09g3-$variant.xcresult" \
+              -only-testing:ApoloEngineTests/G0F09TAKDemuxTests \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G0F09G3-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -parallel-testing-enabled NO \
+              ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 600 \
+              -maximum-test-execution-time-allowance 900 \
+              2>&1 | tee "g0-f09g3-$variant-output.log"; then
+              echo "G0_F09G3_VARIANT variant=$variant result=PASS"
+            else
+              failed=1
+              echo "G0_F09G3_VARIANT variant=$variant result=FAIL"
+            fi
+          done
+          git restore -- Package.swift
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-f09g3-paired-${{ github.run_id }}
+          path: |
+            g0-f09g3-*-output.log
+            g0-f09g3-*-dependency.patch
+            g0-f09g3-environment.txt
+            g0-f09g3-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
