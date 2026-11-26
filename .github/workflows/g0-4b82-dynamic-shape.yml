@@ -97,32 +97,8 @@ jobs:
           old="    private var resampler: OpaquePointer?"
           assert s.count(old)==1
           s=s.replace(old,old+"\n    private var g0ShapeSignature: String?")
-          old="""            if resampler == nil, !makeResampler(from: frame) {
-                continue
-            }
-            append(frame)"""
-          new="""            // G0 runner-only observation. Never call stale SWR with changed input shape.
-            var layout = frame.pointee.ch_layout
-            let ch = layout.nb_channels
-            let rate = frame.pointee.sample_rate
-            let fmt = frame.pointee.format
-            guard rate > 0, ch > 0, ch <= 8,
-                  fmt == AV_SAMPLE_FMT_FLTP.rawValue,
-                  let planes = frame.pointee.extended_data,
-                  (0..<Int(ch)).allSatisfy({ planes[$0] != nil }) else {
-                print("G0_4B82_GUARD invalid=true")
-                continue
-            }
-            let ids = (0..<Int(ch)).map { String(av_channel_layout_channel_from_index(&layout, UInt32($0)).rawValue) }
-            let sig = "\\(rate):\\(fmt):\\(ch):\\(ids.joined(separator: ","))"
-            if resampler == nil {
-                guard makeResampler(from: frame) else { continue }
-                g0ShapeSignature = sig
-            }
-            let allow = g0ShapeSignature == sig
-            print("G0_4B82_GUARD sig=\\(sig) samples=\\(frame.pointee.nb_samples) allow=\\(allow)")
-            guard allow else { continue }
-            append(frame)"""
+          old="            if resampler == nil, !makeResampler(from: frame) {\n                continue\n            }\n            append(frame)"
+          new="            // G0 runner-only observation. Never call stale SWR with changed input shape.\n            var layout = frame.pointee.ch_layout\n            let ch = layout.nb_channels\n            let rate = frame.pointee.sample_rate\n            let fmt = frame.pointee.format\n            guard rate > 0, ch > 0, ch <= 8,\n                  fmt == AV_SAMPLE_FMT_FLTP.rawValue,\n                  let planes = frame.pointee.extended_data,\n                  (0..<Int(ch)).allSatisfy({ planes[$0] != nil }) else {\n                print(\"G0_4B82_GUARD invalid=true\")\n                continue\n            }\n            let ids = (0..<Int(ch)).map { String(av_channel_layout_channel_from_index(&layout, UInt32($0)).rawValue) }\n            let sig = \"\\(rate):\\(fmt):\\(ch):\\(ids.joined(separator: \",\"))\"\n            if resampler == nil {\n                guard makeResampler(from: frame) else { continue }\n                g0ShapeSignature = sig\n            }\n            let allow = g0ShapeSignature == sig\n            print(\"G0_4B82_GUARD sig=\\(sig) samples=\\(frame.pointee.nb_samples) allow=\\(allow)\")\n            guard allow else { continue }\n            append(frame)"
           assert s.count(old)==1
           p.write_text(s.replace(old,new))
           PY
