@@ -2,7 +2,7 @@ name: G0 4B21 worker autorelease boundaries
 
 on:
   pull_request:
-    branches: [diag/g0-4b21-http-rss-20261126]
+    branches: [diag/g0-4b2-http-rss-20261126]
     paths: [".github/workflows/g0-4b21-worker-pools.yml", "Tests/ApoloEngineTests/G0WorkerMemoryTests.swift"]
 
 permissions:
