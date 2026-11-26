@@ -1,0 +1,158 @@
+name: G0 4B32 seek frames and isolated overlay
+
+on:
+  pull_request:
+    branches: [diag/g0-4b31-wav-seek-20261126]
+    paths: [".github/workflows/g0-4b32-seek-frames.yml", "Tests/ApoloEngineTests/G0SeekFrameTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b32-seek-frames-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-4b1-fixtures
+          run-id: 45762076874
+          github-token: ${{ github.token }}
+          path: Tests/ApoloEngineTests/Fixtures/G04B32
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G04B32
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b32-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            for mode in original overlay; do
+              select_pin "$variant"
+              git restore -- Sources/ApoloEngine/AudioDecoder.swift
+              if [[ "$mode" == overlay ]]; then
+                python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        avformat_flush(formatContext)\n"
+          assert s.count(old)==1
+          p.write_text(s.replace(old,"        // G0 runner-only control: omit extra demux flush.\n"))
+          PY
+              fi
+              key="$variant-$mode"
+              git diff -- Package.swift | tee "g0-4b32-$key-dependency.patch"
+              git diff -- Sources/ApoloEngine/AudioDecoder.swift | tee "g0-4b32-$key-source.patch"
+              xcodebuild build-for-testing \
+                -scheme ApoloEngine \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -derivedDataPath ".build/G04B32-$key" \
+                -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B32-packages-$variant" \
+                -disablePackageRepositoryCache \
+                ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+                2>&1 | tee "g0-4b32-$key-build.log"
+            done
+          done
+          git restore -- Package.swift Sources/ApoloEngine/AudioDecoder.swift
+          failed=0
+          for key in baseline-original baseline-overlay a1-overlay a1-original; do
+            XCTESTRUN=$(find ".build/G04B32-$key/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            export TEST_RUNNER_APOLO_G0_SEEK_OVERLAY=0
+            if [[ "$key" == *-overlay ]]; then export TEST_RUNNER_APOLO_G0_SEEK_OVERLAY=1; fi
+            echo "G0_4B32_RUN key=$key" | tee "g0-4b32-$key-output.log"
+            if xcodebuild test-without-building \
+              -xctestrun "$XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-4b32-$key.xcresult" \
+              -only-testing:ApoloEngineTests/G0SeekFrameTests/testMatrix \
+              -parallel-testing-enabled NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 300 \
+              -maximum-test-execution-time-allowance 600 \
+              2>&1 | tee -a "g0-4b32-$key-output.log"; then
+              echo "G0_4B32_VARIANT key=$key result=PASS"
+            else
+              failed=1
+              echo "G0_4B32_VARIANT key=$key result=FAIL"
+            fi
+          done
+          python3 - <<'PY' | tee g0-4b32-control-comparison.txt
+          import pathlib,re
+          pids=set()
+          for key in ("baseline-original","baseline-overlay","a1-overlay","a1-original"):
+              log=pathlib.Path(f"g0-4b32-{key}-output.log").read_text(errors="replace")
+              overlay=key.endswith("-overlay")
+              flag=str(overlay).lower()
+              raw=0 if overlay else 20
+              proc=re.findall(r"G0_4B32_PROCESS pid=(\d+) overlay=(true|false)",log)
+              assert len(proc)==1 and proc[0][1]==flag and proc[0][0] not in pids,(key,proc)
+              pids.add(proc[0][0])
+              assert len(re.findall(r"G0_4B32_RAW case=",log))==raw,key
+              assert len(re.findall(r"G0_4B32_BRIDGE case=",log))==40,key
+              assert len(re.findall(r"G0_4B32_COMPRESSED case=",log))==24,key
+              assert f"G0_4B32_SUMMARY overlay={flag} raw={raw} bridge=40 compressed=24" in log,key
+              print(key,"raw",raw,"bridge",40,"compressed",24)
+          print("G0_4B32_PAIRED processes=4 raw=40 bridge=160 compressed=96 total=296")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b32-paired-${{ github.run_id }}
+          path: |
+            g0-4b32-*-output.log
+            g0-4b32-*-build.log
+            g0-4b32-control-comparison.txt
+            g0-4b32-*-dependency.patch
+            g0-4b32-*-source.patch
+            g0-4b32-environment.txt
+            g0-4b32-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
