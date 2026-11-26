@@ -49,7 +49,7 @@ jobs:
           path: Tests/ApoloEngineTests/Fixtures/G0F09G31
       - name: Verify fixtures
         run: |
-          cd Tests/ApoloEngineTests/Fixtures/G0F09G
+          cd Tests/ApoloEngineTests/Fixtures/G0F09G31
           shasum -a 256 -c SHA256SUMS
           cat generator.txt encoder-revision.txt
       - name: Select matching Xcode
