@@ -1,0 +1,271 @@
+name: G0 4B41 high-rate multichannel ownership
+
+on:
+  pull_request:
+    branches: [diag/g0-4b4-copy-accounting-20261126]
+    paths: [".github/workflows/g0-4b41-hires-multichannel.yml", "Tests/ApoloEngineTests/G0HighRateOwnershipTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  fixtures:
+    if: github.head_ref == 'diag/g0-4b41-hires-multichannel-20261126'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Generate independent deterministic channel-distinct references
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          mkdir -p fixtures
+          cd fixtures
+          ffmpeg -version > generator.txt
+          python3 - <<'PY'
+          import hashlib,json,pathlib,struct,subprocess,math
+          def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+          rows=[]
+          configs=[
+              ("stereo96.wav","pcm_s24le",96000,2,"stereo",192000,True),
+              ("stereo192.wav","pcm_s24le",192000,2,"stereo",384000,True),
+              ("stereo96.flac","flac",96000,2,"stereo",192000,True),
+              ("surround51.wav","pcm_s24le",48000,6,"5.1",96000,True),
+              ("surround71.flac","flac",96000,8,"7.1",192000,True),
+              ("surround51.eac3","eac3",48000,6,"5.1",98304,False)]
+          for name,codec,rate,ch,layout,n,lossless in configs:
+              # Independent signed 24-bit integer oracle, per-channel distinct streams.
+              states=[(0x12345678+i*0x1020304)&0xffffffff for i in range(ch)]
+              raw=bytearray();ref=bytearray()
+              for i in range(n):
+                  for j in range(ch):
+                      x=states[j]
+                      x^=(x<<13)&0xffffffff;x^=x>>17;x^=(x<<5)&0xffffffff
+                      states[j]=x
+                      v=(x&0x7fffff)-0x400000 if lossless else round(0x180000*math.sin(2*math.pi*(53 if j==3 else 211+j*97)*i/rate))
+                      raw.extend(struct.pack("<i",v<<8))
+                      ref.extend(struct.pack("<f",v/8388608))
+              out=pathlib.Path(name)
+              args=["ffmpeg","-nostdin","-v","error","-f","s32le","-ar",str(rate),"-ac",str(ch),"-channel_layout",layout,"-i","pipe:0","-map","0:a:0","-c:a",codec]
+              if codec=="flac":args+=["-sample_fmt","s32","-bits_per_raw_sample","24"]
+              if codec=="eac3":args+=["-b:a","640k"]
+              subprocess.run(args+[name],input=raw,check=True)
+              info=json.loads(subprocess.check_output(["ffprobe","-v","error","-show_streams","-of","json",name]))["streams"][0]
+              assert info["codec_name"]==codec and int(info["sample_rate"])==rate and info["channels"]==ch,info
+              actual=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-xerror","-i",name,"-map","0:a:0","-c:a","pcm_f32le","-f","f32le","-"])
+              assert len(actual)==n*ch*4,(name,len(actual),n*ch*4)
+              if lossless:assert actual==ref,(name,"host decode differs from independent source")
+              else:ref=actual
+              p=pathlib.Path(name+".f32");p.write_bytes(ref)
+              row=dict(file=name,codec=codec,rate=rate,channels=ch,frames=n,layout=info.get("channel_layout",layout),sha256=sha(out),reference=p.name,referenceSHA=sha(p),lossless=lossless)
+              rows.append(row);print("G0_4B41_FIXTURE",row)
+          pathlib.Path("manifest.json").write_text(json.dumps(rows,indent=2))
+          PY
+          sha256sum *.wav *.flac *.eac3 *.f32 manifest.json generator.txt > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b41-fixtures
+          path: fixtures/
+          retention-days: 14
+  paired:
+    needs: fixtures
+    if: github.head_ref == 'diag/g0-4b41-hires-multichannel-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Download identical synthetic fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: g0-4b41-fixtures
+          path: Tests/ApoloEngineTests/Fixtures/G04B41
+      - name: Verify fixtures
+        run: |
+          cd Tests/ApoloEngineTests/Fixtures/G04B41
+          shasum -a 256 -c SHA256SUMS
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b41-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            for mode in clean audit; do
+              select_pin "$variant"
+              git restore -- Sources/ApoloEngine/AudioDecoder.swift Sources/ApoloEngine/HTTPStream.swift
+              if [[ "$mode" == audit ]]; then
+                python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          def change(old,new,n):
+              global s
+              assert s.count(old)==n,(old,s.count(old))
+              s=s.replace(old,new)
+          change("        var output: UnsafeMutablePointer<UInt8>? = memory\n",
+                 '        print("G0_4B41_ALLOC requested=\\(outputSamples * bytesPerFrame) capacityFrames=\\(outputSamples) usable=\\(malloc_size(memory))")\n        var output: UnsafeMutablePointer<UInt8>? = memory\n',2)
+          change("        guard converted > 0 else {\n",
+                 '        print("G0_4B41_SWR converted=\\(converted) capacityFrames=\\(outputSamples) bytesPerFrame=\\(bytesPerFrame)")\n        guard converted > 0 else {\n',2)
+          change("        processIfNeeded(memory, frames: Int(converted))\n",
+                 '        print("G0_4B41_DSP frames=\\(converted) channels=\\(channels)")\n        processIfNeeded(memory, frames: Int(converted))\n',2)
+          change("        var timing = CMSampleTimingInfo(\n",
+                 '        var g0Pointer: UnsafeMutablePointer<Int8>?\n        var g0Length = 0\n        var g0Total = 0\n        let g0Status = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: &g0Length, totalLengthOut: &g0Total, dataPointerOut: &g0Pointer)\n        let g0Same = g0Pointer.map { UnsafeMutableRawPointer($0) == memory } ?? false\n        print("G0_4B41_BLOCK bytes=\\(byteCount) status=\\(g0Status) samePointer=\\(g0Same) contiguous=\\(g0Length) total=\\(g0Total)")\n        var timing = CMSampleTimingInfo(\n',1)
+          change("        return sampleBuffer\n",
+                 '        print("G0_4B41_SAMPLE bytes=\\(byteCount) frames=\\(samples)")\n        return sampleBuffer\n',1)
+          p.write_text(s)
+          p=Path("Sources/ApoloEngine/HTTPStream.swift")
+          s=p.read_text()
+          change("            position += Int64(toCopy)\n",
+                 '            print("G0_4B41_COPY kind=fullData bytes=\\(toCopy)")\n            position += Int64(toCopy)\n',1)
+          change("\n        position += Int64(toCopy)\n",
+                 '\n        print("G0_4B41_COPY kind=cache bytes=\\(toCopy)")\n        position += Int64(toCopy)\n',1)
+          change("        guard let buffer = av_malloc(bufferSize) else { return nil }\n",
+                 '        guard let buffer = av_malloc(bufferSize) else { return nil }\n        print("G0_4B41_AVIO requested=\\(bufferSize)")\n',1)
+          p.write_text(s)
+          PY
+              fi
+              key="$variant-$mode"
+              git diff -- Package.swift | tee "g0-4b41-$key-dependency.patch"
+              git diff -- Sources/ApoloEngine/AudioDecoder.swift Sources/ApoloEngine/HTTPStream.swift | tee "g0-4b41-$key-source.patch"
+              xcodebuild build-for-testing \
+                -scheme ApoloEngine \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -derivedDataPath ".build/G04B41-$key" \
+                -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B41-packages-$variant" \
+                -disablePackageRepositoryCache \
+                ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+                2>&1 | tee "g0-4b41-$key-build.log"
+            done
+          done
+          git restore -- Package.swift Sources/ApoloEngine/AudioDecoder.swift Sources/ApoloEngine/HTTPStream.swift
+          failed=0
+          index=0
+          for key in baseline-clean baseline-audit a1-audit a1-clean; do
+            XCTESTRUN=$(find ".build/G04B41-$key/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            export TEST_RUNNER_APOLO_G0_COPY_AUDIT=0
+            if [[ "$key" == *-audit ]]; then export TEST_RUNNER_APOLO_G0_COPY_AUDIT=1; fi
+            order="WAV96 WAV192 FLAC96 WAV51 FLAC71 EAC3"
+            if [[ "$key" == a1-* ]]; then order="EAC3 FLAC71 WAV51 FLAC96 WAV192 WAV96"; fi
+            for profile in $order; do
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$key" "$profile")
+              echo "G0_4B41_RUN index=$index key=$key test=$profile" | tee "g0-4b41-$run-output.log"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b41-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0HighRateOwnershipTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 180 \
+                -maximum-test-execution-time-allowance 300 \
+                2>&1 | tee -a "g0-4b41-$run-output.log"; then
+                echo "G0_4B41_VARIANT index=$index key=$key test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B41_VARIANT index=$index key=$key test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b41-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b41-[0-9][0-9]-*-output.log"))
+          assert len(paths)==24
+          pids=set()
+          observed={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B41_PROCESS profile=(\S+) pid=(\d+) audit=(true|false) rate=(\d+) channels=(\d+) layout=(\S+) lossless=(true|false)",log)
+              assert len(proc)==1,(path.name,proc)
+              name,pid,audit,rate,ch,layout,lossless=proc[0]
+              bpf=int(ch)*4
+              assert pid not in pids
+              pids.add(pid)
+              cases=re.findall(r"G0_4B41_CASE profile=(\S+) index=(-?\d+) frames=(\d+) buffers=(\d+) hash=(\S+)",log)
+              n=1 if audit=="true" else 14
+              assert len(cases)==n,(path.name,len(cases))
+              assert f"G0_4B41_SUMMARY profile={name} audit={audit} cases={n}" in log
+              assert all(row[0]==name for row in cases)
+              expected=cases[0]
+              if audit=="true":
+                  alloc=re.findall(r"G0_4B41_ALLOC requested=(\d+) capacityFrames=(\d+) usable=(\d+)",log)
+                  swr=re.findall(r"G0_4B41_SWR converted=(-?\d+) capacityFrames=(\d+) bytesPerFrame=(\d+)",log)
+                  blocks=re.findall(r"G0_4B41_BLOCK bytes=(\d+) status=(-?\d+) samePointer=(true|false) contiguous=(\d+) total=(\d+)",log)
+                  samples=re.findall(r"G0_4B41_SAMPLE bytes=(\d+) frames=(\d+)",log)
+                  dsp=re.findall(r"G0_4B41_DSP frames=(\d+) channels=(\d+)",log)
+                  copies=re.findall(r"G0_4B41_COPY kind=(\S+) bytes=(\d+)",log)
+                  avio=re.findall(r"G0_4B41_AVIO requested=(\d+)",log)
+                  assert len(alloc)==len(swr) and len(alloc)>0
+                  assert all(int(u)>=int(r)>0 for r,_,u in alloc)
+                  assert all(int(r)==int(c)*bpf for r,c,_ in alloc)
+                  assert len(samples)==len(blocks)==len(dsp)==int(expected[3])
+                  assert sum(int(x[1]) for x in samples)==int(expected[2])
+                  assert sum(int(x[0]) for x in samples)==int(expected[2])*bpf
+                  assert all(int(x[1])==0 and x[2]=="true" and x[0]==x[3]==x[4] for x in blocks)
+                  assert len(avio)==0 and len(copies)==0
+                  held=re.findall(r"G0_4B41_HELD count=(\d+) distinct=(\d+) bytes=(\d+) afterClose=true",log)
+                  assert held==[(expected[3],expected[3],str(int(expected[2])*bpf))],(path.name,held)
+                  print("G0_4B41_ACCOUNT",path.name,"allocCalls",len(alloc),"requested",sum(int(x[0]) for x in alloc),"usable",sum(int(x[2]) for x in alloc),"swrZero",sum(int(x[0])<=0 for x in swr),"pcmBytes",sum(int(x[0]) for x in samples),"samePointers",len(blocks),"httpCopyCalls",len(copies),"httpCopyBytes",sum(int(x[1]) for x in copies),"avioRequested",sum(map(int,avio)))
+              else:
+                  assert not re.search(r"G0_4B41_(ALLOC|SWR|BLOCK|SAMPLE|DSP|COPY|AVIO) ",log)
+              observed[name]=observed.get(name,0)+1
+          assert len(observed)==6 and all(v==4 for v in observed.values())
+          print("G0_4B41_PAIRED processes=24 profiles=6 audit=12 measured=120 warmups=24 controls=24 total=180")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b41-paired-${{ github.run_id }}
+          path: |
+            g0-4b41-*-output.log
+            g0-4b41-*-build.log
+            g0-4b41-control-comparison.txt
+            g0-4b41-*-dependency.patch
+            g0-4b41-environment.txt
+            g0-4b41-*-source.patch
+            g0-4b41-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
