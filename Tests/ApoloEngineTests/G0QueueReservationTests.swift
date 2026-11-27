@@ -133,7 +133,7 @@ final class G0QueueReservationTests: XCTestCase {
         let cleared=name=="ClearNative" || name=="ClearLibav" || name=="StopNative" || name=="StopLibav"
         let stopped=name=="StopNative" || name=="StopLibav"
         let toDecoder=name=="ClearLibav" || name=="SwitchToLibav"
-        let expectedDispatch=!(candidate && cleared)
+        let expectedDispatch = !(candidate && cleared)
         let expectedNative=expectedDispatch && !toDecoder ? (name=="ClearReenqueue" && !candidate ? 2:1):0
         try require(nativeCount==expectedNative,"native target multiplicity mismatch")
         try require(decoder == (expectedDispatch && toDecoder),"decoder target assignment mismatch")
