@@ -2,7 +2,7 @@ name: G0 4B107 seek outcomes
 
 on:
   pull_request:
-    branches: [diag/g0-4b107-elapsed-writers-20261127]
+    branches: [diag/g0-4b1062-elapsed-writers-20261127]
     paths: [".github/workflows/g0-4b107-seek-outcomes.yml", "Tests/ApoloEngineTests/G0SeekOutcomesTests.swift"]
 
 permissions:
