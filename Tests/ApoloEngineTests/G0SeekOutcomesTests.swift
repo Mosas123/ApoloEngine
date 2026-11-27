@@ -86,6 +86,7 @@ final class G0SeekOutcomesTests: XCTestCase {
     @MainActor private func run(_ name:String) async throws {
         print("G0_4B107_PROCESS pid=\(getpid()) scenario=\(name)")
         XCTAssertFalse(AVPlayerHost.nativeHLSTimedMetadataEnabled)
+        try require(ProcessInfo.processInfo.environment["APOLO_G0_SEEK_PROFILE"] == name,"profile environment mismatch")
         let native = name.hasPrefix("Native")
         let noItem = name == "NativeNoItem"
         let e = ApoloEngine(managesSystemMediaControls:false,managesAudioSession:false)
@@ -94,7 +95,8 @@ final class G0SeekOutcomesTests: XCTestCase {
         e.limiterEnabled = false
         defer { e.g0OutcomeRelease(); e.stop() }
         if !noItem {
-            let url = try native ? nativeFixture() : fixture(seconds:8,marker:100)
+            let url: URL
+            if native { url = try nativeFixture() } else { url = try fixture(seconds:8,marker:100) }
             defer { try? FileManager.default.removeItem(at:url) }
             try await load(e,url,native ? .avPlayer : .libavcodec,events)
             // Keep the source file until all worker activity and cleanup finish.
@@ -135,7 +137,11 @@ final class G0SeekOutcomesTests: XCTestCase {
             let completed=await wait { events.all().contains{$0.hasPrefix("g0.outcome result ")} }
             try require(completed,"missing worker outcome")
             if name == "LibavStopQueued" {
-                let stopped=await wait { events.all().contains{$0.hasPrefix("g0.outcome stopped ")} }
+                let stopped=await wait {
+                    let lines=events.all()
+                    guard let index=lines.firstIndex(where:{$0.hasPrefix("g0.outcome result ")}) else { return false }
+                    return lines.dropFirst(index+1).contains{$0.hasPrefix("g0.outcome stopped ")}
+                }
                 try require(stopped,"queued stop missing")
             }
             try await Task.sleep(for:.milliseconds(350))
