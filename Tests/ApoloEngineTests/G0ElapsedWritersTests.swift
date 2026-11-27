@@ -120,7 +120,7 @@ final class G0ElapsedWritersTests: XCTestCase {
         e.g0Mark("afterNaturalWindow")
         let naturalElapsed = e.elapsed
         let naturalClock = e.currentTime
-        let naturalWrites = e.g0Trace.filter{$0.contains("writer=nativeTime") && $0.contains("phase=afterCommand")}
+        let naturalWrites = e.g0Trace.filter{$0.contains("writer=nativeTime") && ($0.contains("phase=afterCommand") || $0.contains("phase=afterRelease"))}
         var injectedTickAccepted = false
         var injectedTimeAccepted = false
         if name == "InjectedStop" {
