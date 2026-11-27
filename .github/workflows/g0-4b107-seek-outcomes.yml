@@ -1,0 +1,203 @@
+name: G0 4B107 seek outcomes
+
+on:
+  pull_request:
+    branches: [diag/g0-4b1062-elapsed-writers-20261127]
+    paths: [".github/workflows/g0-4b107-seek-outcomes.yml", "Tests/ApoloEngineTests/G0SeekOutcomesTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b107-seek-outcomes-20261127'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_SEEK_OUTCOMES: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b107-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="    private let host = AVPlayerHost()"
+          new="    private let host = AVPlayerHost()\n    private(set) var g0OutcomePublications: [TimeInterval] = []\n    var g0OutcomeNativeResult: Bool { host.g0OutcomeResult }\n    func g0OutcomeRelease() { libavHost?.g0OutcomeRelease() }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="        elapsed = seconds\n        refreshNowPlaying()"
+          new="        elapsed = seconds\n        g0OutcomePublications.append(elapsed)\n        refreshNowPlaying()"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          p=Path("Sources/ApoloEngine/AVPlayerHost.swift")
+          s=p.read_text()
+          old="    private let player = AVQueuePlayer()"
+          new="    private let player = AVQueuePlayer()\n    private(set) var g0OutcomeResult = false"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="        _ = await player.seek(\n            to: time,\n            toleranceBefore: .zero,\n            toleranceAfter: .zero\n        )"
+          new="        if ProcessInfo.processInfo.environment[\"APOLO_G0_SEEK_PROFILE\"] == \"NativeCancelPending\" {\n            g0OutcomeResult = await withCheckedContinuation { continuation in\n                player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { finished in\n                    continuation.resume(returning: finished)\n                }\n                player.currentItem?.cancelPendingSeeks()\n            }\n        } else {\n            g0OutcomeResult = await player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)\n        }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="    private let renderer = AVSampleBufferAudioRenderer()"
+          new="    private let renderer = AVSampleBufferAudioRenderer()\n    private let g0OutcomeGate = DispatchSemaphore(value: 0)\n    func g0OutcomeRelease() { g0OutcomeGate.signal() }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)"
+          new="        let g0First = timelineEnd == 0\n        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)\n        if g0First {\n            diagnostics.emit(\"g0.rendererEnqueued epoch=\\(currentPlaybackEpoch) frames=\\(CMSampleBufferGetNumSamples(buffer)) end=\\(timelineEnd) rate=\\(synchronizer.rate)\")\n        }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self, let decoder = self.decoder else { return }\n            do {"
+          new="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self else { return }\n            let profile = ProcessInfo.processInfo.environment[\"APOLO_G0_SEEK_PROFILE\"] ?? \"\"\n            let epoch = self.currentPlaybackEpoch\n            self.diagnostics.emit(\"g0.outcome entered epoch=\\(epoch) target=\\(seconds)\")\n            guard self.g0OutcomeGate.wait(timeout: .now() + 25) == .success else {\n                self.diagnostics.emit(\"g0.outcome result outcome=gateTimeout epoch=\\(epoch)\")\n                return\n            }\n            guard let decoder = self.decoder else {\n                self.diagnostics.emit(\"g0.outcome result outcome=noDecoder epoch=\\(epoch)\")\n                return\n            }\n            do {\n                if profile == \"LibavInjectedFailure\" { throw NSError(domain: \"G0InjectedSeekFailure\", code: 1) }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="                self.startRequesting()\n            } catch {\n                self.publish(.failed(\"Seek failed\"))"
+          new="                self.startRequesting()\n                self.diagnostics.emit(\"g0.outcome result outcome=success epoch=\\(epoch) clock=\\(self.currentTime)\")\n            } catch {\n                let outcome = (error as NSError).domain == \"G0InjectedSeekFailure\" ? \"injectedFailure\" : \"decoderFailure\"\n                self.diagnostics.emit(\"g0.outcome result outcome=\\(outcome) epoch=\\(epoch) clock=\\(self.currentTime)\")\n                self.publish(.failed(\"Seek failed\"))"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="    func stop() {\n        queue.async { [weak self] in\n            guard let self else { return }\n            self.reset()\n            self.publish(.idle)"
+          new="    func stop() {\n        queue.async { [weak self] in\n            guard let self else { return }\n            self.reset()\n            self.publish(.idle)\n            self.diagnostics.emit(\"g0.outcome stopped epoch=\\(self.currentPlaybackEpoch)\")"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine | tee g0-4b107-route-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b107-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B107-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B107-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_SEEK_OUTCOMES' \
+              2>&1 | tee "g0-4b107-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(NativeNormal NativeNoItem NativeCancelPending LibavNormal LibavInjectedFailure LibavStopQueued)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B107-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$variant" "$profile")
+              echo "G0_4B107_RUN index=$index variant=$variant test=$profile" | tee "g0-4b107-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_SEEK_PROFILE="$profile"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b107-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0SeekOutcomesTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b107-$run-output.log"; then
+                echo "G0_4B107_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B107_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b107-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b107-[0-9][0-9]-*-output.log"))
+          assert len(paths)==12
+          pids=set(); pairs={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B107_PROCESS pid=(\d+) scenario=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key=proc[0]
+              assert pid not in pids and key in path.name
+              pids.add(pid)
+              obs=re.findall(r"G0_4B107_OBSERVATION (.*)",log)
+              cs=re.findall(r"G0_4B107_CONTROL (.*)",log)
+              starts=re.findall(r"G0_4B107_START route=(\S+) epoch=(\d+) (.*)",log)
+              pauses=re.findall(r"G0_4B107_PAUSE route=(\S+) epoch=(\d+) drift=(\S+)",log)
+              assert len(cs)==len(obs)==1 and "cleanup=true" in cs[0] and "metadataOff=true" in cs[0]
+              assert len(starts)==len(pauses)==(0 if key=="NativeNoItem" else 1)
+              if starts: assert starts[0][:2]==pauses[0][:2] and float(pauses[0][2])<.05
+              pending=re.findall(r"G0_4B107_PENDING (.*)",log)
+              worker=re.findall(r"G0_4B107_WORKER (.*)",log)
+              if key.startswith("Libav"):
+                  assert len(pending)==1 and "completion=false" in pending[0]
+                  assert sum("result outcome=" in x for x in worker)==1
+              else: assert not pending and not worker
+              pairs.setdefault(key,[]).append(cs[0])
+              print(path.name,"pid",pid,*cs,*obs,*pending,*worker,sep="\n")
+          assert len(pairs)==6 and all(len(x)==2 and x[0]==x[1] for x in pairs.values())
+          print("G0_4B107_PAIRED processes=12 controls=12 observations=12")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b107-paired-${{ github.run_id }}
+          path: |
+            g0-4b107-*-output.log
+            g0-4b107-*-build.log
+            g0-4b107-control-comparison.txt
+            g0-4b107-*-dependency.patch
+            g0-4b107-environment.txt
+            g0-4b107-route-overlay.patch
+            g0-4b107-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
