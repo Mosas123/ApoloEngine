@@ -1,0 +1,203 @@
+name: G0 4B1074 integrated seek oracle
+
+on:
+  pull_request:
+    branches: [diag/g0-4b1073-seek-sample-oracle-20261127]
+    paths: [".github/workflows/g0-4b1074-integrated-seek-oracle.yml", "Tests/ApoloEngineTests/G0IntegratedSeekOracleTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b1074-integrated-seek-oracle-20261127'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_INTEGRATED_ORACLE: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b1074-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        avformat_flush(formatContext)\n        avcodec_flush_buffers(codecContext)"
+          new="        if ProcessInfo.processInfo.environment[\"APOLO_G0_INTEGRATED_MODE\"] != \"noFlush\" { avformat_flush(formatContext) }\n        avcodec_flush_buffers(codecContext)"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="    private let host = AVPlayerHost()"
+          new="    private let host = AVPlayerHost()\n    private(set) var g0IntegratedPublications: [TimeInterval] = []\n    func g0IntegratedRelease() { libavHost?.g0IntegratedRelease() }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="        elapsed = seconds\n        refreshNowPlaying()\n    }\n\n    /// Queues a source"
+          new="        elapsed = seconds\n        g0IntegratedPublications.append(elapsed)\n        diagnosticEvents.emit(\"g0.integrated published seek=\\(g0IntegratedPublications.count) target=\\(seconds) clock=\\(currentTime)\")\n        refreshNowPlaying()\n    }\n\n    /// Queues a source"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="    private let renderer = AVSampleBufferAudioRenderer()"
+          new="    private let renderer = AVSampleBufferAudioRenderer()\n    private let g0IntegratedGate = DispatchSemaphore(value: 0)\n    private var g0IntegratedSeek = 0\n    func g0IntegratedRelease() { g0IntegratedGate.signal() }\n    private func g0IntegratedInspect(_ buffer: CMSampleBuffer) -> String {\n        let n = CMSampleBufferGetNumSamples(buffer)\n        let pts = CMSampleBufferGetPresentationTimeStamp(buffer).seconds\n        let ramp = g0IntegratedSeek == 0 ? 0 : SeekTransientRamp.frameCount(sampleRate: 48000)\n        guard pts.isFinite, n > ramp, let block = CMSampleBufferGetDataBuffer(buffer), CMBlockBufferGetDataLength(block) == n * 8 else { return \"ptsTick=-1 actualIndex=-1 mismatch=-1 frames=\\(n) ramp=\\(ramp)\" }\n        var values = [Float](repeating: 0,count:n*2)\n        let status = values.withUnsafeMutableBytes { CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:$0.count,destination:$0.baseAddress!) }\n        let l = values[ramp*2]*32768, r = values[ramp*2+1]*32768\n        guard status == kCMBlockBufferNoErr, l.isFinite, r.isFinite, abs(l)<=32768, abs(r)<=32768, l == l.rounded(), r == r.rounded() else { return \"ptsTick=-1 actualIndex=-1 mismatch=-1 frames=\\(n) ramp=\\(ramp)\" }\n        let lo = Int(l)+16384, hi = Int(r)+8192\n        guard (0..<32768).contains(lo), hi>=0, hi%1024==0 else { return \"ptsTick=-1 actualIndex=-1 mismatch=-1 frames=\\(n) ramp=\\(ramp)\" }\n        let actual = hi/1024*32768+lo-ramp\n        var mismatch = 0\n        for j in ramp..<n {\n            let i=actual+j\n            if i<0 || i>=384000 || values[j*2] != Float((i & 32767)-16384)/32768 || values[j*2+1] != Float((i >> 15)*1024-8192)/32768 { mismatch += 1 }\n        }\n        return \"ptsTick=\\(Int((pts*48000).rounded())) actualIndex=\\(actual) mismatch=\\(mismatch) frames=\\(n) ramp=\\(ramp)\"\n    }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self, let decoder = self.decoder else { return }\n            do {"
+          new="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self, let decoder = self.decoder else { return }\n            self.g0IntegratedSeek += 1\n            self.diagnostics.emit(\"g0.integrated entered seek=\\(self.g0IntegratedSeek) target=\\(seconds)\")\n            guard self.g0IntegratedGate.wait(timeout: .now() + 25) == .success else {\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=false reason=gateTimeout\")\n                return\n            }\n            do {"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="                self.startRequesting()\n            } catch {\n                self.publish(.failed(\"Seek failed\"))"
+          new="                self.startRequesting()\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=true clock=\\(self.currentTime)\")\n            } catch {\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=false clock=\\(self.currentTime)\")\n                self.publish(.failed(\"Seek failed\"))"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="    private func enqueueDecoded(_ buffer: CMSampleBuffer) {\n        if !started {"
+          new="    private func enqueueDecoded(_ buffer: CMSampleBuffer) {\n        let g0First = !started\n        let g0PCM = g0First ? g0IntegratedInspect(buffer) : \"\"\n        if g0First { diagnostics.emit(\"g0.integrated beforeEnqueue seek=\\(g0IntegratedSeek) \\(g0PCM) clock=\\(currentTime) rate=\\(synchronizer.rate)\") }\n        if !started {"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          old="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)"
+          new="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)\n        if g0First { diagnostics.emit(\"g0.integrated enqueued seek=\\(g0IntegratedSeek) \\(g0PCM) clock=\\(currentTime) rate=\\(synchronizer.rate) epoch=\\(currentPlaybackEpoch)\") }"
+          assert s.count(old)==1, (str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine | tee g0-4b1074-route-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b1074-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B1074-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B1074-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_INTEGRATED_ORACLE' \
+              2>&1 | tee "g0-4b1074-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(Single2 Single3 Sequential Overlap)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B1074-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for mode in original noFlush; do
+            export TEST_RUNNER_APOLO_G0_INTEGRATED_MODE="$mode"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s-%s' "$index" "$variant" "$mode" "$profile")
+              echo "G0_4B1074_RUN index=$index variant=$variant test=$profile" | tee "g0-4b1074-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_INTEGRATED_PROFILE="$profile"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b1074-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0IntegratedSeekOracleTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b1074-$run-output.log"; then
+                echo "G0_4B1074_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B1074_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+            done
+          done
+          python3 - <<'PY' | tee g0-4b1074-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b1074-[0-9][0-9]-*-output.log"))
+          assert len(paths)==16
+          pids=set(); pairs={}; observations=0; workers=0
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B1074_PROCESS pid=(\d+) scenario=(\S+) mode=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key,mode=proc[0]
+              assert pid not in pids and key in path.name and "-"+mode+"-" in path.name
+              pids.add(pid)
+              obs=re.findall(r"G0_4B1074_OBSERVATION (.*)",log)
+              cs=re.findall(r"G0_4B1074_CONTROL (.*)",log)
+              results=re.findall(r"G0_4B1074_TRACE g0.integrated result (.*)",log)
+              enq=re.findall(r"G0_4B1074_TRACE g0.integrated enqueued (.*)",log)
+              before=re.findall(r"G0_4B1074_TRACE g0.integrated beforeEnqueue (.*)",log)
+              count=2 if key in ("Overlap","Sequential") else 1
+              assert len(obs)==(2 if key=="Sequential" else 1) and len(cs)==1 and "cleanup=true" in cs[0] and "metadataOff=true" in cs[0],path.name
+              assert len(results)==count and all("success=true" in x for x in results)
+              assert len(re.findall(r"G0_4B1074_INITIAL ",log))==1
+              assert len(re.findall(r"G0_4B1074_START ",log))==1
+              assert len(re.findall(r"G0_4B1074_PAUSE ",log))==1
+              assert len(before)==len(enq) and len(enq)>=(2 if key!="Sequential" else 3)
+              assert all("mismatch=0 " in x for x in obs)
+              observations+=len(obs); workers+=len(results)
+              pairs.setdefault((key,mode),[]).append(obs)
+              print(path.name,"pid",pid,*cs,*obs,*results,*enq,sep="\n")
+          assert len(pairs)==8 and all(len(x)==2 for x in pairs.values()) and observations==20 and workers==24
+          print("G0_4B1074_PAIRED processes=16 controls=16 observations=20 workers=24 pairs=8")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b1074-paired-${{ github.run_id }}
+          path: |
+            g0-4b1074-*-output.log
+            g0-4b1074-*-build.log
+            g0-4b1074-control-comparison.txt
+            g0-4b1074-*-dependency.patch
+            g0-4b1074-environment.txt
+            g0-4b1074-route-overlay.patch
+            g0-4b1074-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
