@@ -84,6 +84,8 @@ jobs:
             shasum -a 256 "$root/$entry" "$root/$entry.decoded" | tee -a g0-4b1075-fixture-manifest.txt
           done
           shasum -a 256 "$root/reference.s16" | tee -a g0-4b1075-fixture-manifest.txt
+          cp "$root/flac.flac" g0-4b1075-fixture.flac
+          cp "$root/alac.m4a" g0-4b1075-fixture.m4a
           python3 - <<'PY'
           from pathlib import Path
           import base64,subprocess,json
@@ -227,8 +229,8 @@ jobs:
             g0-4b1075-*-dependency.patch
             g0-4b1075-environment.txt
             g0-4b1075-fixture-manifest.txt
-            .build/g0-lossless-fixtures/flac.flac
-            .build/g0-lossless-fixtures/alac.m4a
+            g0-4b1075-fixture.flac
+            g0-4b1075-fixture.m4a
             g0-4b1075-route-overlay.patch
             g0-4b1075-*.xcresult
           if-no-files-found: warn
