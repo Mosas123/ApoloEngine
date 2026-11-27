@@ -1,0 +1,164 @@
+name: G0 4B93 Gapless PCM and timeline
+
+on:
+  pull_request:
+    branches: [diag/g0-4b92-eof-clock-20261126]
+    paths: [".github/workflows/g0-4b93-gapless-timeline.yml", "Tests/ApoloEngineTests/G0GaplessTimelineTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b93-gapless-timeline-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_GAPLESS_OVERLAY: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b93-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)"
+          new="        g0ObservePCM(buffer)\n        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="    private func publish(_ state: PlaybackState) {"
+          new="    private func g0ObservePCM(_ buffer: CMSampleBuffer) {\n        let frames = CMSampleBufferGetNumSamples(buffer)\n        guard frames > 0, frames <= 65536,\n              let block = CMSampleBufferGetDataBuffer(buffer),\n              CMBlockBufferGetDataLength(block) == frames * 8 else {\n            diagnostics.emit(\"g0.gaplessInvalid buffer\")\n            return\n        }\n        var pcm = [Float](repeating: 0, count: frames * 2)\n        let result = pcm.withUnsafeMutableBytes { ptr in\n            CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: ptr.count, destination: ptr.baseAddress!)\n        }\n        guard result == kCMBlockBufferNoErr, pcm.allSatisfy({ $0.isFinite && abs($0) <= 1 }) else {\n            diagnostics.emit(\"g0.gaplessInvalid copy\")\n            return\n        }\n        func hash(_ skip: Int) -> UInt64 {\n            var value: UInt64 = 14695981039346656037\n            for f in pcm.dropFirst(skip * 2) {\n                value = (value ^ UInt64(f.bitPattern)) &* 1099511628211\n            }\n            return value\n        }\n        let pts = CMTimeConvertScale(CMSampleBufferGetPresentationTimeStamp(buffer), timescale: 48000, method: .roundHalfAwayFromZero).value\n        let lastL = Int((pcm[pcm.count - 2] * 32768).rounded())\n        let lastR = Int((pcm[pcm.count - 1] * 32768).rounded())\n        diagnostics.emit(\"g0.gaplessPCM epoch=\\(currentPlaybackEpoch) frames=\\(frames) pts=\\(pts) trackStart=\\(Int((currentTrackStart * 48000).rounded())) lastL=\\(lastL) lastR=\\(lastR) hash=\\(hash(0)) suffix=\\(hash(min(144, frames))) clock=\\(synchronizer.currentTime().seconds) beforeEnd=\\(timelineEnd)\")\n    }\n\n    private func publish(_ state: PlaybackState) {"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine/LibavcodecAudioHost.swift | tee g0-4b93-host-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b93-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B93-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B93-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+              2>&1 | tee "g0-4b93-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine/LibavcodecAudioHost.swift
+          failed=0
+          profiles=(Normal Seek Successor)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B93-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s' "$index" "$variant" "$profile")
+              echo "G0_4B93_RUN index=$index variant=$variant test=$profile" | tee "g0-4b93-$run-output.log"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b93-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0GaplessTimelineTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b93-$run-output.log"; then
+                echo "G0_4B93_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B93_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+          done
+          python3 - <<'PY' | tee g0-4b93-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b93-[0-9][0-9]-*-output.log"))
+          assert len(paths)==6
+          pids=set(); controls={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B93_PROCESS pid=(\d+) scenario=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key=proc[0]
+              assert pid not in pids
+              pids.add(pid)
+              cs=re.findall(r"G0_4B93_CONTROL (.*)",log)
+              obs=re.findall(r"G0_4B93_OBSERVATION (.*)",log)
+              assert len(cs)==1 and len(obs)==1 and "exact=true" in cs[0]
+              assert "g0.gaplessInvalid" not in log
+              # Successor offset depends on live renderer clock; compare PCM counts/source coverage
+              # exactly, while absolute PTS and boundary gap stay observational.
+              fields=dict(re.findall(r"(\w+)=([^\s]+)",cs[0]))
+              record={k:fields[k] for k in ["scenario","exact","scalars","counts","sourceStarts","sourceEnds","sourceJumps","ptsJumps"]}
+              if key in controls:assert controls[key]==record,(key,"control mismatch")
+              else:controls[key]=record
+              print(path.name,"pid",pid,*cs,*obs,sep="\n")
+          assert len(controls)==3
+          print("G0_4B93_PAIRED processes=6 controls=6 observations=6")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b93-paired-${{ github.run_id }}
+          path: |
+            g0-4b93-*-output.log
+            g0-4b93-*-build.log
+            g0-4b93-control-comparison.txt
+            g0-4b93-*-dependency.patch
+            g0-4b93-environment.txt
+            g0-4b93-host-overlay.patch
+            g0-4b93-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
