@@ -1,0 +1,224 @@
+name: G0 4B102 native per-item retirement
+
+on:
+  pull_request:
+    branches: [diag/g0-4b101-native-lifecycle-20261127]
+    paths: [".github/workflows/g0-4b102-native-retirement.yml", "Tests/ApoloEngineTests/G0NativeRetirementTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b102-native-retirement-20261127'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_NATIVE_RETIREMENT: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b102-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AVPlayerHost.swift")
+          s=p.read_text()
+          old="    private let player = AVQueuePlayer()"
+          new="    private let player = AVQueuePlayer()\n    var g0Items: [AVPlayerItem] { player.items() }\n    var g0Rate: Float { player.rate }\n    var g0TapCount: Int { tapProcessors.count }\n    var g0ObserverCount: Int { endObservers.count }\n    private var g0GateStage: String?\n    private(set) var g0GateEntered = false\n    private var g0GateReleased = false\n    func g0ArmGate(_ stage: String) {\n        g0GateStage = stage\n        g0GateEntered = false\n        g0GateReleased = false\n    }\n    func g0ReleaseGate() { g0GateReleased = true }\n    private func g0Gate(_ stage: String) async {\n        guard g0GateStage == stage else { return }\n        g0GateStage = nil\n        g0GateEntered = true\n        let deadline = ProcessInfo.processInfo.systemUptime + 20\n        while !g0GateReleased && ProcessInfo.processInfo.systemUptime < deadline {\n            try? await Task.sleep(for: .milliseconds(10))\n        }\n    }"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        guard generation == loadGeneration else { return }\n        guard let audioTrack else {\n            // Fail fast:"
+          new="        await g0Gate(\"load\")\n        guard generation == loadGeneration else { return }\n        guard let audioTrack else {\n            // Fail fast:"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        guard generation == loadGeneration else { return }\n        guard let audioTrack else { return }"
+          new="        await g0Gate(\"next\")\n        guard generation == loadGeneration else { return }\n        guard let audioTrack else { return }"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AVPlayerHost.swift")
+          s=p.read_text()
+          old="    private var endObservers: [NSObjectProtocol] = []"
+          new="    private var endObservers: [NSObjectProtocol] = []\n    private let g0Candidate = ProcessInfo.processInfo.environment[\"APOLO_G0_RETIRE_CANDIDATE\"] == \"1\"\n    private var g0UpcomingGeneration: UInt64 = 0\n    private var g0ItemTaps: [ObjectIdentifier: AudioTapProcessor] = [:]\n    private var g0ItemObservers: [ObjectIdentifier: [NSObjectProtocol]] = [:]\n    private func g0Retire(_ item: AVPlayerItem) {\n        guard g0Candidate else { return }\n        let id = ObjectIdentifier(item)\n        if let tokens = g0ItemObservers.removeValue(forKey: id) {\n            for token in tokens {\n                NotificationCenter.default.removeObserver(token)\n                endObservers.removeAll { ($0 as AnyObject) === (token as AnyObject) }\n            }\n        }\n        if let processor = g0ItemTaps.removeValue(forKey: id) {\n            tapProcessors.removeAll { $0 === processor }\n        }\n    }"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="    func clearUpcoming() {\n        let items"
+          new="    func clearUpcoming() {\n        if g0Candidate { g0UpcomingGeneration &+= 1 }\n        let items"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="            player.remove(item)\n"
+          new="            player.remove(item)\n            g0Retire(item)\n"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        guard !isLiveStream else { return }\n        let generation = loadGeneration\n        let asset"
+          new="        guard !isLiveStream else { return }\n        let generation = loadGeneration\n        let upcoming = g0UpcomingGeneration\n        let asset"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        await g0Gate(\"next\")\n        guard generation == loadGeneration else { return }"
+          new="        await g0Gate(\"next\")\n        guard generation == loadGeneration, !g0Candidate || upcoming == g0UpcomingGeneration else { return }"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        tapProcessors.append(processor)\n"
+          new="        tapProcessors.append(processor)\n        if g0Candidate { g0ItemTaps[ObjectIdentifier(item)] = processor }\n"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="                self?.handleEnd(of: ended)"
+          new="                guard let self else { return }\n                if self.g0Candidate && self.g0ItemObservers[ObjectIdentifier(ended)] == nil { return }\n                self.handleEnd(of: ended)"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        endObservers.append(token)\n    }\n\n    private func observeFailure"
+          new="        endObservers.append(token)\n        if g0Candidate { g0ItemObservers[ObjectIdentifier(item), default: []].append(token) }\n    }\n\n    private func observeFailure"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        ) { [weak self] _ in\n            MainActor.assumeIsolated {\n                guard let self else { return }\n                if self.isLiveStream"
+          new="        ) { [weak self] notification in\n            guard let failedItem = notification.object as? AVPlayerItem else { return }\n            MainActor.assumeIsolated {\n                guard let self else { return }\n                if self.g0Candidate && self.g0ItemObservers[ObjectIdentifier(failedItem)] == nil { return }\n                if self.isLiveStream"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        endObservers.append(token)\n    }\n\n    private func handleEnd"
+          new="        endObservers.append(token)\n        if g0Candidate { g0ItemObservers[ObjectIdentifier(item), default: []].append(token) }\n    }\n\n    private func handleEnd"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="    private func handleEnd(of ended: AVPlayerItem) {\n        if isLiveStream"
+          new="    private func handleEnd(of ended: AVPlayerItem) {\n        defer { g0Retire(ended) }\n        if isLiveStream"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          old="        endObservers.removeAll()\n        isLiveStream"
+          new="        endObservers.removeAll()\n        g0ItemObservers.removeAll()\n        g0ItemTaps.removeAll()\n        isLiveStream"
+          assert s.count(old)==1
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine/AVPlayerHost.swift | tee g0-4b102-native-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b102-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B102-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B102-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_NATIVE_RETIREMENT' \
+              2>&1 | tee "g0-4b102-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(ClearPending RepeatedClear NaturalNext)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B102-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for mode in original candidate; do
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s-%s' "$index" "$variant" "$mode" "$profile")
+              echo "G0_4B102_RUN index=$index variant=$variant test=$profile" | tee "g0-4b102-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_RETIRE_CANDIDATE=0
+              if [[ "$mode" == candidate ]]; then export TEST_RUNNER_APOLO_G0_RETIRE_CANDIDATE=1; fi
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b102-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0NativeRetirementTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b102-$run-output.log"; then
+                echo "G0_4B102_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B102_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+            done
+          done
+          python3 - <<'PY' | tee g0-4b102-control-comparison.txt
+          import pathlib,re
+          paths=sorted(pathlib.Path(".").glob("g0-4b102-[0-9][0-9]-*-output.log"))
+          assert len(paths)==12
+          pids=set(); controls={}
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B102_PROCESS pid=(\d+) scenario=(\S+) candidate=(true|false)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,scenario,mode=proc[0]
+              assert mode==str("-candidate-" in path.name).lower()
+              key=(scenario,mode)
+              assert pid not in pids
+              pids.add(pid)
+              cs=re.findall(r"G0_4B102_CONTROL (.*)",log)
+              obs=re.findall(r"G0_4B102_OBSERVATION (.*)",log)
+              assert len(cs)==1 and len(obs)==1
+              assert "stopped=true metadataOff=true" in cs[0]
+              if key in controls:assert controls[key]==cs,(key,"control mismatch")
+              else:controls[key]=cs
+              print(path.name,"pid",pid,*cs,*obs,sep="\n")
+          assert len(controls)==6
+          print("G0_4B102_PAIRED processes=12 controls=12 observations=12")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b102-paired-${{ github.run_id }}
+          path: |
+            g0-4b102-*-output.log
+            g0-4b102-*-build.log
+            g0-4b102-control-comparison.txt
+            g0-4b102-*-dependency.patch
+            g0-4b102-environment.txt
+            g0-4b102-native-overlay.patch
+            g0-4b102-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
