@@ -68,7 +68,7 @@ final class G0LosslessSeekOracleTests: XCTestCase {
         let n=a.count/2, m=b.count/2
         let ramp=SeekTransientRamp.frameCount(sampleRate:Int32(rate))
         let joined=a+b
-        let first=index(joined,ramp).map{$0-ramp}
+        let first=index(a,ramp).map{$0-ramp}
         let secondOffset=max(0,ramp-n)
         let second=index(b,secondOffset).map{$0-secondOffset}
         var mismatch=0, compared=0
