@@ -1,0 +1,151 @@
+name: G0 4B95 short WAV seek causality
+
+on:
+  pull_request:
+    branches: [diag/g0-4b94-renderer-clock-20261126]
+    paths: [".github/workflows/g0-4b95-seek-causality.yml", "Tests/ApoloEngineTests/G0ShortSeekCausalityTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b95-seek-causality-20261126'
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_SHORT_SEEK: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b95-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          for variant in baseline a1; do
+            for mode in original overlay; do
+              select_pin "$variant"
+              git restore -- Sources/ApoloEngine/AudioDecoder.swift
+              if [[ "$mode" == overlay ]]; then
+                python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        avformat_flush(formatContext)\n"
+          assert s.count(old)==1
+          p.write_text(s.replace(old,"        // G0 runner-only control: omit extra demux flush.\n"))
+          PY
+              fi
+              key="$variant-$mode"
+              git diff -- Package.swift | tee "g0-4b95-$key-dependency.patch"
+              git diff -- Sources/ApoloEngine/AudioDecoder.swift | tee "g0-4b95-$key-source.patch"
+              xcodebuild build-for-testing \
+                -scheme ApoloEngine \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -derivedDataPath ".build/G04B95-$key" \
+                -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B95-packages-$variant" \
+                -disablePackageRepositoryCache \
+                -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES \
+                2>&1 | tee "g0-4b95-$key-build.log"
+            done
+          done
+          git restore -- Package.swift Sources/ApoloEngine/AudioDecoder.swift
+          failed=0
+          for key in baseline-original baseline-overlay a1-overlay a1-original; do
+            XCTESTRUN=$(find ".build/G04B95-$key/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            export TEST_RUNNER_APOLO_G0_SEEK_OVERLAY=0
+            if [[ "$key" == *-overlay ]]; then export TEST_RUNNER_APOLO_G0_SEEK_OVERLAY=1; fi
+            echo "G0_4B95_RUN key=$key" | tee "g0-4b95-$key-output.log"
+            if xcodebuild test-without-building \
+              -xctestrun "$XCTESTRUN" \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -resultBundlePath "$GITHUB_WORKSPACE/g0-4b95-$key.xcresult" \
+              -only-testing:ApoloEngineTests/G0ShortSeekCausalityTests/testMatrix \
+              -parallel-testing-enabled NO \
+              -test-timeouts-enabled YES \
+              -default-test-execution-time-allowance 300 \
+              -maximum-test-execution-time-allowance 600 \
+              2>&1 | tee -a "g0-4b95-$key-output.log"; then
+              echo "G0_4B95_VARIANT key=$key result=PASS"
+            else
+              failed=1
+              echo "G0_4B95_VARIANT key=$key result=FAIL"
+            fi
+          done
+          python3 - <<'PY' | tee g0-4b95-control-comparison.txt
+          import pathlib,re
+          pids=set(); controls={}; rawcontrols=None; hashes=set()
+          for key in ("baseline-original","baseline-overlay","a1-overlay","a1-original"):
+              log=pathlib.Path(f"g0-4b95-{key}-output.log").read_text(errors="replace")
+              mode=key.split("-")[1]
+              flag=str(mode=="overlay").lower()
+              proc=re.findall(r"G0_4B95_PROCESS pid=(\d+) overlay=(true|false) sha=([a-f0-9]+)",log)
+              assert len(proc)==1 and proc[0][1]==flag and proc[0][0] not in pids,(key,proc)
+              pids.add(proc[0][0]); hashes.add(proc[0][2])
+              raw=re.findall(r"G0_4B95_RAW (.*)",log)
+              cs=re.findall(r"G0_4B95_CONTROL (.*)",log)
+              assert len(raw)==2 and len(cs)==1,(key,raw,cs)
+              assert f"overlay={flag}" in cs[0]
+              if rawcontrols is None:rawcontrols=raw
+              else:assert rawcontrols==raw,(key,"raw mismatch")
+              if mode in controls:assert controls[mode]==cs[0],(key,"bridge mismatch")
+              else:controls[mode]=cs[0]
+              print(key,*raw,*cs,sep="\n")
+          assert len(hashes)==1 and len(controls)==2
+          print("G0_4B95_PAIRED processes=4 raw=8 bridge=4 controls=12")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b95-paired-${{ github.run_id }}
+          path: |
+            g0-4b95-*-output.log
+            g0-4b95-*-build.log
+            g0-4b95-control-comparison.txt
+            g0-4b95-*-dependency.patch
+            g0-4b95-*-source.patch
+            g0-4b95-environment.txt
+            g0-4b95-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
