@@ -102,7 +102,7 @@ final class G0IntegratedLosslessTests: XCTestCase {
             let exact=tick==targetTick && actual==targetTick && mismatch==0 && mismatch2==0 && contiguous && aligned
             print("G0_4B10752_OBSERVATION scenario=\(scenario) mode=\(mode) seek=\(seek) target=\(targetTick) ptsTick=\(tick) actualIndex=\(actual) frames=\(n) nextTick=\(nextTick) nextActual=\(nextActual) nextFrames=\(m) mismatch=\(mismatch) nextMismatch=\(mismatch2) clock=\(clock) elapsed=\(elapsed) strictClock=\(strict) aligned=\(aligned) continuity=\(contiguous) exact=\(exact) publications=\(e.g0IntegratedPublications)")
             try require(mismatch==0 && mismatch2==0 && n>0 && m>0 && e.loadEpoch==epoch && e.currentTrack?.url==url && e.state == .paused,"PCM integrity or session mismatch")
-            try require(first["rate"]=="0.0" && second["rate"]=="0.0","renderer rate not paused")
+            try require(Double(first["rate"] ?? "")==0 && Double(second["rate"] ?? "")==0,"renderer rate not paused")
             try require(aligned && contiguous,"clock or PCM continuity mismatch")
             // Strict seek correctness is recorded separately from diagnostic completion.
         }
@@ -133,7 +133,7 @@ final class G0IntegratedLosslessTests: XCTestCase {
         }
         e.stop()
         try require(e.state == .idle && e.currentTrack==nil && e.nextTracks.isEmpty && e.elapsed==0,"cleanup")
-        print("G0_4B10752_CONTROL scenario=\(profile) mode=\(mode) workers=\(targets.count) metadataOff=true cleanup=true")
+        print("G0_4B10752_CONTROL scenario=\(scenario) mode=\(mode) workers=\(targets.count) metadataOff=true cleanup=true")
     }
 #endif
     @MainActor private func scenario(_ codec:String,_ name:String) async throws {
