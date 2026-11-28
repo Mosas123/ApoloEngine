@@ -212,7 +212,7 @@ jobs:
           import pathlib,re,collections
           paths=sorted(pathlib.Path(".").glob("g0-4b10762-[0-9][0-9]-*-output.log"))
           assert len(paths)==40,len(paths)
-          pids=set(); pairs={}; observations=0; stats=collections.defaultdict(collections.Counter)
+          pids=set(); pairs={}; observations=0; stats=collections.defaultdict(collections.Counter); hashes=collections.defaultdict(set)
           def fields(s): return dict(re.findall(r"(\w+)=(\S+)",s))
           for path in paths:
               log=path.read_text(errors="replace")
@@ -235,6 +235,8 @@ jobs:
               assert len(obs)==len(demux)==count and len(cs)==1 and "metadataOff=true" in cs[0],path.name
               assert len(linear)==len(maps)==1,path.name
               f=fields(linear[0]);assert f["controlIndex"]==f["found"] and int(f["shiftMismatch"])>0 and f["frames"]=="384000"
+              hashes[pin].add(fields(maps[0])["pcmSHA256"])
+              assert fields(maps[0])["normalized"]==str(mode in ("normalize","both")).lower()
               c=stats[(pin,mode)]
               c["trimEvents"]+=len(trim);c["unsupported"]+=len(unsupported)
               for i,(line,seek) in enumerate(zip(obs,demux),1):
@@ -259,6 +261,8 @@ jobs:
               print(path.name,"pid",pid,*linear,*maps,*cs,*obs,*buffers,*demux,*captures,*trim,*unsupported,sep="\n")
           assert len(pairs)==20 and all(set(x)=={"baseline","a1"} for x in pairs.values()) and observations==112
           assert len(stats)==8 and all(c["total"]==14 for c in stats.values())
+          assert set(hashes)=={"baseline","a1"} and all(len(v)==1 for v in hashes.values()),hashes
+          print("G0_4B10762_REFERENCE_HASHES",dict(hashes))
           for key,c in sorted(stats.items()): print("G0_4B10762_STATS",*key,dict(c))
           print("G0_4B10762_PAIRED processes=40 controls=40 linear=40 observations=112 pairs=20")
           PY
