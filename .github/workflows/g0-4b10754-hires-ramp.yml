@@ -1,0 +1,262 @@
+name: G0 4B10754 Hi-Res cross-buffer ramp oracle
+
+on:
+  pull_request:
+    branches: [diag/g0-4b10753-hires-seek-20261127]
+    paths: [".github/workflows/g0-4b10754-hires-ramp.yml", "Tests/ApoloEngineTests/G0HiResRampTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b10754-hires-ramp-20261127'
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_HIRES_RAMP_ORACLE: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b10754-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          # External encoder generates fixtures only; real bridge is tested independently.
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          command -v ffprobe
+          mkdir -p .build/g0-hires-fixtures
+          ffmpeg -version | tee g0-4b10754-fixture-manifest.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import wave,subprocess,json,base64,hashlib
+          root=Path(".build/g0-hires-fixtures")
+          lines=["#if G0_HIRES_RAMP_ORACLE","enum G0HiResRampFixtureData {"]
+          keys=[]
+          with open("g0-4b10754-fixture-manifest.txt","a") as manifest:
+              for rate in (96000,192000):
+                  raw=bytearray()
+                  for i in range(rate*8):
+                      raw.extend((i-4194304).to_bytes(3,"little",signed=True))
+                      raw.extend((((i*17)&0xffffff)-8388608).to_bytes(3,"little",signed=True))
+                  wav=root/f"reference{rate}.wav"
+                  with wave.open(str(wav),"wb") as f:
+                      f.setnchannels(2);f.setsampwidth(3);f.setframerate(rate);f.writeframes(raw)
+                  manifest.write(f"reference rate={rate} frames={rate*8} sha256={hashlib.sha256(raw).hexdigest()}\n")
+                  for codec,ext,fmt in (("flac","flac","s32"),("alac","m4a","s32p")):
+                      key=codec.upper()+str(rate)
+                      out=Path(f"g0-4b10754-fixture-{key}.{ext}")
+                      subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-i",str(wav),"-map","0:a:0","-c:a",codec,"-sample_fmt",fmt,"-bits_per_raw_sample","24",str(out)],check=True)
+                      streams=json.loads(subprocess.check_output(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-of","json",str(out)]))["streams"]
+                      assert len(streams)==1 and streams[0]["codec_name"]==codec and int(streams[0]["sample_rate"])==rate and streams[0]["channels"]==2 and int(streams[0]["bits_per_raw_sample"])==24,streams
+                      decoded=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-i",str(out),"-map","0:a:0","-c:a","pcm_s24le","-f","s24le","-"])
+                      assert decoded==raw,(key,len(decoded),len(raw))
+                      data=out.read_bytes()
+                      manifest.write(json.dumps(streams)+"\n")
+                      manifest.write(f"{key} sha256={hashlib.sha256(data).hexdigest()} decodedSHA256={hashlib.sha256(decoded).hexdigest()}\n")
+                      print(f"G0_4B10754_FIXTURE codec={codec} rate={rate} bits=24 frames={rate*8} hostRoundtripExact=true")
+                      encoded=base64.b64encode(data).decode("ascii")
+                      lines.append("    private static let "+key+": String = [")
+                      lines.extend('        "'+encoded[i:i+8192]+'",' for i in range(0,len(encoded),8192))
+                      lines.append("    ].joined()")
+                      keys.append(key)
+          lines.append("    static let files: [String:String] = ["+",".join('"'+k+'":'+k for k in keys)+"]")
+          lines.extend(["}","#endif"])
+          Path("Tests/ApoloEngineTests/G0HiResRampFixtureData.swift").write_text("\n".join(lines)+"\n")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="    private var seekTargetTicks: Int64?"
+          new="    private var seekTargetTicks: Int64?\n    private let g0LosslessNoFlush = [\"noFlush\",\"both\"].contains(ProcessInfo.processInfo.environment[\"APOLO_G0_RAMP_MODE\"] ?? \"\")\n    private let g0LosslessTrim = [\"trim\",\"both\"].contains(ProcessInfo.processInfo.environment[\"APOLO_G0_RAMP_MODE\"] ?? \"\")\n    private var g0LosslessSeek = 0\n    private var g0LosslessPacket = 0\n    private var g0LosslessFrame = 0\n    struct G0RampRecord {\n        let pre: [Float]\n        let post: [Float]\n        let fade: Int\n        let before: Int\n        let after: Int\n        let ticks: Int64\n    }\n    private(set) var g0RampRecords: [G0RampRecord] = []"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          new="            if g0LosslessSeek > 0, g0LosslessPacket < 128 {\n                g0LosslessPacket += 1\n                print(\"G0_4B10754_PACKET seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessPacket) pts=\\(packet.pointee.pts) dts=\\(packet.pointee.dts) duration=\\(packet.pointee.duration) pos=\\(packet.pointee.pos)\")\n            }\n            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n\n        // Drop packets the demuxer queued before the seek point.\n        avformat_flush(formatContext)"
+          new="        g0RampRecords.removeAll(keepingCapacity: true)\n        g0LosslessSeek += 1\n        g0LosslessPacket = 0\n        g0LosslessFrame = 0\n        print(\"G0_4B10754_DEMUX seek=\\(g0LosslessSeek) requested=\\(seconds) ticks=\\(target) timeBase=\\(timeBase.num)/\\(timeBase.den) result=\\(result) extraFlush=\\(!g0LosslessNoFlush)\")\n        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n        if !g0LosslessNoFlush { avformat_flush(formatContext) }"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target { return }\n            seekTargetTicks = nil\n        }"
+          new="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if g0LosslessSeek > 0, g0LosslessFrame < 128 {\n            g0LosslessFrame += 1\n            var rawIndex = -1\n            if frame.pointee.ch_layout.nb_channels == 2, frame.pointee.nb_samples > 0, let data = frame.pointee.extended_data, let left = data[0] {\n                let words = UnsafeRawPointer(left).assumingMemoryBound(to: Int32.self)\n                var l:Int32? = nil, r:Int32? = nil\n                if frame.pointee.format == Int32(AV_SAMPLE_FMT_S32.rawValue) { l=words[0];r=words[1] }\n                else if frame.pointee.format == Int32(AV_SAMPLE_FMT_S32P.rawValue), let right=data[1] { l=words[0];r=UnsafeRawPointer(right).assumingMemoryBound(to:Int32.self)[0] }\n                if let l, let r, l & 255 == 0, r & 255 == 0 {\n                    let i=Int(l)/256+4194304\n                    if i>=0,i<Int(sampleRate)*8,Int(r)/256==((i*17)&0xffffff)-8388608 {rawIndex=i}\n                }\n            }\n            print(\"G0_4B10754_FRAME seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessFrame) pts=\\(frame.pointee.pts) samples=\\(frame.pointee.nb_samples) rawIndex=\\(rawIndex) format=\\(frame.pointee.format) rate=\\(frame.pointee.sample_rate) target=\\(String(describing:seekTargetTicks))\")\n        }\n        var g0TrimFrames = 0\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target {\n                if g0LosslessTrim, frame.pointee.pts >= 0, target >= 0,\n                   frame.pointee.sample_rate == sampleRate,\n                   timeBase.num == 1, timeBase.den == sampleRate,\n                   channels == 2, frame.pointee.ch_layout.nb_channels == 2,\n                   (frame.pointee.format == Int32(AV_SAMPLE_FMT_S32.rawValue) ||\n                    frame.pointee.format == Int32(AV_SAMPLE_FMT_S32P.rawValue)),\n                   let resampler, swr_get_delay(resampler, Int64(sampleRate)) == 0,\n                   target - frame.pointee.pts < Int64(frame.pointee.nb_samples) {\n                    g0TrimFrames = Int(target - frame.pointee.pts)\n                } else {\n                    if g0LosslessSeek > 0, g0LosslessFrame <= 128 {\n                        print(\"G0_4B10754_DISCARD seek=\\(g0LosslessSeek) pts=\\(frame.pointee.pts) target=\\(target) samples=\\(frame.pointee.nb_samples)\")\n                    }\n                    return\n                }\n            }\n            if g0TrimFrames == 0 { seekTargetTicks = nil }\n        }"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        processIfNeeded(memory, frames: Int(converted))\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          new="        if g0TrimFrames > 0 {\n            guard converted == samples, g0TrimFrames < Int(converted),\n                  swr_get_delay(resampler, Int64(sampleRate)) == 0 else {\n                print(\"G0_4B10754_TRIM_UNSUPPORTED seek=\\(g0LosslessSeek) converted=\\(converted) input=\\(samples) trim=\\(g0TrimFrames)\")\n                free(memory)\n                return\n            }\n            let remain = Int(converted) - g0TrimFrames\n            _ = memmove(memory, memory.advanced(by: g0TrimFrames * bytesPerFrame), remain * bytesPerFrame)\n            print(\"G0_4B10754_TRIM seek=\\(g0LosslessSeek) pts=\\(frame.pointee.pts) removed=\\(g0TrimFrames) retained=\\(remain) target=\\(String(describing:seekTargetTicks))\")\n            seekTargetTicks = nil\n        }\n        let retained = Int(converted) - g0TrimFrames\n        processIfNeeded(memory, frames: retained)\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="                frames: Int(converted),\n                channels: Int(channels),\n                fadeFrames: seekRampFrames,"
+          new="                frames: retained,\n                channels: Int(channels),\n                fadeFrames: seekRampFrames,"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        let ticks = frame.pointee.pts == Int64.min\n            ? runningSamples\n            : av_rescale_q(\n                frame.pointee.pts,\n                timeBase,\n                AVRational(num: 1, den: sampleRate)\n            )\n        runningSamples += Int64(converted)\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: Int(converted) * bytesPerFrame,\n            samples: Int(converted),\n            startTicks: ticks\n        ) {"
+          new="        let ticks = (frame.pointee.pts == Int64.min\n            ? runningSamples\n            : av_rescale_q(\n                frame.pointee.pts,\n                timeBase,\n                AVRational(num: 1, den: sampleRate)\n            )) + Int64(g0TrimFrames)\n        if g0LosslessTrim, g0LosslessSeek > 0, frame.pointee.pts != Int64.min {\n            runningSamples = ticks + Int64(retained)\n        } else {\n            runningSamples += Int64(retained)\n        }\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: retained * bytesPerFrame,\n            samples: retained,\n            startTicks: ticks\n        ) {"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        processIfNeeded(memory, frames: retained)\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          new="        processIfNeeded(memory, frames: retained)\n        let g0Capture = g0LosslessSeek > 0 && g0RampRecords.count < 2\n        let g0Before = seekRampConsumedFrames\n        let g0Pre = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: retained * Int(channels))) : []\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        runningSamples += Int64(retained)\n        }\n\n        if let buffer = makeSampleBuffer("
+          new="        runningSamples += Int64(retained)\n        }\n        let g0Post = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: retained * Int(channels))) : []\n\n        if let buffer = makeSampleBuffer("
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="            samples: retained,\n            startTicks: ticks\n        ) {\n            readyBuffers.append(buffer)"
+          new="            samples: retained,\n            startTicks: ticks\n        ) {\n            if g0Capture {\n                g0RampRecords.append(G0RampRecord(pre: g0Pre, post: g0Post, fade: seekRampFrames, before: g0Before, after: seekRampConsumedFrames, ticks: ticks))\n                print(\"G0_4B10754_RAMP_CAPTURE seek=\\(g0LosslessSeek) ordinal=\\(g0RampRecords.count) ticks=\\(ticks) frames=\\(retained) fade=\\(seekRampFrames) before=\\(g0Before) after=\\(seekRampConsumedFrames)\")\n            }\n            readyBuffers.append(buffer)"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine | tee g0-4b10754-route-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b10754-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B10754-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B10754-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_HIRES_RAMP_ORACLE' \
+              2>&1 | tee "g0-4b10754-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(FLAC96000RampEdges FLAC96000Repeated FLAC192000RampEdges FLAC192000Repeated ALAC96000RampEdges ALAC96000Repeated ALAC192000RampEdges ALAC192000Repeated)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B10754-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for mode in original noFlush trim both; do
+            export TEST_RUNNER_APOLO_G0_RAMP_MODE="$mode"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s-%s' "$index" "$variant" "$mode" "$profile")
+              echo "G0_4B10754_RUN index=$index variant=$variant test=$profile" | tee "g0-4b10754-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_RAMP_PROFILE="$profile"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b10754-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0HiResRampTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b10754-$run-output.log"; then
+                echo "G0_4B10754_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B10754_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+            done
+          done
+          python3 - <<'PY' | tee g0-4b10754-control-comparison.txt
+          import pathlib,re,collections
+          paths=sorted(pathlib.Path(".").glob("g0-4b10754-[0-9][0-9]-*-output.log"))
+          assert len(paths)==64,len(paths)
+          pids=set(); pairs={}; observations=0; captures=0; stats=collections.defaultdict(collections.Counter)
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B10754_PROCESS pid=(\d+) scenario=(\S+) codec=(\S+) rate=(\d+) mode=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key,codec,rate,mode=proc[0]
+              pin=path.name.split("-")[3]
+              assert pin in ("baseline","a1") and pid not in pids and key in path.name and "-"+mode+"-" in path.name
+              pids.add(pid)
+              obs=re.findall(r"G0_4B10754_OBSERVATION (.*)",log)
+              cs=re.findall(r"G0_4B10754_CONTROL (.*)",log)
+              demux=re.findall(r"G0_4B10754_DEMUX (.*)",log)
+              cap=re.findall(r"G0_4B10754_RAMP_CAPTURE (.*)",log)
+              linear=re.findall(r"G0_4B10754_LINEAR (.*)",log)
+              assert len(obs)==len(demux)==3 and len(cap)==6 and len(cs)==1 and "cleanup=true" in cs[0] and "metadataOff=true" in cs[0],path.name
+              assert len(linear)==1 and f"frames={int(rate)*8} " in linear[0] and "pcmMismatch=0 " in linear[0] and "ptsMismatch=0 " in linear[0],path.name
+              assert len(re.findall(r"G0_4B10754_INITIAL ",log))==1
+              for i,line in enumerate(obs,1):
+                  f=dict(x.split("=",1) for x in line.split())
+                  assert int(f["ordinal"])==i and all(f[k]=="0" for k in ("preMismatch","postMismatch","deliveryMismatch")),line
+                  assert f["continuity"]==f["aligned"]==f["ulpDetected"]=="true" and int(f["shiftDetected"])>0 and int(f["restartDetected"])>0,line
+                  c=stats[(pin,codec,rate,mode)]
+                  c["total"]+=1
+                  c["exact"]+=int(f["exact"]=="true")
+                  c["comparedScalars"]+=int(f["compared"])
+                  n,fade=int(f["frames"]),int(f["fade"])
+                  c["shortFirst"]+=int(n<fade)
+                  c["equalFirst"]+=int(n==fade)
+                  c["longFirst"]+=int(n>fade)
+              observations+=len(obs); captures+=len(cap)
+              group=pairs.setdefault((key,mode),{})
+              assert pin not in group
+              group[pin]=obs
+              print(path.name,"pid",pid,*linear,*cs,*obs,*demux,*cap,sep="\n")
+          assert len(pairs)==32 and all(set(x)=={"baseline","a1"} for x in pairs.values()) and observations==192 and captures==384
+          assert len(stats)==32 and all(c["total"]==6 for c in stats.values())
+          for key,c in sorted(stats.items()): print("G0_4B10754_STATS",*key,dict(c))
+          print("G0_4B10754_PAIRED processes=64 controls=64 linear=64 observations=192 captures=384 pairs=32")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b10754-paired-${{ github.run_id }}
+          path: |
+            g0-4b10754-*-output.log
+            g0-4b10754-*-build.log
+            g0-4b10754-control-comparison.txt
+            g0-4b10754-*-dependency.patch
+            g0-4b10754-environment.txt
+            g0-4b10754-fixture-manifest.txt
+            g0-4b10754-fixture-*.flac
+            g0-4b10754-fixture-*.m4a
+            g0-4b10754-route-overlay.patch
+            g0-4b10754-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
