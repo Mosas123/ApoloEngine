@@ -158,14 +158,16 @@ final class G0MP3PrerollTests: XCTestCase {
             if zeros==r.pre.count {allZeroBuffers+=1}
             let pidx=tickToIndex[pts[k]] ?? -1
             let aidx=base>=0 ? base+offsets[k] : -1
-            let p=compare(r.pre,reference,pidx),a=compare(r.pre,reference,aidx)
+            let ptsSpanContinuous=pidx>=0 && n<=timeline.count-pidx && timeline[pidx+n-1]==pts[k]+n-1
+            let p=ptsSpanContinuous ? compare(r.pre,reference,pidx):(-1,-1.0,-1.0)
+            let a=compare(r.pre,reference,aidx)
             if p.0>=0 {ptsCompared+=r.pre.count;ptsMismatch+=p.0}
             if a.0>=0 {anchoredCompared+=r.pre.count;anchoredMismatch+=a.0}
             if p.0==0 {ptsExactBuffers+=1}
             if a.0==0 {anchoredExactBuffers+=1}
             if k==0 {firstExact=p.0==0}
             let anchor=anchors[k]
-            print("G0_4B10761_BUFFER ordinal=\(ordinal) buffer=\(k+1) pts=\(pts[k]) frames=\(n) energy=\(energy) zeros=\(zeros) rmsSignal=\(sqrt(energy/Double(r.pre.count))) ptsIndex=\(pidx) ptsMismatch=\(p.0) ptsRMS=\(p.1) ptsPeak=\(p.2) anchorIndex=\(aidx) anchorMismatch=\(a.0) anchorRMS=\(a.1) anchorPeak=\(a.2) matchIndex=\(anchor?.index ?? -1) score=\(anchor?.score ?? -2) confident=\(valid(anchor,k))")
+            print("G0_4B10761_BUFFER ordinal=\(ordinal) buffer=\(k+1) pts=\(pts[k]) frames=\(n) energy=\(energy) zeros=\(zeros) rmsSignal=\(sqrt(energy/Double(r.pre.count))) ptsIndex=\(pidx) ptsSpanContinuous=\(ptsSpanContinuous) ptsMismatch=\(p.0) ptsRMS=\(p.1) ptsPeak=\(p.2) anchorIndex=\(aidx) anchorMismatch=\(a.0) anchorRMS=\(a.1) anchorPeak=\(a.2) matchIndex=\(anchor?.index ?? -1) score=\(anchor?.score ?? -2) confident=\(valid(anchor,k))")
         }
         let firstPTS=pts.first ?? Int.min
         let firstContent=firstOK ? timeline[anchors[0]!.index] : Int.min
@@ -184,7 +186,7 @@ final class G0MP3PrerollTests: XCTestCase {
         print("G0_4B10761_PROCESS pid=\(getpid()) scenario=\(scenario) codec=\(codec) mode=\(mode)")
         XCTAssertFalse(AVPlayerHost.nativeHLSTimedMetadataEnabled)
         let encoded=try XCTUnwrap(Data(base64Encoded:try XCTUnwrap(G0MP3PrerollFixtureData.files[codec])))
-        let ext=codec=="AAC" ? ".m4a":codec=="MP3" ? ".mp3":".opus"
+        let ext=".mp3"
         let url=FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString+ext)
         try encoded.write(to:url)
         defer{try? FileManager.default.removeItem(at:url)}
