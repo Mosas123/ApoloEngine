@@ -1,5 +1,6 @@
 import AudioToolbox
 import CoreMedia
+import CryptoKit
 import Foundation
 import XCTest
 @testable import ApoloEngine
@@ -93,6 +94,7 @@ final class G0MP3TimelineTests: XCTestCase {
         return (diff,sqrt(square/Double(values.count)),peak)
     }
     private func inspect(_ d:AudioDecoder,_ reference:[Float],_ timeline:[Int],_ target:Int,_ ordinal:Int) throws {
+        let unsupportedBefore=d.g0TimelineUnsupported
         let start=DispatchTime.now().uptimeNanoseconds
         do {try d.seek(to:Double(target)/Double(rate))}
         catch {print("G0_4B10762_OBSERVATION ordinal=\(ordinal) target=\(target) status=seekError");return}
@@ -180,12 +182,13 @@ final class G0MP3TimelineTests: XCTestCase {
             let result=compare(recs[k].pre,reference,target+offsets[k])
             if result.0>=0 {targetMismatch+=result.0;targetCompared+=recs[k].pre.count}
         }
-        let targetExact=firstPTS==target && !buffers.isEmpty && recs.count==buffers.count && targetCompared==compared && targetMismatch==0 && continuity==0
+        let unsupported=d.g0TimelineUnsupported-unsupportedBefore
+        let targetExact=unsupported==0 && firstPTS==target && !buffers.isEmpty && recs.count==buffers.count && targetCompared==compared && targetMismatch==0 && continuity==0
         let targetEndExact=targetExact && target+total==reference.count/2 && status=="eof"
         let cursor=d.g0TimelineCursor
         let cursorAligned=pts.last.map{cursor==Int64($0+buffers.last!.count/2)} ?? false
         let complete=buffers.count==8 && recs.count==8
-        print("G0_4B10762_OBSERVATION ordinal=\(ordinal) target=\(target) status=\(status) buffers=\(buffers.count) captures=\(min(buffers.count,recs.count)) frames=\(total) firstPTS=\(firstPTS) firstContentTick=\(firstContent) lastContentTick=\(lastContent) firstConfidence=\(firstOK) lastConfidence=\(lastOK) contentContinuous=\(contentContinuous) ptsContinuityError=\(continuity) firstRefIndex=\(normalizedIndex) firstTickIndex=\(firstTickIndex) firstExact=\(firstExact) ptsExactBuffers=\(ptsExactBuffers) anchoredExactBuffers=\(anchoredExactBuffers) allZeroBuffers=\(allZeroBuffers) ptsCompared=\(ptsCompared) ptsMismatch=\(ptsMismatch) anchoredCompared=\(anchoredCompared) anchoredMismatch=\(anchoredMismatch) rampMismatch=\(rampMismatch) deliveryMismatch=\(deliveryMismatch) compared=\(compared) complete=\(complete) targetExact=\(targetExact) targetCompared=\(targetCompared) targetMismatch=\(targetMismatch) targetEndExact=\(targetEndExact) cursor=\(cursor) cursorAligned=\(cursorAligned) seekNanos=\(seekNanos) firstNanos=\(firstNanos) readNanos=\(readNanos) packets=\(d.g0WorkPackets) decodedFrames=\(d.g0WorkFrames) discardedFrames=\(d.g0WorkDiscarded)")
+        print("G0_4B10762_OBSERVATION ordinal=\(ordinal) target=\(target) status=\(status) buffers=\(buffers.count) captures=\(min(buffers.count,recs.count)) frames=\(total) firstPTS=\(firstPTS) firstContentTick=\(firstContent) lastContentTick=\(lastContent) firstConfidence=\(firstOK) lastConfidence=\(lastOK) contentContinuous=\(contentContinuous) ptsContinuityError=\(continuity) firstRefIndex=\(normalizedIndex) firstTickIndex=\(firstTickIndex) firstExact=\(firstExact) ptsExactBuffers=\(ptsExactBuffers) anchoredExactBuffers=\(anchoredExactBuffers) allZeroBuffers=\(allZeroBuffers) ptsCompared=\(ptsCompared) ptsMismatch=\(ptsMismatch) anchoredCompared=\(anchoredCompared) anchoredMismatch=\(anchoredMismatch) rampMismatch=\(rampMismatch) deliveryMismatch=\(deliveryMismatch) compared=\(compared) complete=\(complete) targetExact=\(targetExact) unsupported=\(unsupported) targetCompared=\(targetCompared) targetMismatch=\(targetMismatch) targetEndExact=\(targetEndExact) cursor=\(cursor) cursorAligned=\(cursorAligned) seekNanos=\(seekNanos) firstNanos=\(firstNanos) readNanos=\(readNanos) packets=\(d.g0WorkPackets) decodedFrames=\(d.g0WorkFrames) discardedFrames=\(d.g0WorkDiscarded)")
     }
     private func run(_ codec:String,_ profile:String) throws {
         let scenario=codec+profile
@@ -220,7 +223,9 @@ final class G0MP3TimelineTests: XCTestCase {
         try require(reference.count/2==384000 && firstBlock==47 && timeline.first==0,"fixture linear shape")
         try require(ptsGaps==(normalized ? 0:1) && timeline.last==(normalized ? 383999:385104) && firstGap==(normalized ? 0:1105),"linear PTS map")
         for i in timeline.indices {try require(timeline[i]==i+(normalized || i<47 ? 0:1105),"reference timeline map")}
-        print("G0_4B10762_MAP normalized=\(normalized) startSamples=\(linear.g0TimelineOffset) firstBlock=\(firstBlock) frames=\(timeline.count)")
+        try require(linear.g0TimelineUnsupported==0,"unsupported linear frame")
+        let pcmHash=reference.withUnsafeBytes{SHA256.hash(data:Data($0)).map{String(format:"%02x",$0)}.joined()}
+        print("G0_4B10762_MAP pcmSHA256=\(pcmHash) normalized=\(normalized) startSamples=\(linear.g0TimelineOffset) firstBlock=\(firstBlock) frames=\(timeline.count)")
         let controlIndex=rate*2+137
         let control=Array(reference[(controlIndex*2)..<((controlIndex+256)*2)])
         let controlMatch=try XCTUnwrap(match(control,reference))
