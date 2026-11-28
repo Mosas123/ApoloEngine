@@ -1,3 +1,4 @@
+import AudioToolbox
 import CoreMedia
 import Foundation
 import XCTest
@@ -18,7 +19,7 @@ final class G0HiResSeekTests: XCTestCase {
     private func pcm(_ b:CMSampleBuffer) throws -> [Float] {
         let desc=try XCTUnwrap(CMSampleBufferGetFormatDescription(b))
         let asbd=try XCTUnwrap(CMAudioFormatDescriptionGetStreamBasicDescription(desc)).pointee
-        try require(asbd.mSampleRate==Double(rate) && asbd.mChannelsPerFrame==2 && asbd.mBitsPerChannel==32,"output sample rate, channel count or PCM width")
+        try require(asbd.mSampleRate==Double(rate) && asbd.mChannelsPerFrame==2 && asbd.mBitsPerChannel==32 && asbd.mFormatID==kAudioFormatLinearPCM && (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,"output sample rate, channel count or Float32 format")
         let block=try XCTUnwrap(CMSampleBufferGetDataBuffer(b))
         let n=CMSampleBufferGetNumSamples(b)*2
         guard n>0, CMBlockBufferGetDataLength(block)==n*4 else { throw NSError(domain:"G0LosslessPCM",code:1) }
@@ -47,7 +48,9 @@ final class G0HiResSeekTests: XCTestCase {
     private func tick(_ b:CMSampleBuffer)->Int? {
         let p=CMSampleBufferGetPresentationTimeStamp(b).seconds*Double(rate)
         guard p.isFinite, abs(p)<Double(Int32.max) else {return nil}
-        return Int(p.rounded())
+        let rounded=Int(p.rounded())
+        guard CMTimeCompare(CMSampleBufferGetPresentationTimeStamp(b),CMTime(value:Int64(rounded),timescale:Int32(rate)))==0 else{return nil}
+        return rounded
     }
     private func inspect(_ d:AudioDecoder,_ reference:[Float],_ target:Int,_ ordinal:Int) throws {
         var a:[Float]=[], b:[Float]=[]
