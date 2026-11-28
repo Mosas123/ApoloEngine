@@ -104,9 +104,10 @@ final class G0IntegratedHiResTests: XCTestCase {
             let clock=e.currentTime,elapsed=e.elapsed
             let strict=abs(clock-target)<0.06
             let aligned=abs(clock-Double(tick)/Double(rate))<0.001 && abs(elapsed-clock)<0.001
-            let contiguous=nextTick==tick+n && nextActual==actual+n
+            let contiguous=nextTick==tick+n && nextActual==actual+n && tick==actual && nextTick==nextActual
+            let clockSampleExact=abs(clock*Double(rate)-Double(targetTick))<0.5 && abs(elapsed*Double(rate)-Double(targetTick))<0.5
             let exact=tick==targetTick && actual==targetTick && mismatch==0 && mismatch2==0 && pre==0 && delivery==0 && contiguous && aligned
-            print("G0_4B10755_OBSERVATION scenario=\(scenario) mode=\(mode) seek=\(seek) target=\(targetTick) ptsTick=\(tick) actualIndex=\(actual) frames=\(n) nextTick=\(nextTick) nextActual=\(nextActual) nextFrames=\(m) mismatch=\(mismatch) nextMismatch=\(mismatch2) preMismatch=\(pre) deliveryMismatch=\(delivery) fade=\(fade) firstConsumed=\(firstConsumed) secondConsumed=\(secondConsumed) clock=\(clock) elapsed=\(elapsed) strictClock=\(strict) aligned=\(aligned) continuity=\(contiguous) exact=\(exact) publications=\(e.g0IntegratedPublications)")
+            print("G0_4B10755_OBSERVATION scenario=\(scenario) mode=\(mode) seek=\(seek) target=\(targetTick) ptsTick=\(tick) actualIndex=\(actual) frames=\(n) nextTick=\(nextTick) nextActual=\(nextActual) nextFrames=\(m) mismatch=\(mismatch) nextMismatch=\(mismatch2) preMismatch=\(pre) deliveryMismatch=\(delivery) fade=\(fade) firstConsumed=\(firstConsumed) secondConsumed=\(secondConsumed) clock=\(clock) elapsed=\(elapsed) strictClock=\(strict) clockSampleExact=\(clockSampleExact) aligned=\(aligned) continuity=\(contiguous) exact=\(exact) publications=\(e.g0IntegratedPublications)")
             try require(mismatch==0 && mismatch2==0 && pre==0 && delivery==0 && n>0 && m>0 && e.loadEpoch==epoch && e.currentTrack?.url==url && e.state == .paused,"PCM integrity or session mismatch")
             try require(Double(first["rate"] ?? "")==0 && Double(second["rate"] ?? "")==0,"renderer rate not paused")
             try require(aligned && contiguous,"clock or PCM continuity mismatch")
