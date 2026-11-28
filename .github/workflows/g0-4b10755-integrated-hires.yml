@@ -1,0 +1,352 @@
+name: G0 4B10755 integrated Hi-Res renderer
+
+on:
+  pull_request:
+    branches: [diag/g0-4b10754-hires-ramp-20261127]
+    paths: [".github/workflows/g0-4b10755-integrated-hires.yml", "Tests/ApoloEngineTests/G0IntegratedHiResTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b10755-integrated-hires-20261127'
+    runs-on: macos-26
+    timeout-minutes: 210
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_INTEGRATED_HIRES: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b10755-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          # External encoder generates fixtures only; real bridge is tested independently.
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          command -v ffprobe
+          mkdir -p .build/g0-hires-fixtures
+          ffmpeg -version | tee g0-4b10755-fixture-manifest.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import wave,subprocess,json,base64,hashlib
+          root=Path(".build/g0-hires-fixtures")
+          lines=["#if G0_INTEGRATED_HIRES","enum G0IntegratedHiResFixtureData {"]
+          keys=[]
+          with open("g0-4b10755-fixture-manifest.txt","a") as manifest:
+              for rate in (96000,192000):
+                  raw=bytearray()
+                  for i in range(rate*8):
+                      raw.extend((i-4194304).to_bytes(3,"little",signed=True))
+                      raw.extend((((i*17)&0xffffff)-8388608).to_bytes(3,"little",signed=True))
+                  wav=root/f"reference{rate}.wav"
+                  with wave.open(str(wav),"wb") as f:
+                      f.setnchannels(2);f.setsampwidth(3);f.setframerate(rate);f.writeframes(raw)
+                  manifest.write(f"reference rate={rate} frames={rate*8} sha256={hashlib.sha256(raw).hexdigest()}\n")
+                  for codec,ext,fmt in (("flac","flac","s32"),("alac","m4a","s32p")):
+                      key=codec.upper()+str(rate)
+                      out=Path(f"g0-4b10755-fixture-{key}.{ext}")
+                      subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-i",str(wav),"-map","0:a:0","-c:a",codec,"-sample_fmt",fmt,"-bits_per_raw_sample","24",str(out)],check=True)
+                      streams=json.loads(subprocess.check_output(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-of","json",str(out)]))["streams"]
+                      assert len(streams)==1 and streams[0]["codec_name"]==codec and int(streams[0]["sample_rate"])==rate and streams[0]["channels"]==2 and int(streams[0]["bits_per_raw_sample"])==24,streams
+                      decoded=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-i",str(out),"-map","0:a:0","-c:a","pcm_s24le","-f","s24le","-"])
+                      assert decoded==raw,(key,len(decoded),len(raw))
+                      data=out.read_bytes()
+                      manifest.write(json.dumps(streams)+"\n")
+                      manifest.write(f"{key} sha256={hashlib.sha256(data).hexdigest()} decodedSHA256={hashlib.sha256(decoded).hexdigest()}\n")
+                      print(f"G0_4B10755_FIXTURE codec={codec} rate={rate} bits=24 frames={rate*8} hostRoundtripExact=true")
+                      encoded=base64.b64encode(data).decode("ascii")
+                      lines.append("    private static let "+key+": String = [")
+                      lines.extend('        "'+encoded[i:i+8192]+'",' for i in range(0,len(encoded),8192))
+                      lines.append("    ].joined()")
+                      keys.append(key)
+          lines.append("    static let files: [String:String] = ["+",".join('"'+k+'":'+k for k in keys)+"]")
+          lines.extend(["}","#endif"])
+          Path("Tests/ApoloEngineTests/G0IntegratedHiResFixtureData.swift").write_text("\n".join(lines)+"\n")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="    private var seekTargetTicks: Int64?"
+          new="    private var seekTargetTicks: Int64?\n    private let g0LosslessNoFlush = [\"noFlush\",\"both\"].contains(ProcessInfo.processInfo.environment[\"APOLO_G0_RENDER_HIRES_MODE\"] ?? \"\")\n    private let g0LosslessTrim = [\"trim\",\"both\"].contains(ProcessInfo.processInfo.environment[\"APOLO_G0_RENDER_HIRES_MODE\"] ?? \"\")\n    private var g0LosslessSeek = 0\n    private var g0LosslessPacket = 0\n    private var g0LosslessFrame = 0\n    struct G0RampRecord {\n        let pre: [Float]\n        let post: [Float]\n        let fade: Int\n        let before: Int\n        let after: Int\n        let ticks: Int64\n    }\n    private(set) var g0RampRecords: [G0RampRecord] = []"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          new="            if g0LosslessSeek > 0, g0LosslessPacket < 128 {\n                g0LosslessPacket += 1\n                print(\"G0_4B10755_PACKET seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessPacket) pts=\\(packet.pointee.pts) dts=\\(packet.pointee.dts) duration=\\(packet.pointee.duration) pos=\\(packet.pointee.pos)\")\n            }\n            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n\n        // Drop packets the demuxer queued before the seek point.\n        avformat_flush(formatContext)"
+          new="        g0RampRecords.removeAll(keepingCapacity: true)\n        g0LosslessSeek += 1\n        g0LosslessPacket = 0\n        g0LosslessFrame = 0\n        print(\"G0_4B10755_DEMUX seek=\\(g0LosslessSeek) requested=\\(seconds) ticks=\\(target) timeBase=\\(timeBase.num)/\\(timeBase.den) result=\\(result) extraFlush=\\(!g0LosslessNoFlush)\")\n        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n        if !g0LosslessNoFlush { avformat_flush(formatContext) }"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target { return }\n            seekTargetTicks = nil\n        }"
+          new="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if g0LosslessSeek > 0, g0LosslessFrame < 128 {\n            g0LosslessFrame += 1\n            var rawIndex = -1\n            if frame.pointee.ch_layout.nb_channels == 2, frame.pointee.nb_samples > 0, let data = frame.pointee.extended_data, let left = data[0] {\n                let words = UnsafeRawPointer(left).assumingMemoryBound(to: Int32.self)\n                var l:Int32? = nil, r:Int32? = nil\n                if frame.pointee.format == Int32(AV_SAMPLE_FMT_S32.rawValue) { l=words[0];r=words[1] }\n                else if frame.pointee.format == Int32(AV_SAMPLE_FMT_S32P.rawValue), let right=data[1] { l=words[0];r=UnsafeRawPointer(right).assumingMemoryBound(to:Int32.self)[0] }\n                if let l, let r, l & 255 == 0, r & 255 == 0 {\n                    let i=Int(l)/256+4194304\n                    if i>=0,i<Int(sampleRate)*8,Int(r)/256==((i*17)&0xffffff)-8388608 {rawIndex=i}\n                }\n            }\n            print(\"G0_4B10755_FRAME seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessFrame) pts=\\(frame.pointee.pts) samples=\\(frame.pointee.nb_samples) rawIndex=\\(rawIndex) format=\\(frame.pointee.format) rate=\\(frame.pointee.sample_rate) target=\\(String(describing:seekTargetTicks))\")\n        }\n        var g0TrimFrames = 0\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target {\n                if g0LosslessTrim, frame.pointee.pts >= 0, target >= 0,\n                   frame.pointee.sample_rate == sampleRate,\n                   timeBase.num == 1, timeBase.den == sampleRate,\n                   channels == 2, frame.pointee.ch_layout.nb_channels == 2,\n                   (frame.pointee.format == Int32(AV_SAMPLE_FMT_S32.rawValue) ||\n                    frame.pointee.format == Int32(AV_SAMPLE_FMT_S32P.rawValue)),\n                   let resampler, swr_get_delay(resampler, Int64(sampleRate)) == 0,\n                   target - frame.pointee.pts < Int64(frame.pointee.nb_samples) {\n                    g0TrimFrames = Int(target - frame.pointee.pts)\n                } else {\n                    if g0LosslessSeek > 0, g0LosslessFrame <= 128 {\n                        print(\"G0_4B10755_DISCARD seek=\\(g0LosslessSeek) pts=\\(frame.pointee.pts) target=\\(target) samples=\\(frame.pointee.nb_samples)\")\n                    }\n                    return\n                }\n            }\n            if g0TrimFrames == 0 { seekTargetTicks = nil }\n        }"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        processIfNeeded(memory, frames: Int(converted))\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          new="        if g0TrimFrames > 0 {\n            guard converted == samples, g0TrimFrames < Int(converted),\n                  swr_get_delay(resampler, Int64(sampleRate)) == 0 else {\n                print(\"G0_4B10755_TRIM_UNSUPPORTED seek=\\(g0LosslessSeek) converted=\\(converted) input=\\(samples) trim=\\(g0TrimFrames)\")\n                free(memory)\n                return\n            }\n            let remain = Int(converted) - g0TrimFrames\n            _ = memmove(memory, memory.advanced(by: g0TrimFrames * bytesPerFrame), remain * bytesPerFrame)\n            print(\"G0_4B10755_TRIM seek=\\(g0LosslessSeek) pts=\\(frame.pointee.pts) removed=\\(g0TrimFrames) retained=\\(remain) target=\\(String(describing:seekTargetTicks))\")\n            seekTargetTicks = nil\n        }\n        let retained = Int(converted) - g0TrimFrames\n        processIfNeeded(memory, frames: retained)\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="                frames: Int(converted),\n                channels: Int(channels),\n                fadeFrames: seekRampFrames,"
+          new="                frames: retained,\n                channels: Int(channels),\n                fadeFrames: seekRampFrames,"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        let ticks = frame.pointee.pts == Int64.min\n            ? runningSamples\n            : av_rescale_q(\n                frame.pointee.pts,\n                timeBase,\n                AVRational(num: 1, den: sampleRate)\n            )\n        runningSamples += Int64(converted)\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: Int(converted) * bytesPerFrame,\n            samples: Int(converted),\n            startTicks: ticks\n        ) {"
+          new="        let ticks = (frame.pointee.pts == Int64.min\n            ? runningSamples\n            : av_rescale_q(\n                frame.pointee.pts,\n                timeBase,\n                AVRational(num: 1, den: sampleRate)\n            )) + Int64(g0TrimFrames)\n        if g0LosslessTrim, g0LosslessSeek > 0, frame.pointee.pts != Int64.min {\n            runningSamples = ticks + Int64(retained)\n        } else {\n            runningSamples += Int64(retained)\n        }\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: retained * bytesPerFrame,\n            samples: retained,\n            startTicks: ticks\n        ) {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        processIfNeeded(memory, frames: retained)\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          new="        processIfNeeded(memory, frames: retained)\n        let g0Capture = g0LosslessSeek > 0 && g0RampRecords.count < 2\n        let g0Before = seekRampConsumedFrames\n        let g0Pre = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: retained * Int(channels))) : []\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="        runningSamples += Int64(retained)\n        }\n\n        if let buffer = makeSampleBuffer("
+          new="        runningSamples += Int64(retained)\n        }\n        let g0Post = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: retained * Int(channels))) : []\n\n        if let buffer = makeSampleBuffer("
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="            samples: retained,\n            startTicks: ticks\n        ) {\n            readyBuffers.append(buffer)"
+          new="            samples: retained,\n            startTicks: ticks\n        ) {\n            if g0Capture {\n                g0RampRecords.append(G0RampRecord(pre: g0Pre, post: g0Post, fade: seekRampFrames, before: g0Before, after: seekRampConsumedFrames, ticks: ticks))\n                print(\"G0_4B10755_RAMP_CAPTURE seek=\\(g0LosslessSeek) ordinal=\\(g0RampRecords.count) ticks=\\(ticks) frames=\\(retained) fade=\\(seekRampFrames) before=\\(g0Before) after=\\(seekRampConsumedFrames)\")\n            }\n            readyBuffers.append(buffer)"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="    private let host = AVPlayerHost()"
+          new="    private let host = AVPlayerHost()\n    private(set) var g0IntegratedPublications: [TimeInterval] = []\n    func g0IntegratedRelease() { libavHost?.g0IntegratedRelease() }"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="        elapsed = seconds\n        refreshNowPlaying()\n    }\n\n    /// Queues a source"
+          new="        elapsed = seconds\n        g0IntegratedPublications.append(elapsed)\n        diagnosticEvents.emit(\"g0.integrated published seek=\\(g0IntegratedPublications.count) target=\\(seconds) clock=\\(currentTime)\")\n        refreshNowPlaying()\n    }\n\n    /// Queues a source"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="    private let renderer = AVSampleBufferAudioRenderer()"
+          new="    private let renderer = AVSampleBufferAudioRenderer()\n    private let g0IntegratedGate = DispatchSemaphore(value: 0)\n    private var g0IntegratedSeek = 0\n    private var g0IntegratedBuffer = 0\n    func g0IntegratedRelease() { g0IntegratedGate.signal() }\n    private func g0IntegratedInspect(_ buffer: CMSampleBuffer) -> String {\n        let n=CMSampleBufferGetNumSamples(buffer)\n        let bad=\"ptsTick=-1 actualIndex=-1 mismatch=-1 preMismatch=-1 deliveryMismatch=-1 frames=\\(n) sourceRate=-1 fade=-1 consumed=-1 before=-1 compared=-1\"\n        let stamp=CMSampleBufferGetPresentationTimeStamp(buffer)\n        guard let desc=CMSampleBufferGetFormatDescription(buffer),\n              let asbd=CMAudioFormatDescriptionGetStreamBasicDescription(desc)?.pointee,\n              asbd.mSampleRate==96000 || asbd.mSampleRate==192000,\n              asbd.mChannelsPerFrame==2, asbd.mBitsPerChannel==32,\n              asbd.mFormatID==kAudioFormatLinearPCM,\n              (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0,\n              n>0, let block=CMSampleBufferGetDataBuffer(buffer),\n              CMBlockBufferGetDataLength(block)==n*8 else {return bad}\n        let rate=Int(asbd.mSampleRate)\n        let t=stamp.seconds*Double(rate)\n        guard t.isFinite, abs(t)<Double(Int32.max) else{return bad}\n        let tick=Int(t.rounded())\n        guard CMTimeCompare(stamp,CMTime(value:Int64(tick),timescale:Int32(rate)))==0 else{return bad}\n        var values=[Float](repeating:0,count:n*2)\n        let status=values.withUnsafeMutableBytes {CMBlockBufferCopyDataBytes(block,atOffset:0,dataLength:$0.count,destination:$0.baseAddress!)}\n        guard status==kCMBlockBufferNoErr else{return bad}\n        let fade=g0IntegratedSeek==0 ? 0 : Int((Double(rate)*0.003).rounded())\n        var pre=values, post=values, before=0, consumed=0\n        if g0IntegratedSeek>0 {\n            guard let decoder, decoder.g0RampRecords.indices.contains(g0IntegratedBuffer-1) else{return bad}\n            let rec=decoder.g0RampRecords[g0IntegratedBuffer-1]\n            guard rec.ticks==Int64(tick),rec.fade==fade,rec.pre.count==n*2,rec.post.count==n*2 else{return bad}\n            pre=rec.pre;post=rec.post;before=rec.before;consumed=rec.after\n            guard before>=0,before<=fade,consumed==min(fade,before+n) else{return bad}\n        }\n        let l=pre[0]*8388608,r=pre[1]*8388608\n        guard l.isFinite,r.isFinite,l==l.rounded(),r==r.rounded(),abs(l)<=8388608,abs(r)<=8388608 else{return bad}\n        let actual=Int(l)+4194304\n        guard actual>=0,actual+n<=rate*8,Int(r)==((actual*17)&0xffffff)-8388608 else{return bad}\n        var preMismatch=0,mismatch=0,deliveryMismatch=0\n        for f in 0..<n {\n            let i=actual+f\n            let gain=before+f<fade ? Float(before+f+1)/Float(fade) : 1\n            for c in 0..<2 {\n                let k=f*2+c\n                let x=Float(c==0 ? i-4194304 : ((i*17)&0xffffff)-8388608)/8388608\n                let expected=fade>0 && before+f<fade ? x*gain:x\n                if pre[k].bitPattern != x.bitPattern {preMismatch+=1}\n                if post[k].bitPattern != expected.bitPattern {mismatch+=1}\n                if values[k].bitPattern != post[k].bitPattern {deliveryMismatch+=1}\n            }\n        }\n        return \"ptsTick=\\(tick) actualIndex=\\(actual) mismatch=\\(mismatch) preMismatch=\\(preMismatch) deliveryMismatch=\\(deliveryMismatch) frames=\\(n) sourceRate=\\(rate) fade=\\(fade) consumed=\\(consumed) before=\\(before) compared=\\(n*2)\"\n    }"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self, let decoder = self.decoder else { return }\n            do {"
+          new="    func seek(to seconds: TimeInterval) {\n        queue.async { [weak self] in\n            guard let self, let decoder = self.decoder else { return }\n            self.g0IntegratedSeek += 1\n            self.g0IntegratedBuffer = 0\n            self.diagnostics.emit(\"g0.integrated entered seek=\\(self.g0IntegratedSeek) target=\\(seconds)\")\n            guard self.g0IntegratedGate.wait(timeout: .now() + 25) == .success else {\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=false reason=gateTimeout\")\n                return\n            }\n            do {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="                self.startRequesting()\n            } catch {\n                self.publish(.failed(\"Seek failed\"))"
+          new="                self.startRequesting()\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=true clock=\\(self.currentTime)\")\n            } catch {\n                self.diagnostics.emit(\"g0.integrated result seek=\\(self.g0IntegratedSeek) success=false clock=\\(self.currentTime)\")\n                self.publish(.failed(\"Seek failed\"))"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="    private func enqueueDecoded(_ buffer: CMSampleBuffer) {\n        if !started {"
+          new="    private func enqueueDecoded(_ buffer: CMSampleBuffer) {\n        g0IntegratedBuffer += 1\n        let g0First = g0IntegratedBuffer <= 2\n        let g0PCM = g0First ? g0IntegratedInspect(buffer) : \"\"\n        if g0First { diagnostics.emit(\"g0.integrated beforeEnqueue seek=\\(g0IntegratedSeek) ordinal=\\(g0IntegratedBuffer) \\(g0PCM) clock=\\(currentTime) rate=\\(synchronizer.rate)\") }\n        if !started {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/LibavcodecAudioHost.swift")
+          s=p.read_text()
+          old="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)"
+          new="        timelineEnd = max(timelineEnd, Self.endSeconds(of: buffer))\n        renderer.enqueue(buffer)\n        if g0First { diagnostics.emit(\"g0.integrated enqueued seek=\\(g0IntegratedSeek) ordinal=\\(g0IntegratedBuffer) \\(g0PCM) clock=\\(currentTime) rate=\\(synchronizer.rate) epoch=\\(currentPlaybackEpoch)\") }"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="        if Self.supportsNativeLocal(track.url, hint: track.sourceMIMEType)\n            || (isRemote(track.url)\n                && !isExoticRemote(track.url, hint: track.sourceMIMEType)) {"
+          new="        let g0ForceALAC = track.url.isFileURL && track.url.pathExtension.lowercased() == \"m4a\" && (ProcessInfo.processInfo.environment[\"APOLO_G0_RENDER_HIRES_PROFILE\"] ?? \"\").hasPrefix(\"ALAC\")\n        if !g0ForceALAC && (Self.supportsNativeLocal(track.url, hint: track.sourceMIMEType)\n            || (isRemote(track.url)\n                && !isExoticRemote(track.url, hint: track.sourceMIMEType))) {"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          p=Path("Sources/ApoloEngine/ApoloEngine.swift")
+          s=p.read_text()
+          old="        let codecRoute: AudioRoute = isRemote(track.url)\n            ? .libavcodec"
+          new="        let g0ForceALAC = track.url.isFileURL && track.url.pathExtension.lowercased() == \"m4a\" && (ProcessInfo.processInfo.environment[\"APOLO_G0_RENDER_HIRES_PROFILE\"] ?? \"\").hasPrefix(\"ALAC\")\n        if g0ForceALAC { diagnosticEvents.emit(\"g0.integrated forcedALAC codec=\\(audioTrack.codec)\") }\n        let codecRoute: AudioRoute = (isRemote(track.url) || g0ForceALAC)\n            ? .libavcodec"
+          assert s.count(old)==1,(str(p),old)
+          p.write_text(s.replace(old,new))
+          PY
+          git diff -- Sources/ApoloEngine | tee g0-4b10755-route-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b10755-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B10755-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B10755-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_INTEGRATED_HIRES' \
+              2>&1 | tee "g0-4b10755-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(FLAC96000Single2 FLAC96000SingleShort FLAC96000Sequential FLAC96000Overlap FLAC192000Single2 FLAC192000SingleShort FLAC192000Sequential FLAC192000Overlap ALAC96000Single2 ALAC96000SingleShort ALAC96000Sequential ALAC96000Overlap ALAC192000Single2 ALAC192000SingleShort ALAC192000Sequential ALAC192000Overlap)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B10755-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for mode in original noFlush trim both; do
+            export TEST_RUNNER_APOLO_G0_RENDER_HIRES_MODE="$mode"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s-%s' "$index" "$variant" "$mode" "$profile")
+              echo "G0_4B10755_RUN index=$index variant=$variant test=$profile" | tee "g0-4b10755-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_RENDER_HIRES_PROFILE="$profile"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b10755-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0IntegratedHiResTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b10755-$run-output.log"; then
+                echo "G0_4B10755_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B10755_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+            done
+          done
+          python3 - <<'PY' | tee g0-4b10755-control-comparison.txt
+          import pathlib,re,collections
+          paths=sorted(pathlib.Path(".").glob("g0-4b10755-[0-9][0-9]*-*-output.log"))
+          assert len(paths)==128,len(paths)
+          pids=set(); pairs={}; observations=0; workers=0; stats=collections.defaultdict(collections.Counter)
+          def fields(s): return dict(re.findall(r"(\w+)=(\S+)",s))
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B10755_PROCESS pid=(\d+) scenario=(\S+) codec=(\S+) rate=(\d+) mode=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key,codec,rate,mode=proc[0]
+              pin=path.name.split("-")[3]
+              assert pin in ("baseline","a1") and pid not in pids and key in path.name and "-"+mode+"-" in path.name
+              pids.add(pid)
+              obs=re.findall(r"G0_4B10755_OBSERVATION (.*)",log)
+              cs=re.findall(r"G0_4B10755_CONTROL (.*)",log)
+              results=re.findall(r"G0_4B10755_TRACE g0.integrated result (.*)",log)
+              enq=re.findall(r"G0_4B10755_TRACE g0.integrated enqueued (.*)",log)
+              before=re.findall(r"G0_4B10755_TRACE g0.integrated beforeEnqueue (.*)",log)
+              pending=re.findall(r"G0_4B10755_PENDING (.*)",log)
+              capture=re.findall(r"G0_4B10755_RAMP_CAPTURE (.*)",log)
+              count=2 if key.endswith(("Overlap","Sequential")) else 1
+              assert len(obs)==(2 if key.endswith("Sequential") else 1) and len(cs)==1 and "cleanup=true" in cs[0] and "metadataOff=true" in cs[0],path.name
+              assert len(results)==len(pending)==count and all("success=true" in x for x in results)
+              for label in ("INITIAL","START","PAUSE"):
+                  assert len(re.findall(r"G0_4B10755_"+label+r" ",log))==1,path.name
+              forced=re.findall(r"G0_4B10755_TRACE g0.integrated forcedALAC (.*)",log)
+              assert len(forced)==int(codec=="ALAC"),path.name
+              if forced: assert "alac" in forced[0].lower(),forced
+              assert len(before)==len(enq)
+              initial=[fields(x) for x in enq if x.startswith("seek=0 ")]
+              assert len(initial)==2 and initial[0]["ptsTick"]==initial[0]["actualIndex"]=="0"
+              assert int(initial[1]["ptsTick"])==int(initial[1]["actualIndex"])==int(initial[0]["frames"])
+              for line in enq:
+                  f=fields(line)
+                  assert f["sourceRate"]==rate and f["mismatch"]==f["preMismatch"]==f["deliveryMismatch"]=="0",line
+              for line in obs:
+                  f=fields(line)
+                  assert f["mismatch"]==f["nextMismatch"]==f["preMismatch"]==f["deliveryMismatch"]=="0" and f["aligned"]==f["continuity"]=="true",line
+                  seek=f["seek"]
+                  actual=[fields(x) for x in enq if x.startswith("seek="+seek+" ")]
+                  caps=[fields(x) for x in capture if x.startswith("seek="+seek+" ")]
+                  assert len(actual)==len(caps)==2,path.name
+                  for ordinal,(a,c) in enumerate(zip(actual,caps),1):
+                      assert int(a["ordinal"])==int(c["ordinal"])==ordinal and a["ptsTick"]==c["ticks"] and a["frames"]==c["frames"] and a["before"]==c["before"] and a["consumed"]==c["after"],(a,c)
+                  assert actual[0]["before"]=="0" and actual[1]["before"]==actual[0]["consumed"]
+                  c=stats[(pin,codec,rate,mode)]
+                  c["total"]+=1
+                  c["exact"]+=int(f["exact"]=="true")
+                  c["strictClock"]+=int(f["strictClock"]=="true")
+                  c["comparedScalars"]+=2*(int(f["frames"])+int(f["nextFrames"]))
+                  c["rampSpansFirst"]+=int(int(f["frames"])<int(f["fade"]))
+              observations+=len(obs);workers+=len(results)
+              group=pairs.setdefault((key,mode),{})
+              assert pin not in group
+              group[pin]=obs
+              print(path.name,"pid",pid,*cs,*obs,*pending,*results,*enq,*capture,sep="\n")
+          assert len(pairs)==64 and all(set(x)=={"baseline","a1"} for x in pairs.values()) and observations==160 and workers==192
+          assert len(stats)==32 and all(c["total"]==5 for c in stats.values())
+          for key,c in sorted(stats.items()): print("G0_4B10755_STATS",*key,dict(c))
+          print("G0_4B10755_PAIRED processes=128 controls=128 observations=160 workers=192 pairs=64")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b10755-paired-${{ github.run_id }}
+          path: |
+            g0-4b10755-*-output.log
+            g0-4b10755-*-build.log
+            g0-4b10755-control-comparison.txt
+            g0-4b10755-*-dependency.patch
+            g0-4b10755-environment.txt
+            g0-4b10755-fixture-manifest.txt
+            g0-4b10755-fixture-*.flac
+            g0-4b10755-fixture-*.m4a
+            g0-4b10755-route-overlay.patch
+            g0-4b10755-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
