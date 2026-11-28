@@ -1,0 +1,275 @@
+name: G0 4B10761 MP3 preroll and history oracle
+
+on:
+  pull_request:
+    branches: [diag/g0-4b1076-lossy-seek-20261128]
+    paths: [".github/workflows/g0-4b10761-mp3-preroll.yml", "Tests/ApoloEngineTests/G0MP3PrerollTests.swift"]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  paired:
+    if: github.head_ref == 'diag/g0-4b10761-mp3-preroll-20261128'
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - name: Checkout exact diagnostic head
+        uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Select matching Xcode
+        uses: maxim-lobanov/setup-xcode@v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Prebuild both pins and isolate each profile in its own process
+        shell: bash
+        env:
+          TEST_RUNNER_APOLO_G0_LAB: "1"
+          TEST_RUNNER_APOLO_G0_MP3_PREROLL_ORACLE: "1"
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices booted -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next((x["udid"] for a in d["devices"].values() for x in a if x["state"]=="Booted" and x["name"].startswith("iPhone")),""))')
+          if [[ -z "$UDID" ]]; then
+            UDID=$(xcrun simctl list devices available -j | python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(x["udid"] for a in d["devices"].values() for x in a if x["name"].startswith("iPhone")))')
+            xcrun simctl boot "$UDID"
+          fi
+          xcrun simctl bootstatus "$UDID" -b
+          {
+            git rev-parse HEAD
+            uname -a
+            sw_vers
+            sysctl hw.model hw.ncpu hw.memsize
+            xcodebuild -version
+            swift --version
+            echo "Simulator=$UDID"
+            xcrun simctl list devices booted
+          } | tee g0-4b10761-environment.txt
+          select_pin() {
+            git restore -- Package.swift
+            python3 scripts/g0_select_dependency.py "$1"
+            if [[ "$1" == baseline ]]; then
+              python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Package.swift")
+          s=p.read_text()
+          old='branch: "apolo-union"'
+          assert s.count(old)==1
+          p.write_text(s.replace(old,'revision: "c12701ebf9b51fab0940948dd630c22f041fcfe9"'))
+          PY
+            fi
+          }
+          # Synthetic deterministic, aperiodic stereo source. Host encoders only.
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          command -v ffprobe
+          mkdir -p .build/g0-lossy-fixtures
+          ffmpeg -version | tee g0-4b10761-fixture-manifest.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          import wave,subprocess,json,base64,hashlib,random,struct,math
+          rate=48000
+          rng=random.Random(471055)
+          raw=bytearray()
+          state=[0.,0.]
+          for i in range(rate*8):
+              for ch in (0,1):
+                  state[ch]=0.45*state[ch]+0.55*rng.uniform(-1,1)
+                  v=0.65*state[ch]+0.10*math.sin(2*math.pi*(170+ch*113+i/rate*31)*i/rate)
+                  raw.extend(struct.pack("<h",round(v*32767)))
+          wav=Path(".build/g0-lossy-fixtures/reference.wav")
+          with wave.open(str(wav),"wb") as f:
+              f.setnchannels(2);f.setsampwidth(2);f.setframerate(rate);f.writeframes(raw)
+          lines=["#if G0_MP3_PREROLL_ORACLE","enum G0MP3PrerollFixtureData {"]
+          keys=[]
+          with open("g0-4b10761-fixture-manifest.txt","a") as manifest:
+              manifest.write(f"source rate={rate} frames={rate*8} sha256={hashlib.sha256(raw).hexdigest()}\n")
+              for key,codec,ext,encoder,bitrate in (("MP3","mp3","mp3","libmp3lame","320k"),):
+                  out=Path(f"g0-4b10761-fixture-{key}.{ext}")
+                  subprocess.run(["ffmpeg","-nostdin","-v","error","-y","-i",str(wav),"-map","0:a:0","-c:a",encoder,"-b:a",bitrate,str(out)],check=True)
+                  meta=json.loads(subprocess.check_output(["ffprobe","-v","error","-select_streams","a:0","-show_streams","-show_format","-show_packets","-of","json",str(out)]))
+                  stream=meta["streams"][0]
+                  for packet in meta["packets"]:
+                      if packet.get("side_data_list"): print("G0_4B10761_PACKET_METADATA",json.dumps({"pts":packet.get("pts"),"duration":packet.get("duration"),"side_data_list":packet["side_data_list"]},separators=(",",":")))
+                  print("G0_4B10761_STREAM_METADATA",json.dumps({k:stream.get(k) for k in ("time_base","start_pts","start_time","duration_ts","duration","codec_name")},separators=(",",":")))
+                  assert stream["codec_name"]==codec and int(stream["sample_rate"])==rate and stream["channels"]==2,stream
+                  Path(f"g0-4b10761-packets-{key}.json").write_text(json.dumps(meta,indent=2))
+                  host=subprocess.check_output(["ffmpeg","-nostdin","-v","error","-i",str(out),"-map","0:a:0","-c:a","pcm_f32le","-f","f32le","-"])
+                  assert len(host)%8==0 and rate*7<=len(host)//8<=rate*9
+                  data=out.read_bytes()
+                  manifest.write(json.dumps(stream)+"\n")
+                  manifest.write(f"{key} requestedBitrate={bitrate} fileSHA256={hashlib.sha256(data).hexdigest()} hostFrames={len(host)//8} hostFloatSHA256={hashlib.sha256(host).hexdigest()}\n")
+                  print(f"G0_4B10761_FIXTURE codec={key} rate={rate} hostFrames={len(host)//8} packetCount={len(meta['packets'])}")
+                  encoded=base64.b64encode(data).decode("ascii")
+                  lines.append("    private static let "+key+": String = [")
+                  lines.extend('        "'+encoded[i:i+8192]+'",' for i in range(0,len(encoded),8192))
+                  lines.append("    ].joined()")
+                  keys.append(key)
+          lines.append("    static let files: [String:String] = ["+",".join('"'+k+'":'+k for k in keys)+"]")
+          lines.extend(["}","#endif"])
+          Path("Tests/ApoloEngineTests/G0MP3PrerollFixtureData.swift").write_text("\n".join(lines)+"\n")
+          PY
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path("Sources/ApoloEngine/AudioDecoder.swift")
+          s=p.read_text()
+          old="    private var seekTargetTicks: Int64?"
+          new="    private var seekTargetTicks: Int64?\n    private let g0MP3Mode = ProcessInfo.processInfo.environment[\"APOLO_G0_MP3_MODE\"] ?? \"original\"\n    private var g0LosslessNoFlush: Bool { [\"noFlush\",\"pre24\",\"pre96\",\"pre240\"].contains(g0MP3Mode) }\n    private var g0PrerollMs: Int { g0MP3Mode==\"pre24\" ? 24 : (g0MP3Mode==\"pre96\" || g0MP3Mode==\"flush96\") ? 96 : g0MP3Mode==\"pre240\" ? 240 : 0 }\n    private(set) var g0WorkPackets = 0\n    private(set) var g0WorkFrames = 0\n    private(set) var g0WorkDiscarded = 0\n    private var g0LosslessSeek = 0\n    private var g0LosslessPacket = 0\n    private var g0LosslessFrame = 0\n    struct G0RampRecord {\n        let pre: [Float]\n        let post: [Float]\n        let fade: Int\n        let before: Int\n        let after: Int\n        let ticks: Int64\n    }\n    private(set) var g0RampRecords: [G0RampRecord] = []"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          new="            if g0LosslessSeek > 0 { g0WorkPackets += 1 }\n            if g0LosslessPacket < (g0LosslessSeek == 0 ? 8 : 128) {\n                g0LosslessPacket += 1\n                print(\"G0_4B10761_PACKET seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessPacket) pts=\\(packet.pointee.pts) dts=\\(packet.pointee.dts) duration=\\(packet.pointee.duration) pos=\\(packet.pointee.pos) size=\\(packet.pointee.size) flags=\\(packet.pointee.flags) sideData=\\(packet.pointee.side_data_elems)\")\n            }\n            let accepted = send(packet, to: codecContext)\n            av_packet_unref(packet)"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        let target = Int64(seconds / rate)\n        let result = avformat_seek_file(\n            formatContext,\n            streamIndex,\n            Int64.min,\n            target,"
+          new="        let target = Int64(seconds / rate)\n        let demuxTarget = g0PrerollMs == 0 ? target : max(0, target - Int64(Double(g0PrerollMs)/1000/rate))\n        let result = avformat_seek_file(\n            formatContext,\n            streamIndex,\n            Int64.min,\n            demuxTarget,"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n\n        // Drop packets the demuxer queued before the seek point.\n        avformat_flush(formatContext)"
+          new="        g0WorkPackets=0; g0WorkFrames=0; g0WorkDiscarded=0\n        g0RampRecords.removeAll(keepingCapacity: true)\n        g0LosslessSeek += 1\n        g0LosslessPacket = 0\n        g0LosslessFrame = 0\n        print(\"G0_4B10761_DEMUX seek=\\(g0LosslessSeek) requested=\\(seconds) ticks=\\(target) demuxTicks=\\(demuxTarget) prerollMs=\\(g0PrerollMs) timeBase=\\(timeBase.num)/\\(timeBase.den) result=\\(result) extraFlush=\\(!g0LosslessNoFlush)\")\n        guard result >= 0 else { throw ApoloError.unsupportedFormat }\n        if !g0LosslessNoFlush { avformat_flush(formatContext) }"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target { return }\n            seekTargetTicks = nil\n        }"
+          new="    private func append(_ frame: UnsafeMutablePointer<AVFrame>) {\n        if g0LosslessSeek > 0 { g0WorkFrames += 1 }\n        if g0LosslessFrame < (g0LosslessSeek == 0 ? 8 : 128) {\n            g0LosslessFrame += 1\n            print(\"G0_4B10761_FRAME seek=\\(g0LosslessSeek) ordinal=\\(g0LosslessFrame) pts=\\(frame.pointee.pts) samples=\\(frame.pointee.nb_samples) format=\\(frame.pointee.format) rate=\\(frame.pointee.sample_rate) target=\\(String(describing:seekTargetTicks)) swrDelay=\\(resampler.map { swr_get_delay($0,Int64(sampleRate)) } ?? -1)\")\n        }\n        if let target = seekTargetTicks, frame.pointee.pts != Int64.min {\n            if frame.pointee.pts < target {\n                if g0LosslessSeek > 0 { g0WorkDiscarded += Int(frame.pointee.nb_samples) }\n                if g0LosslessFrame <= 128 {print(\"G0_4B10761_DISCARD seek=\\(g0LosslessSeek) pts=\\(frame.pointee.pts) target=\\(target) samples=\\(frame.pointee.nb_samples)\")}\n                return\n            }\n            seekTargetTicks = nil\n        }"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        processIfNeeded(memory, frames: Int(converted))\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          new="        processIfNeeded(memory, frames: Int(converted))\n        let g0Capture = g0LosslessSeek > 0 && g0RampRecords.count < 8\n        let g0Before = seekRampConsumedFrames\n        let g0Pre = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: Int(converted) * Int(channels))) : []\n        if seekRampFrames > 0, seekRampConsumedFrames < seekRampFrames {"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="            )\n        runningSamples += Int64(converted)\n\n        if let buffer = makeSampleBuffer("
+          new="            )\n        runningSamples += Int64(converted)\n        let g0Post = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: Int(converted) * Int(channels))) : []\n\n        if let buffer = makeSampleBuffer("
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          old="        let g0Post = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: Int(converted) * Int(channels))) : []\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: Int(converted) * bytesPerFrame,\n            samples: Int(converted),\n            startTicks: ticks\n        ) {\n            readyBuffers.append(buffer)"
+          new="        let g0Post = g0Capture ? Array(UnsafeBufferPointer(start: memory.assumingMemoryBound(to: Float.self), count: Int(converted) * Int(channels))) : []\n\n        if let buffer = makeSampleBuffer(\n            memory: memory,\n            byteCount: Int(converted) * bytesPerFrame,\n            samples: Int(converted),\n            startTicks: ticks\n        ) {\n            if g0Capture {\n                g0RampRecords.append(G0RampRecord(pre: g0Pre, post: g0Post, fade: seekRampFrames, before: g0Before, after: seekRampConsumedFrames, ticks: ticks))\n                print(\"G0_4B10761_RAMP_CAPTURE seek=\\(g0LosslessSeek) ordinal=\\(g0RampRecords.count) ticks=\\(ticks) frames=\\(Int(converted)) fade=\\(seekRampFrames) before=\\(g0Before) after=\\(seekRampConsumedFrames)\")\n            }\n            readyBuffers.append(buffer)"
+          assert s.count(old)==1,(str(p),old)
+          s=s.replace(old,new)
+          p.write_text(s)
+          PY
+          git diff -- Sources/ApoloEngine | tee g0-4b10761-route-overlay.patch
+          for variant in baseline a1; do
+            select_pin "$variant"
+            git diff -- Package.swift | tee "g0-4b10761-$variant-dependency.patch"
+            xcodebuild build-for-testing \
+              -scheme ApoloEngine \
+              -destination "platform=iOS Simulator,id=$UDID" \
+              -derivedDataPath ".build/G04B10761-$variant" \
+              -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/G04B10761-packages-$variant" \
+              -disablePackageRepositoryCache \
+              -configuration Release ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO ENABLE_TESTABILITY=YES 'SWIFT_ACTIVE_COMPILATION_CONDITIONS=$(inherited) G0_MP3_PREROLL_ORACLE' \
+              2>&1 | tee "g0-4b10761-$variant-build.log"
+          done
+          git restore -- Package.swift Sources/ApoloEngine
+          failed=0
+          profiles=(MP3NearStart MP3Repeated MP3AfterEOF MP3Tail)
+          index=0
+          # Baseline order then reverse for A1, isolated xctestrun invocations.
+          for variant in baseline a1; do
+            XCTESTRUN=$(find ".build/G04B10761-$variant/Build/Products" -name '*.xctestrun' -type f | head -1)
+            test -n "$XCTESTRUN"
+            for mode in original noFlush pre24 pre96 pre240 flush96; do
+            export TEST_RUNNER_APOLO_G0_MP3_MODE="$mode"
+            for ((i=0;i<${#profiles[@]};i++)); do
+              pos=$i
+              if [[ "$variant" == a1 ]]; then pos=$((${#profiles[@]}-1-i)); fi
+              profile="${profiles[$pos]}"
+              index=$((index+1))
+              run=$(printf '%02d-%s-%s-%s' "$index" "$variant" "$mode" "$profile")
+              echo "G0_4B10761_RUN index=$index variant=$variant test=$profile" | tee "g0-4b10761-$run-output.log"
+              export TEST_RUNNER_APOLO_G0_MP3_PROFILE="$profile"
+              if xcodebuild test-without-building \
+                -xctestrun "$XCTESTRUN" \
+                -destination "platform=iOS Simulator,id=$UDID" \
+                -resultBundlePath "$GITHUB_WORKSPACE/g0-4b10761-$run.xcresult" \
+                -only-testing:"ApoloEngineTests/G0MP3PrerollTests/test$profile" \
+                -parallel-testing-enabled NO \
+                -test-timeouts-enabled YES \
+                -default-test-execution-time-allowance 600 \
+                -maximum-test-execution-time-allowance 900 \
+                2>&1 | tee -a "g0-4b10761-$run-output.log"; then
+                echo "G0_4B10761_VARIANT index=$index variant=$variant test=$profile result=PASS"
+              else
+                failed=1
+                echo "G0_4B10761_VARIANT index=$index variant=$variant test=$profile result=FAIL"
+              fi
+            done
+            done
+          done
+          python3 - <<'PY' | tee g0-4b10761-control-comparison.txt
+          import pathlib,re,collections
+          paths=sorted(pathlib.Path(".").glob("g0-4b10761-[0-9][0-9]-*-output.log"))
+          assert len(paths)==48,len(paths)
+          pids=set(); pairs={}; observations=0; stats=collections.defaultdict(collections.Counter)
+          def fields(s): return dict(re.findall(r"(\w+)=(\S+)",s))
+          for path in paths:
+              log=path.read_text(errors="replace")
+              proc=re.findall(r"G0_4B10761_PROCESS pid=(\d+) scenario=(\S+) codec=(\S+) mode=(\S+)",log)
+              assert len(proc)==1,(path.name,proc)
+              pid,key,codec,mode=proc[0]
+              pin=path.name.split("-")[3]
+              assert pin in ("baseline","a1") and codec=="MP3" and pid not in pids and key in path.name and "-"+mode+"-" in path.name
+              pids.add(pid)
+              obs=re.findall(r"G0_4B10761_OBSERVATION (.*)",log)
+              cs=re.findall(r"G0_4B10761_CONTROL (.*)",log)
+              demux=re.findall(r"G0_4B10761_DEMUX (.*)",log)
+              linear=re.findall(r"G0_4B10761_LINEAR (.*)",log)
+              buffers=re.findall(r"G0_4B10761_BUFFER (.*)",log)
+              captures=re.findall(r"G0_4B10761_RAMP_CAPTURE (.*)",log)
+              count=3 if key.endswith("Repeated") else 1
+              assert len(obs)==len(demux)==count and len(cs)==1 and "metadataOff=true" in cs[0],path.name
+              assert len(linear)==1,path.name
+              f=fields(linear[0]);assert f["controlIndex"]==f["found"] and int(f["shiftMismatch"])>0
+              assert len(re.findall(r"G0_4B10761_INITIAL ",log))==int(not key.endswith("AfterEOF"))
+              assert len(re.findall(r"G0_4B10761_EOF ",log))==int(key.endswith("AfterEOF"))
+              for i,(line,seek) in enumerate(zip(obs,demux),1):
+                  f=fields(line);d=fields(seek);assert int(f["ordinal"])==int(d["seek"])==i
+                  assert f["status"] in ("ok","eof","seekError","readError"),line
+                  expected={"original":0,"noFlush":0,"pre24":24,"pre96":96,"pre240":240,"flush96":96}[mode]
+                  assert int(d["prerollMs"])==expected and d["extraFlush"]==str(mode in ("original","flush96")).lower()
+                  assert int(d["demuxTicks"])<=int(d["ticks"]) and (expected!=0 or d["demuxTicks"]==d["ticks"])
+                  c=stats[(pin,mode)];c["total"]+=1;c[f["status"]]+=1
+                  if f["status"]=="seekError":continue
+                  assert f["rampMismatch"]==f["deliveryMismatch"]=="0",line
+                  bb=[fields(x) for x in buffers if fields(x)["ordinal"]==str(i)]
+                  assert len(bb)==int(f["captures"]),line
+                  for k,b in enumerate(bb,1): assert int(b["buffer"])==k and float(b["energy"])>=0
+                  for k in ("frames","compared","ptsCompared","ptsMismatch","anchoredCompared","anchoredMismatch","ptsExactBuffers","anchoredExactBuffers","allZeroBuffers","packets","decodedFrames","discardedFrames"):
+                      c[k]+=int(f[k])
+                  c["complete"]+=int(f["complete"]=="true")
+                  c["firstExact"]+=int(f["firstExact"]=="true")
+                  c["firstConfident"]+=int(f["firstConfidence"]=="true")
+                  c["aligned"]+=int(f["firstConfidence"]=="true" and f["firstContentTick"]==f["firstPTS"])
+                  c["ptsExact"]+=int(f["firstPTS"]==f["target"])
+                  c["audibleIndexExact"]+=int(f["firstConfidence"]=="true" and f["firstRefIndex"]==f["target"])
+                  c["all8ExactAtPTS"]+=int(f["complete"]=="true" and f["ptsExactBuffers"]=="8")
+              observations+=len(obs)
+              group=pairs.setdefault((key,mode),{})
+              assert pin not in group
+              group[pin]=obs
+              print(path.name,"pid",pid,*linear,*cs,*obs,*buffers,*demux,*captures,sep="\n")
+          assert len(pairs)==24 and all(set(x)=={"baseline","a1"} for x in pairs.values()) and observations==72
+          assert len(stats)==12 and all(c["total"]==6 for c in stats.values())
+          for key,c in sorted(stats.items()): print("G0_4B10761_STATS",*key,dict(c))
+          print("G0_4B10761_PAIRED processes=48 controls=48 linear=48 observations=72 pairs=24")
+          PY
+          exit "$failed"
+      - name: Preserve both diagnostic outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: g0-4b10761-paired-${{ github.run_id }}
+          path: |
+            g0-4b10761-*-output.log
+            g0-4b10761-*-build.log
+            g0-4b10761-control-comparison.txt
+            g0-4b10761-*-dependency.patch
+            g0-4b10761-environment.txt
+            g0-4b10761-fixture-manifest.txt
+            g0-4b10761-fixture-*
+            g0-4b10761-packets-*.json
+            g0-4b10761-route-overlay.patch
+            g0-4b10761-*.xcresult
+          if-no-files-found: warn
+          retention-days: 14
